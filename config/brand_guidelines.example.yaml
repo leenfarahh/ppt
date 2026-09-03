@@ -1,0 +1,133 @@
+# Example brand guidelines. Every value here is a placeholder -- copy this
+# file, replace it with the real brand system, and keep the real one out of
+# version control if it is a client's.
+#
+#   formatting-tool validate --master master.pptx --deck messy.pptx \
+#       --guidelines config/my_brand.yaml
+#
+# Unknown keys are rejected rather than ignored: a typo would otherwise
+# silently switch off a whole class of checks. Run with -v to see which rules
+# were skipped for want of a value.
+
+name: Example Brand
+
+# Palette. Label -> hex. Labels appear in the report ("nearest: ink"), so name
+# them the way the brand book does. The AI layer sees these labels too.
+palette:
+  ink: "#101820"
+  paper: "#FFFFFF"
+  primary: "#1F4FD8"
+  primary-tint: "#D9E2FA"
+  accent: "#F25C05"
+  grey-70: "#4A4F55"
+  grey-30: "#C9CDD2"
+
+# Typefaces permitted anywhere in the deck. The first entry is treated as the
+# default when a rule suggests a fix.
+allowed_fonts:
+  - Inter
+  - Inter Tight
+  - Georgia
+
+# Latin fonts do not cover Arabic. List the Arabic faces separately; they are
+# added to the approved set, and a future rule will check that a run tagged as
+# Arabic uses one of these rather than a Latin fallback.
+arabic_fonts:
+  - IBM Plex Sans Arabic
+
+# Type scale per role. Anything omitted is inferred from the master deck, so a
+# blank range is not a disabled check -- set it explicitly to pin it.
+roles:
+  title:
+    fonts: [Inter Tight]
+    min_size_pt: 32
+    max_size_pt: 40
+    colors: ["#101820", "#FFFFFF"]
+    max_lines: 2
+    required: true
+  subtitle:
+    fonts: [Inter]
+    min_size_pt: 18
+    max_size_pt: 22
+    required: false
+  body:
+    fonts: [Inter]
+    min_size_pt: 12
+    max_size_pt: 16
+  caption:
+    fonts: [Inter]
+    min_size_pt: 9
+    max_size_pt: 11
+  footer:
+    fonts: [Inter]
+    min_size_pt: 8
+    max_size_pt: 10
+
+logo:
+  required_on_every_slide: false
+  required_on_first_slide: true
+  min_width_in: 0.9
+  clear_space_in: 0.25
+  # Corners: tl, tr, bl, br.
+  allowed_corners: [tl, br]
+  # SHA-1 of each approved logo file. Without these, a logo is matched by shape
+  # name, which lets a re-exported or stretched copy through. Get them with:
+  #   formatting-tool profile --deck master.pptx | grep image_sha1
+  asset_sha1: []
+
+# Usable area of the slide. Text crossing these edges is reported; background
+# panels and full-bleed images are exempt.
+#
+# null means the brand does not specify that edge, and it is not checked. There
+# is deliberately no default: an invented frame would report every deck against
+# a margin nobody set.
+safe_margins:
+  top_in: 0.5
+  right_in: 0.6
+  bottom_in: 0.5
+  left_in: 0.6
+
+typography:
+  max_orphan_words: 1
+  min_widow_chars: 4
+  max_title_lines: 2
+  allow_hyphenation: false
+
+# How much drift the deterministic layer forgives before it reports. Loosen
+# these first if the report is noisy; tighten them for a final proof.
+tolerances:
+  color_delta_e: 3.0
+  size_pt: 0.5
+  position_in: 0.05
+
+# Not brand values: how the rules decide something is a defect. A brand book
+# will never specify these, so they are never extracted. Tune them against a
+# deck you know is correct, and loosen them first when the report is noisy.
+tuning:
+  # Fraction of the canvas a shape must cover to read as intentional bleed.
+  bleed_coverage: 0.9
+  # Square inches of overlap below which two boxes are merely touching.
+  min_overlap_in2: 0.02
+  # Shapes that must share a left edge before it counts as a grid line.
+  grid_support: 4
+  # Multiple of position tolerance within which a miss is drift rather than
+  # deliberate placement.
+  near_miss_factor: 4.0
+  # Multiple of colour tolerance within which a palette entry is close enough
+  # to name as the intended colour in a suggestion.
+  suggestion_factor: 4.0
+  # Roles where size variation across slides is a defect.
+  strict_size_roles: [title, subtitle, footer]
+
+# Where each value above came from. Written by extract-guidelines; a report
+# reads it to say which findings rest on inferred rather than stated values.
+# Hand-written files can leave this out entirely.
+provenance: {}
+
+# Free prose, passed verbatim to the AI layer. This is where a rule that cannot
+# be expressed as a number belongs.
+notes: |
+  Section dividers use the primary colour full-bleed with reversed white text;
+  do not flag reversed type on a divider as a contrast problem.
+  Data-heavy slides may drop body copy to 12pt, but never below.
+  The accent colour is for a single emphasis per slide, never for body copy.

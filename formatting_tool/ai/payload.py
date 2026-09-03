@@ -1,0 +1,191 @@
+#Build the request payload for the AI validation layer.
+
+
+from __future__ import annotations
+
+import json
+from typing import Any, Iterator, Optional, Sequence
+
+from ..models import (
+    DeckProfile,
+    Issue,
+    MasterSpec,
+    ShapeProfile,
+    SlideProfile,
+    enum_safe,
+)
+
+DEFAULT_BATCH_SIZE = 10
+
+
+# cached half: guidelines and expected values
+
+def build_reference_block(spec: MasterSpec) -> str:
+
+    guidelines = spec.guidelines
+    reference = {
+        "brand": guidelines.name,
+        "slide_size_in": [spec.width_in, spec.height_in],
+        "palette": spec.palette,
+        "allowed_fonts": spec.allowed_fonts,
+        "arabic_fonts": guidelines.arabic_fonts,
+        "roles": enum_safe({k: v for k, v in spec.roles.items()}),
+        "logo": enum_safe(guidelines.logo),
+        "safe_margins_in": enum_safe(guidelines.safe_margins),
+        "typography": enum_safe(guidelines.typography),
+        "tolerances": enum_safe(guidelines.tolerances),
+        "master_observed_sizes_pt": spec.observed_sizes_pt,
+        "master_layouts": spec.layout_names,
+        "notes": guidelines.notes,
+    }
+    return json.dumps(enum_safe(reference), indent=2, sort_keys=True)
+
+
+# volatile half: rule findings and slides
+
+def ref_for(index: int) -> str:
+    return f"R{index + 1}"
+
+
+def build_rule_findings(issues: Sequence[Issue]) -> list[dict[str, Any]]:
+    return [
+        {
+            "ref": ref_for(index),
+            "rule_id": issue.rule_id,
+            "slide": issue.slide,
+            "shape": issue.shape,
+            "category": issue.category.value,
+            "severity": issue.severity.value,
+            "message": issue.message,
+            "expected": issue.expected,
+            "found": issue.found,
+        }
+        for index, issue in enumerate(issues)
+    ]
+
+
+def build_slide_digests(slides: Sequence[SlideProfile]) -> list[dict[str, Any]]:
+
+    return [
+        {
+            "n": slide.number,
+            "layout": slide.layout_name,
+            "hidden": slide.hidden or None,
+            "shapes": [_shape_digest(shape) for shape in slide.shapes],
+        }
+        for slide in slides
+    ]
+
+
+def _shape_digest(shape: ShapeProfile) -> dict[str, Any]:
+    box = shape.geometry
+    digest: dict[str, Any] = {
+        "name": shape.name,
+        "type": shape.shape_type,
+        "role": shape.role.value,
+        "ph": shape.placeholder_type,
+        "box_in": [box.left_in, box.top_in, box.width_in, box.height_in],
+    }
+    if shape.text.strip():
+        digest["text"] = shape.text
+    if shape.fill_hex:
+        digest["fill"] = shape.fill_hex
+    if shape.line_hex:
+        digest["line"] = shape.line_hex
+    if shape.image_sha1:
+        digest["image_sha1"] = shape.image_sha1
+    if shape.autofit:
+        digest["autofit"] = shape.autofit
+
+    runs = _run_digests(shape)
+    if runs:
+        digest["runs"] = runs
+    if shape.children:
+        digest["children"] = [_shape_digest(child) for child in shape.children]
+    return {k: v for k, v in digest.items() if v is not None}
+
+
+def _run_digests(shape: ShapeProfile) -> list[dict[str, Any]]:
+
+    seen: dict[tuple, dict[str, Any]] = {}
+    for paragraph in shape.paragraphs:
+        for run in paragraph.runs:
+            if not run.text.strip():
+                continue
+            key = (
+                run.font_name,
+                run.size_pt,
+                run.bold,
+                run.italic,
+                run.color_hex,
+                run.color_is_theme,
+                paragraph.level,
+            )
+            if key in seen:
+                seen[key]["runs"] += 1
+                continue
+            entry = {
+                "font": run.font_name,
+                "pt": run.size_pt,
+                "bold": run.bold or None,
+                "italic": run.italic or None,
+                "color": run.color_hex,
+                "theme_color": run.color_is_theme or None,
+                "level": paragraph.level or None,
+                "align": paragraph.alignment,
+                "runs": 1,
+                "sample": run.text[:60],
+            }
+            seen[key] = {k: v for k, v in entry.items() if v is not None}
+    return list(seen.values())
+
+
+# batching
+
+def build_batches(
+    deck: DeckProfile,
+    rule_issues: Sequence[Issue],
+    batch_size: int = DEFAULT_BATCH_SIZE,
+) -> Iterator[dict[str, Any]]:
+
+    findings = build_rule_findings(rule_issues)
+    deck_level = [f for f in findings if f["slide"] is None]
+
+    slides = deck.slides
+    total = (len(slides) + batch_size - 1) // batch_size or 1
+
+    for index in range(0, len(slides), batch_size):
+        chunk = slides[index: index + batch_size]
+        numbers = {slide.number for slide in chunk}
+        yield {
+            "deck": deck.name,
+            "batch": {
+                "index": index // batch_size + 1,
+                "of": total,
+                "slides": sorted(numbers),
+            },
+            "slide_size_in": [deck.width_in, deck.height_in],
+            "theme_fonts": deck.theme_fonts,
+            "theme_colors": deck.theme_colors,
+            "rule_findings": deck_level
+            + [f for f in findings if f["slide"] in numbers],
+            "slides": build_slide_digests(chunk),
+        }
+
+
+def payload_to_text(payload: dict[str, Any]) -> str:
+    return json.dumps(enum_safe(payload), indent=1, sort_keys=True)
+
+
+def estimate_tokens(text: str) -> int:
+    return len(text) // 4
+
+
+def find_issue_by_ref(
+    issues: Sequence[Issue],
+    ref: str,
+) -> Optional[Issue]:
+    for index, issue in enumerate(issues):
+        if ref_for(index) == ref:
+            return issue
+    return None

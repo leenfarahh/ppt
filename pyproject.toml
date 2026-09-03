@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "formatting-tool"
+version = "0.1.0"
+description = "Two-layer deck formatting validator: deterministic rules, then an AI review pass."
+requires-python = ">=3.10"
+dependencies = [
+    "python-pptx>=1.0.2",
+    "google-genai>=1.0.0",
+    "PyYAML>=6.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.scripts]
+formatting-tool = "formatting_tool.cli:main"
+
+[tool.setuptools]
+packages = [
+    "formatting_tool",
+    "formatting_tool.extract",
+    "formatting_tool.rules",
+    "formatting_tool.ai",
+    "formatting_tool.report",
+]

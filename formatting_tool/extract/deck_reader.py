@@ -18,11 +18,13 @@ from xml.etree import ElementTree
 from ..models import (
     DeckProfile,
     Geometry,
+    LayoutProfile,
     ParagraphProfile,
     RunProfile,
     ShapeProfile,
     SlideProfile,
     TextRole,
+    placeholder_token,
 )
 
 _DRAWINGML_NS = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
@@ -72,7 +74,7 @@ def read_deck(path: str | Path) -> DeckProfile:
         path=str(path),
         width_in=_inches(prs.slide_width),
         height_in=_inches(prs.slide_height),
-        layout_names=[_safe(lambda: lay.name) or "" for lay in _layouts(prs)],
+        layouts=_read_layouts(prs),
         theme_fonts=theme_fonts,
         theme_colors=theme_colors,
     )
@@ -103,8 +105,10 @@ def _read_slide(slide: Any, number: int) -> SlideProfile:
 def _read_shape(shape: Any) -> ShapeProfile:
     shape_type = str(_safe(lambda: shape.shape_type) or "UNKNOWN")
     placeholder_type = None
+    placeholder_idx = None
     if _safe(lambda: shape.is_placeholder):
         placeholder_type = str(_safe(lambda: shape.placeholder_format.type) or "")
+        placeholder_idx = _safe(lambda: shape.placeholder_format.idx)
 
     profile = ShapeProfile(
         shape_id=_safe(lambda: shape.shape_id) or -1,
@@ -118,6 +122,7 @@ def _read_shape(shape: Any) -> ShapeProfile:
             rotation=float(_safe(lambda: shape.rotation) or 0.0),
         ),
         placeholder_type=placeholder_type,
+        placeholder_idx=placeholder_idx if placeholder_idx is None else int(placeholder_idx),
         role=_role_for(placeholder_type, _safe(lambda: shape.name) or ""),
         fill_hex=_fill_hex(shape),
         line_hex=_line_hex(shape),
@@ -179,7 +184,7 @@ def _role_for(placeholder_type: Optional[str], shape_name: str) -> TextRole:
     ("Title 1", "Subtitle 2") -- and which is itself a signal worth reporting
     when it disagrees with the geometry.
     """
-    token = _placeholder_token(placeholder_type)
+    token = placeholder_token(placeholder_type)
     if token and token in _PLACEHOLDER_ROLES:
         return _PLACEHOLDER_ROLES[token]
 
@@ -193,11 +198,28 @@ def _role_for(placeholder_type: Optional[str], shape_name: str) -> TextRole:
     return TextRole.UNKNOWN
 
 
-def _placeholder_token(placeholder_type: Optional[str]) -> Optional[str]:
-    """"SUBTITLE (4)" -> "SUBTITLE". Also tolerates a bare enum name."""
-    if not placeholder_type:
-        return None
-    return placeholder_type.split("(")[0].strip().upper()
+# --------------------------------------------------------------------------- #
+# Layouts
+# --------------------------------------------------------------------------- #
+
+def _read_layouts(prs: Any) -> list[LayoutProfile]:
+    """Read every layout in the file, shapes and all.
+
+    Names alone are not enough for either job that needs layouts: checking a
+    layout carries its header and footer furniture means looking at its
+    shapes, and choosing which layout a messy slide belongs on means comparing
+    placeholder structure.
+    """
+    layouts: list[LayoutProfile] = []
+    for index, layout in enumerate(_layouts(prs)):
+        profile = LayoutProfile(
+            name=_safe(lambda: layout.name) or f"layout {index + 1}",
+            index=index,
+        )
+        for shape in _safe(lambda: list(layout.shapes)) or []:
+            profile.shapes.append(_read_shape(shape))
+        layouts.append(profile)
+    return layouts
 
 
 # --------------------------------------------------------------------------- #

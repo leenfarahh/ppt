@@ -21,7 +21,8 @@ from typing import Any, Optional
 from ..ai.client import DEFAULT_MODEL, THINKING_BUDGETS
 from ..ai.gemini import AIValidationError, build_client, count, file_part, generate_json
 from ..ai.schema import to_gemini_schema
-from ..models import BrandGuidelines, Provenance
+from ..extract import DeckReadError, read_deck
+from ..models import BrandGuidelines, Provenance, guideline_paths
 from .mapping import Rejection, guidelines_from_extraction
 from .schema import BRANDBOOK_SCHEMA
 
@@ -122,6 +123,86 @@ class BrandBookError(RuntimeError):
     """Raised when a reference file cannot be read."""
 
 
+def extract_guidelines(
+    path: str | Path,
+    config: Optional[ExtractConfig] = None,
+    client: Any = None,
+) -> ExtractionResult:
+    """Extract guidelines from a brand reference, PDF or approved deck.
+
+    The two sources answer different questions and are not interchangeable. A
+    PDF brand book states rules, so what comes out of it is AUTHORED and
+    carries a quote. An approved deck states nothing; it demonstrates. What
+    comes out of it is INFERRED, and a reviewer has to promote each value
+    before a report will speak about it in brand terms.
+    """
+    suffix = Path(path).suffix.lower()
+    if suffix == ".pdf":
+        return extract_from_pdf(path, config, client)
+    if suffix == ".pptx":
+        return extract_from_deck(path)
+    raise BrandBookError(
+        f"{Path(path).name}: expected a .pdf brand book or a .pptx approved "
+        "deck. Export a DOCX or Keynote brand document to PDF first, so that "
+        "what is read is what a designer sees on the page."
+    )
+
+
+def extract_from_deck(path: str | Path) -> ExtractionResult:
+    """Read an approved deck as a brand reference.
+
+    No model call: everything worth having is already structured in the file.
+    The theme carries the palette and the typefaces, and the slides carry the
+    type sizes, the logo placement and the margins. Reading those is what
+    `inference` already does for a master deck, so this returns the empty
+    shell it fills.
+
+    A deck is evidence of habit, never a stated rule, so every value it
+    produces is marked MISSING here and INFERRED once inference has run. The
+    report hedges findings that rest on them, deliberately.
+    """
+    path = Path(path)
+    if not path.exists():
+        raise BrandBookError(f"reference file not found: {path}")
+
+    try:
+        deck = read_deck(path)
+    except DeckReadError as exc:
+        raise BrandBookError(str(exc)) from exc
+
+    if not deck.slides:
+        log.warning(
+            "%s has no slides, only layouts. The palette and typefaces come "
+            "from the theme and will still be read, but type sizes, logo "
+            "placement and margins are read from slides and will stay "
+            "unspecified. Add one example slide per layout to get them.",
+            path.name,
+        )
+
+    guidelines = BrandGuidelines(
+        name=path.stem,
+        source=path.name,
+        # Nothing in a deck is stated, so every value starts unspecified and
+        # inference decides which of them the file is consistent enough to
+        # support.
+        provenance={p: Provenance.MISSING.value for p in guideline_paths()},
+    )
+
+    log.info(
+        "read %s: %d slide(s), %d layout(s), %d theme colour(s), %d theme font(s)",
+        path.name,
+        len(deck.slides),
+        len(deck.layouts),
+        len(deck.theme_colors),
+        len(deck.theme_fonts),
+    )
+    return ExtractionResult(
+        guidelines=guidelines,
+        source=str(path),
+        unspecified=guideline_paths(),
+    )
+
+
 def extract_from_pdf(
     path: str | Path,
     config: Optional[ExtractConfig] = None,
@@ -135,9 +216,8 @@ def extract_from_pdf(
         raise BrandBookError(f"reference file not found: {path}")
     if path.suffix.lower() != ".pdf":
         raise BrandBookError(
-            f"{path.name}: only PDF reference files are supported. "
-            "Export a PPTX or DOCX brand document to PDF first, so that what "
-            "is read is what a designer sees on the page."
+            f"{path.name}: extract_from_pdf reads PDFs only; use "
+            "extract_guidelines to accept an approved .pptx as well."
         )
 
     client = client or build_client(config.api_key_env)

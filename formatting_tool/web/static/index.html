@@ -1,0 +1,719 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Deck check</title>
+<style>
+:root {
+  --bg: #FAFAF9;
+  --surface: #FFFFFF;
+  --ink: #17191C;
+  --muted: #6E7278;
+  --faint: #9A9EA4;
+  --line: #E5E5E1;
+  --line-strong: #D3D3CE;
+  --accent: #1F2A44;
+  --accent-ink: #FFFFFF;
+  --tint: #F0F1F4;
+  --blocker: #A11B2B;
+  --error: #B4531A;
+  --warning: #8A6A12;
+  --info: #5A6472;
+  --mono: ui-monospace, "Cascadia Mono", "SF Mono", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0F1114;
+    --surface: #16191D;
+    --ink: #E9EAEC;
+    --muted: #979DA5;
+    --faint: #6C737C;
+    --line: #24282E;
+    --line-strong: #333941;
+    --accent: #E9EAEC;
+    --accent-ink: #0F1114;
+    --tint: #1D2127;
+    --blocker: #F1707C;
+    --error: #F0975A;
+    --warning: #DCB53F;
+    --info: #93A0B1;
+  }
+}
+
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 400 14px/1.55 ui-sans-serif, -apple-system, "Segoe UI", Inter, system-ui, sans-serif;
+  font-feature-settings: "cv05", "ss01";
+}
+main { max-width: 880px; margin: 0 auto; padding: 56px 24px 120px; }
+h1, h2, h3 { margin: 0; font-weight: 600; letter-spacing: -0.011em; }
+code { font-family: var(--mono); font-size: 12px; }
+button { font: inherit; color: inherit; cursor: pointer; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+
+/* ---------- header ---------- */
+header { margin-bottom: 34px; }
+header h1 { font-size: 19px; }
+header p { margin: 5px 0 0; color: var(--muted); font-size: 13px; }
+
+/* ---------- drop zones ---------- */
+.inputs { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+@media (max-width: 620px) { .inputs { grid-template-columns: 1fr; } }
+
+.drop {
+  position: relative;
+  background: var(--surface);
+  border: 1px dashed var(--line-strong);
+  border-radius: 10px;
+  padding: 18px;
+  min-height: 116px;
+  display: flex; flex-direction: column; gap: 4px;
+  transition: border-color .12s ease, background .12s ease;
+}
+.drop:hover { border-color: var(--faint); }
+.drop.over { border-color: var(--accent); border-style: solid; background: var(--tint); }
+/* The tall drop target earns its space while empty; once a file is in it the
+   grid keeps both columns level anyway. */
+.drop.filled { border-style: solid; border-color: var(--line-strong); min-height: 0; }
+.drop-label {
+  font-size: 11px; letter-spacing: .07em; text-transform: uppercase;
+  color: var(--faint); font-weight: 600;
+}
+.drop-hint { color: var(--muted); font-size: 13px; }
+.drop-hint u { text-decoration-color: var(--line-strong); text-underline-offset: 2px; cursor: pointer; }
+.files { list-style: none; margin: 6px 0 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.files li { display: flex; align-items: baseline; gap: 8px; font-size: 13px; }
+.files .size { color: var(--faint); font-size: 11px; font-family: var(--mono); margin-left: auto; }
+.files .x {
+  border: 0; background: none; color: var(--faint); padding: 0 2px;
+  font-size: 15px; line-height: 1;
+}
+.files .x:hover { color: var(--blocker); }
+.drop input[type=file] { display: none; }
+
+/* ---------- controls ---------- */
+.controls {
+  display: flex; align-items: flex-end; gap: 18px; flex-wrap: wrap;
+  margin-top: 18px;
+}
+.field { display: flex; flex-direction: column; gap: 6px; }
+.field > span {
+  font-size: 11px; letter-spacing: .07em; text-transform: uppercase;
+  color: var(--faint); font-weight: 600;
+}
+select, input[type=text], input[type=number] {
+  font: inherit; color: inherit; background: var(--surface);
+  border: 1px solid var(--line-strong); border-radius: 7px;
+  padding: 7px 10px; min-width: 190px;
+}
+input[type=number] { min-width: 84px; }
+
+.segmented { display: inline-flex; border: 1px solid var(--line-strong); border-radius: 7px; overflow: hidden; }
+.segmented button {
+  border: 0; background: var(--surface); padding: 7px 13px; font-size: 13px;
+  color: var(--muted);
+}
+.segmented button + button { border-left: 1px solid var(--line-strong); }
+.segmented button.on { background: var(--accent); color: var(--accent-ink); font-weight: 500; }
+
+.run {
+  margin-left: auto; border: 0; border-radius: 7px;
+  background: var(--accent); color: var(--accent-ink);
+  padding: 9px 20px; font-weight: 500;
+}
+.run:disabled { opacity: .45; cursor: default; }
+
+details.advanced { margin-top: 16px; }
+details.advanced summary {
+  cursor: pointer; color: var(--muted); font-size: 12.5px;
+  list-style: none; width: fit-content;
+}
+details.advanced summary::-webkit-details-marker { display: none; }
+details.advanced summary::before { content: "+ "; color: var(--faint); }
+details.advanced[open] summary::before { content: "\2212  "; }
+.advanced-body {
+  display: flex; gap: 16px; flex-wrap: wrap; margin-top: 14px;
+  padding: 16px; background: var(--surface);
+  border: 1px solid var(--line); border-radius: 9px;
+}
+.note { font-size: 12px; color: var(--faint); flex-basis: 100%; margin: 0; }
+
+/* ---------- status ---------- */
+.status { margin-top: 22px; font-size: 13px; color: var(--muted); }
+.status.err { color: var(--blocker); }
+.spinner {
+  display: inline-block; width: 11px; height: 11px; margin-right: 8px;
+  border: 1.5px solid var(--line-strong); border-top-color: var(--accent);
+  border-radius: 50%; animation: spin .7s linear infinite; vertical-align: -1px;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ---------- summary ---------- */
+.summary {
+  margin-top: 34px; padding-top: 18px;
+  border-top: 1px solid var(--line-strong);
+}
+.summary-line { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.summary-line .count { font-size: 19px; font-weight: 600; letter-spacing: -0.02em; }
+.summary-line .meta { color: var(--muted); font-size: 12.5px; }
+.summary-line .meta code { color: var(--muted); }
+
+.toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
+.chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  border: 1px solid var(--line-strong); background: var(--surface);
+  border-radius: 20px; padding: 4px 11px; font-size: 12.5px; color: var(--muted);
+}
+.chip .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.chip.on { color: var(--ink); border-color: var(--faint); }
+.chip.off { opacity: .42; }
+.chip .n { font-family: var(--mono); font-size: 11px; }
+.chip.blocker .dot { color: var(--blocker); }
+.chip.error   .dot { color: var(--error); }
+.chip.warning .dot { color: var(--warning); }
+.chip.info    .dot { color: var(--info); }
+.toolbar .grow { margin-left: auto; display: flex; gap: 8px; }
+.toolbar input[type=text] { min-width: 160px; padding: 5px 10px; font-size: 13px; border-radius: 20px; }
+.linkish {
+  border: 1px solid var(--line-strong); background: var(--surface);
+  border-radius: 20px; padding: 5px 12px; font-size: 12.5px; color: var(--muted);
+}
+.linkish:hover { color: var(--ink); border-color: var(--faint); }
+
+/* ---------- notices ---------- */
+.notice {
+  margin-top: 16px; padding: 11px 14px; border-radius: 8px;
+  border: 1px solid var(--line-strong); background: var(--surface);
+  font-size: 13px; display: flex; gap: 10px; align-items: flex-start;
+}
+.notice b { font-weight: 600; }
+.notice.warn { border-left: 3px solid var(--warning); }
+.notice.bad  { border-left: 3px solid var(--blocker); }
+.notice p { margin: 3px 0 0; color: var(--muted); font-size: 12.5px; }
+
+/* ---------- findings ---------- */
+.deck-group { margin-top: 30px; }
+.deck-group > h2 {
+  font-size: 13px; letter-spacing: .04em; text-transform: uppercase;
+  color: var(--faint);
+  padding-bottom: 8px; border-bottom: 1px solid var(--line);
+}
+.slide-head {
+  margin-top: 22px; margin-bottom: 2px;
+  font-size: 12px; font-family: var(--mono); color: var(--faint);
+}
+
+.finding {
+  display: grid; grid-template-columns: 82px 1fr; gap: 14px;
+  padding: 11px 0; border-bottom: 1px solid var(--line);
+}
+.finding .sev {
+  display: flex; align-items: center; gap: 6px;
+  /* Grid items stretch by default, which would centre the label against the
+     whole finding. It belongs beside the first line of the message. */
+  align-self: start; padding-top: 3px;
+  font-size: 11.5px; letter-spacing: .02em;
+}
+.finding .sev .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; flex: none; }
+.finding.blocker .sev { color: var(--blocker); }
+.finding.error   .sev { color: var(--error); }
+.finding.warning .sev { color: var(--warning); }
+.finding.info    .sev { color: var(--info); }
+
+.finding .head { display: flex; align-items: baseline; gap: 12px; }
+.finding .msg { flex: 1; }
+.finding .tag {
+  font-family: var(--mono); font-size: 11px; color: var(--faint);
+  white-space: nowrap;
+}
+.finding .where { color: var(--muted); font-size: 12.5px; margin-top: 2px; }
+.finding .pair { margin-top: 5px; font-size: 12px; display: flex; gap: 14px; flex-wrap: wrap; }
+.finding .pair .k { color: var(--faint); margin-right: 5px; }
+.finding .pair code {
+  background: var(--tint); border-radius: 4px; padding: 1px 5px;
+}
+.finding .fix { margin-top: 5px; font-size: 12.5px; color: var(--muted); }
+.finding .fix::before { content: "\2192  "; color: var(--faint); }
+.badge-ai {
+  font-size: 10px; letter-spacing: .06em; text-transform: uppercase;
+  border: 1px solid var(--line-strong); border-radius: 4px;
+  padding: 0 4px; color: var(--faint);
+}
+
+.empty { margin-top: 34px; padding-top: 18px; border-top: 1px solid var(--line-strong); color: var(--muted); }
+.hidden { display: none !important; }
+
+.runlog {
+  margin-top: 26px; font-size: 12px;
+}
+.runlog summary { cursor: pointer; color: var(--faint); list-style: none; width: fit-content; }
+.runlog summary::-webkit-details-marker { display: none; }
+.runlog pre {
+  font-family: var(--mono); font-size: 11.5px; line-height: 1.6;
+  background: var(--surface); border: 1px solid var(--line);
+  border-radius: 8px; padding: 12px 14px; margin: 10px 0 0;
+  overflow-x: auto; white-space: pre-wrap; color: var(--muted);
+}
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Deck check</h1>
+    <p>Validate a deck against its master and brand guidelines.</p>
+  </header>
+
+  <section class="inputs">
+    <div class="drop" id="drop-master" data-kind="master">
+      <span class="drop-label">Master</span>
+      <span class="drop-hint">Drop the approved deck, or <u>browse</u></span>
+      <ul class="files"></ul>
+      <input type="file" accept=".pptx">
+    </div>
+    <div class="drop" id="drop-deck" data-kind="deck">
+      <span class="drop-label">Decks to check</span>
+      <span class="drop-hint">Drop one or more, or <u>browse</u></span>
+      <ul class="files"></ul>
+      <input type="file" accept=".pptx" multiple>
+    </div>
+  </section>
+
+  <div class="controls">
+    <label class="field">
+      <span>Guidelines</span>
+      <select id="guidelines"></select>
+    </label>
+    <div class="field">
+      <span>Layers</span>
+      <div class="segmented" id="layers">
+        <button data-ai="0" class="on">Rules only</button>
+        <button data-ai="1">Rules + AI</button>
+      </div>
+    </div>
+    <button class="run" id="run">Run check</button>
+  </div>
+
+  <details class="advanced">
+    <summary>AI options</summary>
+    <div class="advanced-body">
+      <label class="field">
+        <span>Model</span>
+        <input type="text" id="model" spellcheck="false">
+      </label>
+      <label class="field">
+        <span>Effort</span>
+        <select id="effort">
+          <option>low</option><option>medium</option><option>high</option>
+          <option>xhigh</option><option>max</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>Min confidence</span>
+        <input type="number" id="confidence" min="0" max="1" step="0.05" value="0">
+      </label>
+      <label class="field">
+        <span>Slides per call</span>
+        <input type="number" id="batch" min="1" max="50" step="1">
+      </label>
+      <p class="note" id="ai-note"></p>
+    </div>
+  </details>
+
+  <div class="status" id="status"></div>
+  <div id="results"></div>
+</main>
+
+<script>
+"use strict";
+
+const SEVERITIES = ["blocker", "error", "warning", "info"];
+
+const state = {
+  ctx: null,
+  master: null,
+  decks: [],
+  useAI: false,
+  result: null,
+  hidden: new Set(),   // severities toggled off
+  query: "",
+};
+
+const $ = (sel) => document.querySelector(sel);
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const kb = (n) => n < 1e6 ? `${Math.round(n / 1024)} KB` : `${(n / 1e6).toFixed(1)} MB`;
+
+/* ---------------- boot ---------------- */
+
+async function boot() {
+  try {
+    state.ctx = await (await fetch("/api/context")).json();
+  } catch (err) {
+    return setStatus(`Could not reach the server: ${err.message}`, "err");
+  }
+  const ctx = state.ctx;
+
+  const select = $("#guidelines");
+  select.innerHTML =
+    `<option value="">None (master only)</option>` +
+    ctx.guidelines.map((f) => `<option value="${esc(f)}">${esc(f)}</option>`).join("");
+  // A guidelines file is the difference between 11 findings and 21, so pick
+  // one if there is exactly one obvious candidate.
+  if (ctx.guidelines.length === 1) select.value = ctx.guidelines[0];
+
+  $("#model").value = ctx.defaults.model;
+  $("#effort").value = ctx.defaults.effort;
+  $("#batch").value = ctx.defaults.batch_size;
+
+  const notes = [];
+  if (ctx.defaults.cli_model !== ctx.defaults.model) {
+    notes.push(`The CLI default is <code>${esc(ctx.defaults.cli_model)}</code>, which is retired and answers 404.`);
+  }
+  if (!ctx.api_key) notes.push("No <code>GEMINI_API_KEY</code> in the environment, so the AI layer will fail.");
+  $("#ai-note").innerHTML = notes.join(" ");
+
+  setStatus(`Guidelines from ${esc(ctx.guidelines_dir)}`);
+}
+
+/* ---------------- file inputs ---------------- */
+
+function wireDrop(el) {
+  const kind = el.dataset.kind;
+  const input = el.querySelector("input[type=file]");
+
+  el.addEventListener("click", (e) => {
+    // The remove buttons live inside the zone, and this listener runs before
+    // the document-level one that handles them.
+    if (e.target === input || e.target.closest(".x")) return;
+    input.click();
+  });
+  input.addEventListener("change", () => { accept(kind, input.files); input.value = ""; });
+
+  el.addEventListener("dragover", (e) => { e.preventDefault(); el.classList.add("over"); });
+  el.addEventListener("dragleave", (e) => {
+    if (!el.contains(e.relatedTarget)) el.classList.remove("over");
+  });
+  el.addEventListener("drop", (e) => {
+    e.preventDefault();
+    el.classList.remove("over");
+    accept(kind, e.dataTransfer.files);
+  });
+}
+
+function accept(kind, fileList) {
+  const files = [...fileList].filter((f) => f.name.toLowerCase().endsWith(".pptx"));
+  const rejected = fileList.length - files.length;
+  if (rejected) setStatus(`Ignored ${rejected} file(s): only .pptx can be read.`, "err");
+  if (!files.length) return;
+
+  if (kind === "master") state.master = files[0];
+  else state.decks = dedupe([...state.decks, ...files]);
+  renderFiles();
+}
+
+const dedupe = (files) => {
+  const seen = new Set();
+  return files.filter((f) => {
+    const key = `${f.name}:${f.size}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+};
+
+function renderFiles() {
+  paint($("#drop-master"), state.master ? [state.master] : [], "master");
+  paint($("#drop-deck"), state.decks, "deck");
+  $("#run").disabled = !(state.master && state.decks.length);
+}
+
+function paint(el, files, kind) {
+  el.classList.toggle("filled", files.length > 0);
+  el.querySelector(".drop-hint").classList.toggle("hidden", files.length > 0);
+  el.querySelector(".files").innerHTML = files.map((f, i) => `
+    <li>
+      <span>${esc(f.name)}</span>
+      <span class="size">${kb(f.size)}</span>
+      <button class="x" data-kind="${kind}" data-i="${i}" title="Remove">&times;</button>
+    </li>`).join("");
+}
+
+document.addEventListener("click", (e) => {
+  const x = e.target.closest(".x");
+  if (!x) return;
+  e.stopPropagation();
+  if (x.dataset.kind === "master") state.master = null;
+  else state.decks.splice(Number(x.dataset.i), 1);
+  renderFiles();
+});
+
+/* ---------------- run ---------------- */
+
+function setStatus(html, cls = "") {
+  const el = $("#status");
+  el.className = `status ${cls}`;
+  el.innerHTML = html;
+}
+
+async function runCheck() {
+  if (!state.master || !state.decks.length) return;
+
+  const form = new FormData();
+  form.append("master", state.master, state.master.name);
+  for (const deck of state.decks) form.append("deck", deck, deck.name);
+  form.append("options", JSON.stringify({
+    guidelines: $("#guidelines").value,
+    use_ai: state.useAI,
+    model: $("#model").value,
+    effort: $("#effort").value,
+    min_confidence: Number($("#confidence").value) || 0,
+    batch_size: Number($("#batch").value) || undefined,
+  }));
+
+  $("#run").disabled = true;
+  $("#results").innerHTML = "";
+  const started = Date.now();
+  const tick = setInterval(() => {
+    const secs = ((Date.now() - started) / 1000).toFixed(0);
+    setStatus(`<span class="spinner"></span>Reading ${state.decks.length} deck(s)` +
+              `${state.useAI ? " and asking the model" : ""}… ${secs}s`);
+  }, 200);
+
+  try {
+    const response = await fetch("/api/validate", { method: "POST", body: form });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || data.error || `HTTP ${response.status}`);
+    state.result = data;
+    state.hidden.clear();
+    state.query = "";
+    setStatus("");
+    render();
+  } catch (err) {
+    setStatus(`<b>Run failed.</b> ${esc(err.message)}`, "err");
+  } finally {
+    clearInterval(tick);
+    $("#run").disabled = false;
+  }
+}
+
+/* ---------------- render ---------------- */
+
+function render() {
+  const { report, logs, elapsed_s: elapsed, ai } = state.result;
+  const issues = report.issues || [];
+  const counts = Object.fromEntries(SEVERITIES.map((s) =>
+    [s, issues.filter((i) => i.severity === s).length]));
+
+  const visible = issues.filter((i) => !state.hidden.has(i.severity) && matches(i));
+
+  $("#results").innerHTML = [
+    summaryHTML(report, issues, counts, visible, elapsed),
+    noticesHTML(logs, ai, report),
+    visible.length ? groupsHTML(visible) : emptyHTML(issues.length),
+    logHTML(logs),
+  ].join("");
+
+  wireResults();
+}
+
+const matches = (issue) => {
+  if (!state.query) return true;
+  const q = state.query.toLowerCase();
+  return [issue.message, issue.rule_id, issue.shape, issue.found, issue.expected, issue.suggestion]
+    .some((v) => v && String(v).toLowerCase().includes(q));
+};
+
+function summaryHTML(report, issues, counts, visible, elapsed) {
+  const filtered = visible.length !== issues.length;
+  const meta = [
+    `${esc(report.decks.join(", "))} vs ${esc(report.master)}`,
+    report.guidelines ? esc(report.guidelines.split(/[\\/]/).pop()) : "no guidelines",
+    `${elapsed}s`,
+  ];
+  return `
+  <section class="summary">
+    <div class="summary-line">
+      <span class="count">${issues.length}</span>
+      <span>finding${issues.length === 1 ? "" : "s"}</span>
+      ${filtered ? `<span class="meta">(${visible.length} shown)</span>` : ""}
+      <span class="meta">&middot; ${meta.join(" &middot; ")}</span>
+    </div>
+    <div class="toolbar">
+      ${SEVERITIES.filter((s) => counts[s]).map((s) => `
+        <button class="chip ${s} ${state.hidden.has(s) ? "off" : "on"}" data-sev="${s}">
+          <span class="dot"></span>${s}<span class="n">${counts[s]}</span>
+        </button>`).join("")}
+      <div class="grow">
+        <input type="text" id="q" placeholder="Filter…" value="${esc(state.query)}">
+        <button class="linkish" id="save">Save JSON</button>
+      </div>
+    </div>
+  </section>`;
+}
+
+function noticesHTML(logs, ai, report) {
+  const out = [];
+
+  if (ai.requested && !ai.ran) {
+    const why = logs.find((l) => l.level === "error");
+    out.push(`<div class="notice bad">
+      <div><b>The AI layer did not run.</b>
+      <p>${esc(why ? why.message : "The call failed.")}</p>
+      <p>What follows is the deterministic layer alone.</p></div></div>`);
+  }
+
+  for (const l of logs.filter((l) => l.level === "warning")) {
+    out.push(`<div class="notice warn"><div><b>Warning.</b><p>${esc(l.message)}</p></div></div>`);
+  }
+
+  if (report.inferred_values && report.inferred_values.length) {
+    out.push(`<div class="notice warn"><div>
+      <b>${report.inferred_values.length} brand value(s) were inferred, not stated.</b>
+      <p>Findings resting on these are the weaker claims here:
+      <code>${report.inferred_values.map(esc).join("</code>, <code>")}</code></p></div></div>`);
+  }
+
+  if (report.ai_summary) {
+    out.push(`<div class="notice"><div><b>Model summary.</b><p>${esc(report.ai_summary)}</p></div></div>`);
+  }
+  return out.join("");
+}
+
+function groupsHTML(issues) {
+  const byDeck = new Map();
+  for (const issue of issues) {
+    const key = issue.deck || "deck";
+    if (!byDeck.has(key)) byDeck.set(key, []);
+    byDeck.get(key).push(issue);
+  }
+
+  return [...byDeck].map(([deck, list]) => {
+    const bySlide = new Map();
+    for (const issue of list) {
+      // Deck-level findings carry no slide number; -1 sorts them to the front.
+      const slide = issue.slide ?? -1;
+      if (!bySlide.has(slide)) bySlide.set(slide, []);
+      bySlide.get(slide).push(issue);
+    }
+    const slides = [...bySlide].sort((a, b) => a[0] - b[0]);
+
+    return `<section class="deck-group">
+      <h2>${esc(deck)}</h2>
+      ${slides.map(([slide, items]) => `
+        <div class="slide-head">${slide < 0 ? "Whole deck" : `Slide ${slide}`}</div>
+        ${items.map(findingHTML).join("")}`).join("")}
+    </section>`;
+  }).join("");
+}
+
+function findingHTML(issue) {
+  const pairs = [];
+  if (issue.expected) pairs.push(`<span><span class="k">expected</span><code>${esc(issue.expected)}</code></span>`);
+  if (issue.found) pairs.push(`<span><span class="k">found</span><code>${esc(issue.found)}</code></span>`);
+
+  const tags = [];
+  if (issue.source === "ai") {
+    tags.push(`<span class="badge-ai">AI${issue.confidence != null
+      ? ` ${Math.round(issue.confidence * 100)}%` : ""}</span>`);
+  }
+  if (issue.rule_id) tags.push(esc(issue.rule_id));
+  else tags.push(esc(issue.category));
+
+  return `<article class="finding ${esc(issue.severity)}">
+    <div class="sev"><span class="dot"></span>${esc(issue.severity)}</div>
+    <div>
+      <div class="head">
+        <span class="msg">${esc(issue.message)}</span>
+        <span class="tag">${tags.join(" ")}</span>
+      </div>
+      ${issue.shape ? `<div class="where">${esc(issue.shape)}</div>` : ""}
+      ${pairs.length ? `<div class="pair">${pairs.join("")}</div>` : ""}
+      ${issue.suggestion ? `<div class="fix">${esc(issue.suggestion)}</div>` : ""}
+    </div>
+  </article>`;
+}
+
+function emptyHTML(total) {
+  return `<div class="empty">${total
+    ? "Nothing matches the current filter."
+    : "No inconsistencies found. The deck matches its master and the guidelines supplied."}</div>`;
+}
+
+function logHTML(logs) {
+  if (!logs.length) return "";
+  const body = logs.map((l) => `${l.level.padEnd(7)} ${l.message}`).join("\n");
+  return `<details class="runlog">
+    <summary>Run log (${logs.length} lines)</summary>
+    <pre>${esc(body)}</pre>
+  </details>`;
+}
+
+/* ---------------- results interaction ---------------- */
+
+function wireResults() {
+  for (const chip of document.querySelectorAll(".chip")) {
+    chip.addEventListener("click", () => {
+      const sev = chip.dataset.sev;
+      state.hidden.has(sev) ? state.hidden.delete(sev) : state.hidden.add(sev);
+      render();
+    });
+  }
+
+  const q = $("#q");
+  if (q) {
+    q.addEventListener("input", debounce(() => {
+      const caret = q.selectionStart;
+      state.query = q.value;
+      render();
+      // Re-rendering replaces the input, so put the caret back where it was.
+      const next = $("#q");
+      next.focus();
+      next.setSelectionRange(caret, caret);
+    }, 160));
+  }
+
+  const save = $("#save");
+  if (save) save.addEventListener("click", saveJSON);
+}
+
+function debounce(fn, ms) {
+  let timer;
+  return (...args) => { clearTimeout(timer); timer = setTimeout(() => fn(...args), ms); };
+}
+
+function saveJSON() {
+  const report = state.result.report;
+  const blob = new Blob([JSON.stringify(report, null, 2)], { type: "application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `${report.decks[0].replace(/\.pptx$/i, "")}-review.json`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+/* ---------------- wiring ---------------- */
+
+document.querySelectorAll(".drop").forEach(wireDrop);
+
+$("#layers").addEventListener("click", (e) => {
+  const button = e.target.closest("button");
+  if (!button) return;
+  state.useAI = button.dataset.ai === "1";
+  for (const b of $("#layers").children) b.classList.toggle("on", b === button);
+});
+
+$("#run").addEventListener("click", runCheck);
+document.addEventListener("keydown", (e) => {
+  if ((e.metaKey || e.ctrlKey) && e.key === "Enter") runCheck();
+});
+
+renderFiles();
+boot();
+</script>
+</body>
+</html>

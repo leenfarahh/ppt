@@ -14,7 +14,9 @@ from formatting_tool.ai.schema import to_gemini_schema
 from formatting_tool.brandbook import (
     BRANDBOOK_SCHEMA,
     ExtractConfig,
+    extract_from_deck,
     extract_from_pdf,
+    extract_guidelines,
     guidelines_from_extraction,
     infer_gaps,
     write_guidelines_yaml,
@@ -436,9 +438,81 @@ def test_non_pdf_reference_file_is_refused(tmp_path: Path) -> None:
     try:
         extract_from_pdf(docx)
     except Exception as exc:
-        assert "only PDF reference files are supported" in str(exc)
+        assert "reads PDFs only" in str(exc)
     else:
         raise AssertionError("a .docx reference file should be refused")
+
+
+def test_extract_guidelines_refuses_an_unsupported_reference(tmp_path: Path) -> None:
+    """The dispatcher names both accepted forms, not just the PDF."""
+    docx = tmp_path / "book.docx"
+    docx.write_bytes(b"not a pdf")
+    try:
+        extract_guidelines(docx)
+    except Exception as exc:
+        assert ".pdf brand book" in str(exc)
+        assert ".pptx approved deck" in str(exc)
+    else:
+        raise AssertionError("a .docx reference file should be refused")
+
+
+def test_extract_from_deck_starts_everything_missing(tmp_path: Path) -> None:
+    """A deck states nothing, so nothing arrives authored.
+
+    The value of the deck path is entirely in what inference makes of it, and
+    that is only sound if extraction hands it a blank slate: an AUTHORED value
+    here would be a rule nobody wrote.
+    """
+    import pytest
+
+    pptx = pytest.importorskip("pptx")
+    deck = tmp_path / "approved.pptx"
+    pptx.Presentation().save(str(deck))
+
+    result = extract_from_deck(deck)
+
+    assert result.guidelines.paths_with(Provenance.AUTHORED) == []
+    assert result.guidelines.provenance
+    assert set(result.guidelines.provenance.values()) == {Provenance.MISSING.value}
+    assert result.input_tokens == 0 and result.output_tokens == 0
+
+
+def test_palette_is_inferred_from_the_theme() -> None:
+    """The colour scheme is the one brand value a deck states unambiguously."""
+    master = DeckProfile(
+        path="master.pptx",
+        width_in=13.333,
+        height_in=7.5,
+        theme_colors={"accent1": "1F2A44", "accent2": "C8A951"},
+    )
+    guidelines = BrandGuidelines(
+        provenance={"palette": Provenance.MISSING.value}
+    )
+
+    result = infer_gaps(guidelines, master)
+
+    assert guidelines.palette == {"accent1": "1F2A44", "accent2": "C8A951"}
+    assert guidelines.provenance_of("palette") is Provenance.INFERRED
+    assert "palette" in result.inferred
+
+
+def test_authored_palette_survives_inference() -> None:
+    """An authored palette is never overwritten by the theme behind it."""
+    master = DeckProfile(
+        path="master.pptx",
+        width_in=13.333,
+        height_in=7.5,
+        theme_colors={"accent1": "FF0000"},
+    )
+    guidelines = BrandGuidelines(
+        palette={"navy": "1F2A44"},
+        provenance={"palette": Provenance.AUTHORED.value},
+    )
+
+    infer_gaps(guidelines, master)
+
+    assert guidelines.palette == {"navy": "1F2A44"}
+    assert guidelines.provenance_of("palette") is Provenance.AUTHORED
 
 
 # --------------------------------------------------------------------------- #

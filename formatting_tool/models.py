@@ -47,6 +47,7 @@ class Category(str, Enum):
     SUBTITLE = "subtitle"
     TYPOGRAPHY = "typography"   # orphans, widows, rag, hyphenation
     SPACE = "space"             # safe margins, overflow, overlap, alignment
+    LAYOUT = "layout"           # slide-to-layout binding, layout completeness
     OTHER = "other"
 
 
@@ -91,7 +92,11 @@ class Issue:
     severity: Severity
     message: str
     source: Source = Source.RULE
-    rule_id: Optional[str] = None
+    rule_id: Optional[str] = None       # the deterministic rule, for a RULE issue
+    # AI issues only: the ref (R7) of the rule finding this restates. Kept
+    # apart from rule_id, which names a rule a consumer can look up; a ref is
+    # meaningful only inside the run that produced it.
+    confirms: Optional[str] = None
     slide: Optional[int] = None         # 1-based slide number; None = deck-level
     shape: Optional[str] = None         # shape name as it appears in the deck
     deck: Optional[str] = None          # filled in by the pipeline
@@ -109,6 +114,38 @@ class Issue:
 
 
 @dataclass
+class Dismissal:
+    """A rule finding the AI layer judged a false positive, and its reason.
+
+    Recorded rather than merely dropped. A dismissal deletes something the
+    deterministic layer proved from the file, so it is a claim in its own
+    right and has to be as reviewable as the finding it removes.
+    """
+
+    rule_id: Optional[str]
+    reason: str
+    deck: Optional[str] = None
+    slide: Optional[int] = None
+    shape: Optional[str] = None
+    message: str = ""
+    severity: Optional[str] = None
+
+
+@dataclass
+class SkippedRule:
+    """A check that never ran, and what it was waiting for.
+
+    A rule that reports nothing because it is disabled looks exactly like a
+    rule that reports nothing because the deck is clean. This is the
+    difference, on the report where a reader will see it.
+    """
+
+    rule_id: str
+    reason: str
+    unlocked_by: str = ""
+
+
+@dataclass
 class ValidationReport:
     master: str
     decks: list[str]
@@ -122,6 +159,10 @@ class ValidationReport:
     # in the reference file. Findings resting on these are the weaker claims in
     # the report, so it says which they are.
     inferred_values: list[str] = field(default_factory=list)
+    # What the report does not show, and why. Between them these two account
+    # for the gap between what the rules found and what is printed.
+    dismissals: list[Dismissal] = field(default_factory=list)
+    skipped_rules: list[SkippedRule] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return enum_safe(asdict(self))
@@ -183,6 +224,7 @@ class ShapeProfile:
     shape_type: str
     geometry: Geometry
     placeholder_type: Optional[str] = None
+    placeholder_idx: Optional[int] = None   # the ph idx a slide shape binds to
     role: TextRole = TextRole.UNKNOWN
     text: str = ""
     paragraphs: list[ParagraphProfile] = field(default_factory=list)
@@ -194,6 +236,10 @@ class ShapeProfile:
     autofit: Optional[str] = None
     word_wrap: Optional[bool] = None
     children: list["ShapeProfile"] = field(default_factory=list)
+
+    @property
+    def placeholder_token(self) -> Optional[str]:
+        return placeholder_token(self.placeholder_type)
 
 
 @dataclass
@@ -207,18 +253,41 @@ class SlideProfile:
 
 
 @dataclass
+class LayoutProfile:
+    """One slide layout, read from the master rather than from a slide.
+
+    Slides carry direct formatting that hides what the layout actually
+    defines, so the layout has to be read in its own right: to check that it
+    is complete (header and footer furniture), and to decide which layout a
+    messy slide should be rebuilt onto.
+    """
+
+    name: str
+    index: int                           # position in the master, 0-based
+    shapes: list[ShapeProfile] = field(default_factory=list)
+
+    @property
+    def placeholders(self) -> list[ShapeProfile]:
+        return [s for s in self.shapes if s.placeholder_type]
+
+
+@dataclass
 class DeckProfile:
     path: str
     width_in: float
     height_in: float
     slides: list[SlideProfile] = field(default_factory=list)
-    layout_names: list[str] = field(default_factory=list)
+    layouts: list[LayoutProfile] = field(default_factory=list)
     theme_fonts: dict[str, str] = field(default_factory=dict)   # major / minor
     theme_colors: dict[str, str] = field(default_factory=dict)  # accent1 -> hex
 
     @property
     def name(self) -> str:
         return Path(self.path).name
+
+    @property
+    def layout_names(self) -> list[str]:
+        return [layout.name for layout in self.layouts]
 
 
 # --------------------------------------------------------------------------- #
@@ -303,6 +372,14 @@ class RuleTuning:
     strict_size_roles: list[str] = field(
         default_factory=lambda: ["title", "subtitle", "footer"]
     )
+    # Depth of the strips at the top and bottom of a layout that a shape has
+    # to sit in to read as header or footer furniture, as a fraction of slide
+    # height. The footer strip is the shallower of the two by convention.
+    header_band_fraction: float = 0.15
+    footer_band_fraction: float = 0.12
+    # Placeholder-signature overlap a layout must reach before a slide is
+    # rebuilt onto it without the match being called out for review.
+    layout_match_floor: float = 0.5
 
 
 @dataclass
@@ -374,11 +451,36 @@ class MasterSpec:
     roles: dict[str, RoleSpec] = field(default_factory=dict)
     observed_sizes_pt: dict[str, list[float]] = field(default_factory=dict)
     logo_geometry: Optional[Geometry] = None
-    layout_names: list[str] = field(default_factory=list)
+    layouts: list[LayoutProfile] = field(default_factory=list)
+    # The master's own theme. A messy deck carries a theme too, and it is the
+    # foreign brand's: a rule that compares a deck against its own theme is
+    # asking whether the wrong brand was applied consistently. Every reference
+    # to a theme downstream reads these, never DeckProfile.theme_*.
+    theme_fonts: dict[str, str] = field(default_factory=dict)
+    theme_colors: dict[str, str] = field(default_factory=dict)
 
     @property
     def tolerances(self) -> Tolerances:
         return self.guidelines.tolerances
+
+    @property
+    def layout_names(self) -> list[str]:
+        return [layout.name for layout in self.layouts]
+
+    def layout_named(self, name: Optional[str]) -> Optional[LayoutProfile]:
+        """Look a layout up by name, case- and separator-insensitively.
+
+        Layout names are free text: they get renamed, localized, and
+        punctuated differently between masters, so an exact match alone
+        reports drift that is not there.
+        """
+        if not name:
+            return None
+        wanted = normalize_layout_name(name)
+        for layout in self.layouts:
+            if normalize_layout_name(layout.name) == wanted:
+                return layout
+        return None
 
     def to_dict(self) -> dict[str, Any]:
         return enum_safe(asdict(self))
@@ -387,6 +489,28 @@ class MasterSpec:
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
+
+def placeholder_token(value: Optional[str]) -> Optional[str]:
+    """"SUBTITLE (4)" -> "SUBTITLE". Also tolerates a bare enum name.
+
+    python-pptx renders PP_PLACEHOLDER members with their numeric value
+    attached. Comparisons are on the exact token, never a substring: "TITLE"
+    is a substring of "SUBTITLE".
+    """
+    if not value:
+        return None
+    return value.split("(")[0].strip().upper()
+
+
+def normalize_layout_name(name: str) -> str:
+    """Fold a layout name to something two masters can be compared on.
+
+    Case, spacing, underscores and hyphens all vary between a designer's
+    master and the same layout after a round trip through PowerPoint, and none
+    of that variation means the layout changed.
+    """
+    return "".join(ch for ch in name.lower() if ch.isalnum())
+
 
 def walk_shapes(shapes: list[ShapeProfile]) -> Iterator[ShapeProfile]:
     """Depth-first walk that descends into groups.

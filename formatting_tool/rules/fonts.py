@@ -75,6 +75,11 @@ class ThemeFontDriftRule(Rule):
     explicitly (python-pptx returns None for an inherited font), so a run whose
     explicit font equals the theme font is redundant: on-brand today, broken
     the moment the theme changes. Reported once per shape, not once per run.
+
+    The theme compared against is the master's, never the deck's own. A messy
+    deck arrives carrying the theme of whatever file it was built from, and
+    measuring it against that theme asks only whether the wrong brand was
+    applied consistently.
     """
 
     id = "font.family.theme_drift"
@@ -83,7 +88,7 @@ class ThemeFontDriftRule(Rule):
     default_severity = Severity.INFO
 
     def check(self, ctx: RuleContext) -> Iterable[Issue]:
-        theme_fonts = {f.casefold(): f for f in ctx.deck.theme_fonts.values() if f}
+        theme_fonts = {f.casefold(): f for f in ctx.spec.theme_fonts.values() if f}
         if not theme_fonts:
             return
 

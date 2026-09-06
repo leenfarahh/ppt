@@ -24,4 +24,8 @@ packages = [
     "formatting_tool.rules",
     "formatting_tool.ai",
     "formatting_tool.report",
+    "formatting_tool.web",
 ]
+
+[tool.setuptools.package-data]
+"formatting_tool.web" = ["static/*.html"]

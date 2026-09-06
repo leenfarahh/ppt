@@ -27,7 +27,6 @@ DEFAULT_MODEL = "gemini-2.5-pro"
 DEFAULT_EFFORT = "high"
 DEFAULT_MAX_TOKENS = 16000
 
-
 THINKING_BUDGETS = {
     "low": 2048,
     "medium": 8192,

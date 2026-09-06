@@ -38,13 +38,20 @@ from .guidelines import load_guidelines
 from .linemetrics import LineMetricsProvider, default_provider
 from .models import (
     DeckProfile,
+    Dismissal,
     Provenance,
     Issue,
     MasterSpec,
     ValidationReport,
 )
-from .report.merge import merge_issues, summarize
-from .rules import RuleContext, build_default_rules, run_rules
+from .report.merge import merge_issues, summarize_report
+from .rules import (
+    RuleContext,
+    build_default_rules,
+    build_master_rules,
+    run_rules,
+    skipped_rules,
+)
 
 log = logging.getLogger(__name__)
 
@@ -93,12 +100,32 @@ def run(config: RunConfig) -> ValidationReport:
             ", ".join(report.inferred_values),
         )
 
-    all_issues: list[Issue] = []
+    # The master's own layouts are checked once, not once per deck: an
+    # incomplete layout is a defect in the template, and repeating it for
+    # every deck under review would bury the deck findings.
+    all_issues: list[Issue] = _run_master_layer(master, spec)
+    log.info("%s: %d master layout finding(s)", master.name, len(all_issues))
     summaries: list[str] = []
+
+    # Which checks will not run at all. It depends only on the guidelines, not
+    # on any deck, so it is settled once here rather than per deck.
+    report.skipped_rules = skipped_rules(
+        RuleContext(deck=master, spec=spec), build_default_rules()
+    )
+    if report.skipped_rules:
+        log.warning(
+            "%d check(s) will not run: no brand guidelines were supplied. "
+            "Colour, typeface, type-scale and safe-margin findings cannot "
+            "appear in this report. Run extract-guidelines --from %s to "
+            "produce one.",
+            len(report.skipped_rules),
+            master.name,
+        )
 
     for deck_path in config.decks:
         deck = read_deck(deck_path)
         _warn_on_size_mismatch(deck, spec)
+        _warn_on_foreign_theme(deck, spec)
 
         rule_issues = _run_rule_layer(deck, spec)
         log.info("%s: %d rule finding(s)", deck.name, len(rule_issues))
@@ -107,14 +134,25 @@ def run(config: RunConfig) -> ValidationReport:
         if ai_result.summary:
             summaries.append(f"{deck.name}: {ai_result.summary}")
 
+        dismissed: list[Dismissal] = []
         merged = merge_issues(
             rule_issues=rule_issues,
             ai_issues=ai_result.issues,
             dismissals=ai_result.dismissals,
             ref_lookup={ref_for(i): issue for i, issue in enumerate(rule_issues)},
             min_confidence=config.min_confidence,
+            record=dismissed,
         )
         all_issues.extend(merged)
+        report.dismissals.extend(dismissed)
+        if dismissed:
+            log.info(
+                "%s: the AI layer dismissed %d of %d rule finding(s); they are "
+                "listed on the report",
+                deck.name,
+                len(dismissed),
+                len(rule_issues),
+            )
 
         if ai_result.calls:
             log.info(
@@ -127,7 +165,9 @@ def run(config: RunConfig) -> ValidationReport:
             )
 
     report.issues = all_issues
-    report.stats = summarize(all_issues)
+    # Counted alongside the issues so the numbers reconcile: what the rules
+    # found is what is reported, plus what was dismissed.
+    report.stats = summarize_report(report)
     report.ai_summary = " ".join(summaries) or None
     return report
 
@@ -146,6 +186,16 @@ def _run_rule_layer(
     return run_rules(ctx, rules)
 
 
+def _run_master_layer(master: DeckProfile, spec: MasterSpec) -> list[Issue]:
+    """Check the master's own layouts for completeness.
+
+    The context is built on the master so that findings are attributed to the
+    template file they belong to rather than to whichever deck was under
+    review when they were found.
+    """
+    return run_rules(RuleContext(deck=master, spec=spec), build_master_rules())
+
+
 def _run_ai_layer(
     deck: DeckProfile,
     spec: MasterSpec,
@@ -158,16 +208,27 @@ def _run_ai_layer(
 
     validator = AIValidator(spec, config.ai)
 
-    for payload in build_batches(deck, rule_issues, config.batch_size):
+    for payload in build_batches(deck, rule_issues, config.batch_size, spec=spec):
         if config.ai_dry_run:
             _dump_payload(payload, validator, config)
             continue
         try:
             result.merge(validator.validate_batch(payload, deck.name))
-        except AIValidationError:
+        except AIValidationError as exc:
             # The deterministic findings are still worth reporting, so the run
             # continues without the AI layer rather than failing outright.
-            log.exception("AI layer failed on %s; reporting rule findings only", deck.name)
+            #
+            # AIValidationError already carries the actionable message, so the
+            # traceback through the SDK adds nothing at normal verbosity. It is
+            # kept for -vv, where an unexpected SDK error needs the frames.
+            log.error(
+                "AI layer failed on %s: %s -- reporting rule findings only",
+                deck.name,
+                exc,
+                exc_info=log.isEnabledFor(logging.DEBUG),
+            )
+            if not log.isEnabledFor(logging.DEBUG):
+                log.info("run with -vv for the full traceback")
             break
     return result
 
@@ -205,6 +266,28 @@ def _dump_payload(payload: dict, validator: AIValidator, config: RunConfig) -> N
         encoding="utf-8",
     )
     log.info("wrote %s", target)
+
+
+def _warn_on_foreign_theme(deck: DeckProfile, spec: MasterSpec) -> None:
+    """A deck carrying a different theme is carrying a different brand.
+
+    Every theme-bound colour and inherited typeface in the deck resolves
+    through this theme, so when it differs from the master's, the deck is
+    internally consistent against the wrong standard. Nothing downstream reads
+    the deck's theme any more, but a reader should know why so much of the
+    deck is being reported.
+    """
+    if not spec.theme_fonts and not spec.theme_colors:
+        return
+    if deck.theme_fonts == spec.theme_fonts and deck.theme_colors == spec.theme_colors:
+        return
+    log.warning(
+        "%s carries its own theme (%s), not the master's (%s); it was built "
+        "from another file and is measured against the master throughout",
+        deck.name,
+        ", ".join(f"{k}={v}" for k, v in sorted(deck.theme_fonts.items())) or "none",
+        ", ".join(f"{k}={v}" for k, v in sorted(spec.theme_fonts.items())) or "none",
+    )
 
 
 def _warn_on_size_mismatch(deck: DeckProfile, spec: MasterSpec) -> None:

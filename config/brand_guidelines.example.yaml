@@ -118,6 +118,15 @@ tuning:
   suggestion_factor: 4.0
   # Roles where size variation across slides is a defect.
   strict_size_roles: [title, subtitle, footer]
+  # How deep the strips at the top and bottom of a layout are, as a fraction of
+  # slide height. A non-placeholder shape sitting in one of them reads as the
+  # header or footer band that layout.band_missing looks for.
+  header_band_fraction: 0.15
+  footer_band_fraction: 0.12
+  # How well a layout must fit a slide's content regions before `rebuild`
+  # places the slide on it without calling the match out for review. Raise it
+  # to be told about more slides, lower it to be told about fewer.
+  layout_match_floor: 0.5
 
 # Where each value above came from. Written by extract-guidelines; a report
 # reads it to say which findings rest on inferred rather than stated values.

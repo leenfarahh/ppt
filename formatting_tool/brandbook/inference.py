@@ -53,6 +53,7 @@ def infer_gaps(guidelines: BrandGuidelines, master: DeckProfile) -> InferenceRes
     """Fill MISSING values from the master deck, marking each as INFERRED."""
     result = InferenceResult(guidelines=guidelines)
 
+    _infer_palette(guidelines, master, result)
     _infer_fonts(guidelines, master, result)
     _infer_roles(guidelines, master, result)
     _infer_logo(guidelines, master, result)
@@ -71,6 +72,36 @@ def infer_gaps(guidelines: BrandGuidelines, master: DeckProfile) -> InferenceRes
 # --------------------------------------------------------------------------- #
 # Inferences
 # --------------------------------------------------------------------------- #
+
+def _infer_palette(
+    guidelines: BrandGuidelines,
+    master: DeckProfile,
+    result: InferenceResult,
+) -> None:
+    """Palette from the theme colour scheme.
+
+    The strongest inference available from a deck, and the only one not read
+    off content: the colour scheme is a deliberate setting a designer made
+    once, not a by-product of editing, and every theme-bound colour in the
+    file resolves through it. Entries keep their theme slot names because
+    nobody has stated a brand name for them.
+    """
+    if not _is_missing(guidelines, "palette") or guidelines.palette:
+        return
+    if not master.theme_colors:
+        log.debug("%s declares no theme colours, not inferring a palette", master.name)
+        return
+
+    guidelines.palette = dict(master.theme_colors)
+    # The basis is repeated on every palette line in the written file, so it
+    # stays short: the slot names are the keys the reader is already looking at.
+    _mark(
+        guidelines,
+        result,
+        "palette",
+        f"{len(master.theme_colors)} theme colour slots in {master.name}",
+    )
+
 
 def _infer_fonts(
     guidelines: BrandGuidelines,

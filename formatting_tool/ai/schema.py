@@ -145,7 +145,11 @@ def issues_from_response(
                 severity=_severity(raw.get("severity")),
                 message=str(raw.get("message", "")).strip(),
                 source=Source.AI,
-                rule_id=_first_ref(raw.get("confirms_refs")),
+                # The ref goes in `confirms`, not `rule_id`. A ref like "R7"
+                # is an index into this run's rule findings; putting it in
+                # rule_id hands a downstream consumer a rule name that does
+                # not exist.
+                confirms=_first_ref(raw.get("confirms_refs")),
                 slide=raw.get("slide"),
                 shape=raw.get("shape"),
                 deck=deck_name,

@@ -146,6 +146,7 @@ def build_batches(
     deck: DeckProfile,
     rule_issues: Sequence[Issue],
     batch_size: int = DEFAULT_BATCH_SIZE,
+    spec: Optional[MasterSpec] = None,
 ) -> Iterator[dict[str, Any]]:
 
     findings = build_rule_findings(rule_issues)
@@ -153,6 +154,7 @@ def build_batches(
 
     slides = deck.slides
     total = (len(slides) + batch_size - 1) // batch_size or 1
+    theme = _theme_block(deck, spec)
 
     for index in range(0, len(slides), batch_size):
         chunk = slides[index: index + batch_size]
@@ -165,12 +167,40 @@ def build_batches(
                 "slides": sorted(numbers),
             },
             "slide_size_in": [deck.width_in, deck.height_in],
-            "theme_fonts": deck.theme_fonts,
-            "theme_colors": deck.theme_colors,
+            **theme,
             "rule_findings": deck_level
             + [f for f in findings if f["slide"] in numbers],
             "slides": build_slide_digests(chunk),
         }
+
+
+def _theme_block(deck: DeckProfile, spec: Optional[MasterSpec]) -> dict[str, Any]:
+    """The theme the model should judge against, plus the deck's if it differs.
+
+    Sending the deck's own theme under a neutral name told the model that the
+    foreign brand it arrived with was the standard. The master's theme is the
+    reference; the deck's appears only when the two disagree, named for what
+    it is, because a deck carrying somebody else's theme is itself a finding
+    worth the model's attention.
+    """
+    if spec is None:
+        return {"theme_fonts": deck.theme_fonts, "theme_colors": deck.theme_colors}
+
+    block: dict[str, Any] = {
+        "master_theme_fonts": spec.theme_fonts,
+        "master_theme_colors": spec.theme_colors,
+    }
+    if deck.theme_fonts != spec.theme_fonts or deck.theme_colors != spec.theme_colors:
+        block["deck_own_theme"] = {
+            "note": (
+                "This deck carries its own theme, from the file it was built "
+                "from. It is not the brand standard; judge against "
+                "master_theme_* above."
+            ),
+            "fonts": deck.theme_fonts,
+            "colors": deck.theme_colors,
+        }
+    return block
 
 
 def payload_to_text(payload: dict[str, Any]) -> str:

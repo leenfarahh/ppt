@@ -41,7 +41,9 @@ def derive_master_spec(
         roles=_roles(guidelines, observed_sizes),
         observed_sizes_pt={k: sorted(v) for k, v in observed_sizes.items()},
         logo_geometry=_logo_geometry(master, guidelines),
-        layout_names=list(master.layout_names),
+        layouts=list(master.layouts),
+        theme_fonts=dict(master.theme_fonts),
+        theme_colors=dict(master.theme_colors),
     )
     return spec
 

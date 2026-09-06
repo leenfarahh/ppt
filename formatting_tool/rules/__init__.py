@@ -11,7 +11,7 @@ import logging
 from typing import Iterable, Optional, Sequence
 
 from ..linemetrics import LineMetricsProvider
-from ..models import Issue
+from ..models import Issue, SkippedRule
 from .base import Rule, RuleContext
 from .colors import (
     InconsistentColorUseRule,
@@ -19,6 +19,7 @@ from .colors import (
     OffPaletteTextRule,
 )
 from .fonts import MixedFontsInShapeRule, ThemeFontDriftRule, UnapprovedFontRule
+from .layouts import LayoutBandRule, LayoutHeaderFooterRule, LayoutMissingRule
 from .logo import LogoGeometryRule, LogoPresenceRule, UnapprovedLogoAssetRule
 from .sizes import AutofitShrinkRule, InconsistentRoleSizeRule, RoleFontSizeRule
 from .space import (
@@ -43,7 +44,51 @@ from .typography import (
 
 log = logging.getLogger(__name__)
 
-__all__ = ["RuleContext", "Rule", "build_default_rules", "run_rules"]
+__all__ = [
+    "RuleContext",
+    "Rule",
+    "build_default_rules",
+    "build_master_rules",
+    "run_rules",
+    "skipped_rules",
+]
+
+
+def skipped_rules(ctx: RuleContext, rules: Sequence[Rule]) -> list[SkippedRule]:
+    """The rules that will not run against this context, and why.
+
+    A rule reporting nothing because it is disabled is indistinguishable, in
+    the issue list, from a rule reporting nothing because the deck is clean.
+    The report carries this so the difference is visible without reading the
+    source.
+    """
+    skipped: list[SkippedRule] = []
+    for rule in rules:
+        if rule.applies(ctx):
+            continue
+        skipped.append(
+            SkippedRule(
+                rule_id=rule.id,
+                reason="no brand guidelines file was supplied",
+                unlocked_by=(
+                    "extract-guidelines --from BRANDBOOK.pdf (or the approved "
+                    "MASTER.pptx), then validate --guidelines that file"
+                ),
+            )
+        )
+    return skipped
+
+
+def build_master_rules() -> list[Rule]:
+    """Rules whose subject is the master, not the deck being checked.
+
+    They read `ctx.spec` alone, so running them once per deck would report the
+    same incomplete layout N times. The pipeline runs them a single time.
+    """
+    return [
+        LayoutHeaderFooterRule(),
+        LayoutBandRule(),
+    ]
 
 
 def build_default_rules(
@@ -52,6 +97,7 @@ def build_default_rules(
     """Every rule, in report order (structure, then brand, then polish)."""
     return [
         # Structure
+        LayoutMissingRule(),
         MissingTitleRule(),
         DetachedTitleRule(),
         SubtitleRule(),

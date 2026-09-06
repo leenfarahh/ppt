@@ -5,10 +5,16 @@
         --guidelines config/brand.yaml --format markdown --out review.md
     formatting-tool validate --master brand.pptx --deck messy.pptx \
         --ai-dry-run --payload-dir out/payloads
+    formatting-tool rebuild --master brand.pptx --deck messy.pptx \
+        --out out/messy.rebuilt.pptx
+    formatting-tool extract-guidelines --from brandbook.pdf --master brand.pptx
+    formatting-tool extract-guidelines --from brand.pptx --out config/brand.yaml
     formatting-tool profile --deck messy.pptx
     formatting-tool rules
+    formatting-tool ui
 
-Exit codes: 0 clean, 1 inconsistencies at or above --fail-on, 2 could not run.
+Exit codes: 0 clean, 1 inconsistencies at or above --fail-on (or, for rebuild
+--strict, a slide that matched no layout), 2 could not run.
 """
 
 from __future__ import annotations
@@ -24,19 +30,22 @@ from . import __version__
 from .ai.client import AIConfig, DEFAULT_EFFORT, DEFAULT_MODEL
 from .ai.gemini import AIValidationError
 from .ai.payload import DEFAULT_BATCH_SIZE
+from .classify import fit_slide, layout_coverage, missing_kinds
 from .brandbook import (
     BrandBookError,
     ExtractConfig,
-    extract_from_pdf,
+    extract_guidelines,
     infer_gaps,
     write_guidelines_yaml,
 )
 from .extract import DeckReadError, read_deck
-from .guidelines import GuidelinesError
+from .guidelines import GuidelinesError, load_guidelines
 from .models import SEVERITY_RANK, Severity, ValidationReport, enum_safe
 from .pipeline import RunConfig, run
-from .report import summarize, write_json, write_markdown, write_text
-from .rules import build_default_rules, describe_rules
+from .rebuild import RebuildError, RebuildResult, rebuild
+from .rebuild.matcher import structure_score
+from .report import summarize_report, write_json, write_markdown, write_text
+from .rules import build_default_rules, build_master_rules, describe_rules
 
 log = logging.getLogger("formatting_tool")
 
@@ -56,13 +65,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         if args.command == "validate":
             return _cmd_validate(args)
+        if args.command == "classify":
+            return _cmd_classify(args)
+        if args.command == "rebuild":
+            return _cmd_rebuild(args)
         if args.command == "profile":
             return _cmd_profile(args)
         if args.command == "rules":
             return _cmd_rules(args)
         if args.command == "extract-guidelines":
             return _cmd_extract(args)
-    except (DeckReadError, GuidelinesError, BrandBookError, AIValidationError) as exc:
+        if args.command == "ui":
+            return _cmd_ui(args)
+    except (
+        DeckReadError,
+        GuidelinesError,
+        BrandBookError,
+        RebuildError,
+        AIValidationError,
+    ) as exc:
         log.error("%s", exc)
         return 2
     except KeyboardInterrupt:
@@ -118,16 +139,31 @@ def _cmd_validate(args: argparse.Namespace) -> int:
 
 
 def _cmd_extract(args: argparse.Namespace) -> int:
-    """Read a brand reference PDF into a reviewable guidelines file."""
-    result = extract_from_pdf(
+    """Read a brand reference into a reviewable guidelines file.
+
+    The reference is a PDF brand book or an approved .pptx. When it is a deck,
+    it is also the deck the gaps are inferred from -- naming a second one with
+    --master would mean two conflicting sets of observations with no way to
+    say which won.
+    """
+    source_is_deck = args.source.suffix.lower() == ".pptx"
+    if source_is_deck and args.master is not None and args.master != args.source:
+        raise BrandBookError(
+            f"--from {args.source.name} is already a deck, so --master "
+            f"{args.master.name} would be a second source of observations. "
+            "Drop --master, or extract from the brand book PDF and keep "
+            "--master for the deck."
+        )
+
+    result = extract_guidelines(
         args.source,
         ExtractConfig(model=args.model, effort=args.effort),
     )
 
+    master_path = args.source if source_is_deck else args.master
     inference = None
-    if args.master is not None:
-        master = read_deck(args.master)
-        inference = infer_gaps(result.guidelines, master)
+    if master_path is not None:
+        inference = infer_gaps(result.guidelines, read_deck(master_path))
 
     document = write_guidelines_yaml(
         result.guidelines,
@@ -135,7 +171,7 @@ def _cmd_extract(args: argparse.Namespace) -> int:
         pages=result.pages,
         inference=inference,
         rejections=result.rejections,
-        master=Path(args.master).name if args.master else None,
+        master=Path(master_path).name if master_path else None,
         unspecified=result.unspecified,
     )
 
@@ -148,18 +184,31 @@ def _cmd_extract(args: argparse.Namespace) -> int:
 
 def _report_extraction(result, inference, out: Optional[Path]) -> None:
     """Tell the user what to review, on stderr so stdout stays the document."""
-    authored = len(result.authored)
+    source = Path(result.source)
+    from_deck = source.suffix.lower() == ".pptx"
     inferred = len(inference.inferred) if inference else 0
     missing = len(inference.still_missing) if inference else len(result.missing)
 
     lines = [
-        f"{authored} value(s) stated in {Path(result.source).name}",
-        f"{inferred} inferred from the master deck",
+        f"{len(result.authored)} value(s) stated in {source.name}",
+        f"{inferred} inferred from {source.name if from_deck else 'the master deck'}",
         f"{missing} still unspecified",
-        f"{len(result.rejections)} reading(s) discarded",
-        f"~{result.input_tokens} in / {result.output_tokens} out tokens",
     ]
+    if not from_deck:
+        # A deck extraction makes no model call, so neither number means
+        # anything and a "0 reading(s) discarded" line only reads as an error.
+        lines.append(f"{len(result.rejections)} reading(s) discarded")
+        lines.append(f"~{result.input_tokens} in / {result.output_tokens} out tokens")
     print("  ".join(lines), file=sys.stderr)
+
+    if from_deck:
+        print(
+            "\nA deck demonstrates, it does not state. Every value above is "
+            "inferred and\nthe report will hedge findings that rest on it "
+            "until you confirm the value\nand mark it `authored` in the "
+            "provenance block.",
+            file=sys.stderr,
+        )
 
     if inference and inference.inferred:
         print("\nInferred, so worth checking first:", file=sys.stderr)
@@ -175,6 +224,177 @@ def _report_extraction(result, inference, out: Optional[Path]) -> None:
         )
 
 
+def _cmd_classify(args: argparse.Namespace) -> int:
+    """Say what each slide is and which master layout serves it."""
+    master = read_deck(args.master)
+    deck = read_deck(args.deck)
+    floor = load_guidelines(args.guidelines).tuning.layout_match_floor
+
+    fits = [
+        fit_slide(
+            slide, deck, master.layouts, score_structure=structure_score, floor=floor
+        )
+        for slide in deck.slides
+    ]
+    coverage = layout_coverage(master.layouts)
+    missing = missing_kinds(fits, master.layouts)
+
+    if args.format == "json":
+        json.dump(
+            {
+                "master": master.name,
+                "deck": deck.name,
+                "layouts": {
+                    kind.value: names for kind, names in sorted(
+                        coverage.items(), key=lambda item: item[0].value
+                    )
+                },
+                "kinds_the_master_cannot_serve": [k.value for k in missing],
+                "slides": [
+                    {
+                        "slide": fit.slide,
+                        "kind": fit.kind.value,
+                        "confidence": round(fit.classification.confidence, 2),
+                        "why": fit.classification.basis,
+                        "layout": fit.layout_name,
+                        "layout_kind": fit.layout_kind.value,
+                        "fit": fit.fit,
+                        "score": round(fit.score, 2),
+                        "basis": fit.basis,
+                    }
+                    for fit in fits
+                ],
+            },
+            sys.stdout,
+            indent=2,
+            ensure_ascii=False,
+        )
+        sys.stdout.write("\n")
+        return 0
+
+    _print_classification(master, deck, fits, coverage, missing)
+    return 1 if (missing and args.strict) else 0
+
+
+def _print_classification(master, deck, fits, coverage, missing) -> None:
+    """A slide-by-slide table, then what the master cannot serve."""
+    print(f"Deck:   {deck.name} ({len(deck.slides)} slides)")
+    print(f"Master: {master.name} ({len(master.layouts)} layouts)\n")
+
+    print("The master offers:")
+    for kind, names in sorted(coverage.items(), key=lambda item: item[0].value):
+        print(f"  {kind.value:<9} {', '.join(names)}")
+    print()
+
+    width = max((len(f.layout_name or '') for f in fits), default=10)
+    header = f"{'#':>3}  {'is a':<9} {'conf':>4}  {'fits':<9} {'layout':<{width}}"
+    print(header)
+    print("-" * len(header))
+    for fit in fits:
+        mark = {"good": "", "loose": "  <-- check", "none": "  <-- no such layout"}[fit.fit]
+        print(
+            f"{fit.slide:>3}  {fit.kind.value:<9} "
+            f"{fit.classification.confidence:>4.2f}  {fit.fit:<9} "
+            f"{fit.layout_name or '-':<{width}}{mark}"
+        )
+        print(f"     because {fit.classification.basis}")
+        print(f"     layout: {fit.basis}")
+
+    if missing:
+        print(
+            f"\nThe master has no layout for: "
+            f"{', '.join(k.value for k in missing)}."
+        )
+        print(
+            "  Those slides were put on the closest layout there is, which is\n"
+            "  not the same as a layout that fits. Either add the missing\n"
+            "  layouts to the master, or expect to lay these out by hand."
+        )
+
+
+def _cmd_rebuild(args: argparse.Namespace) -> int:
+    """Rebuild a deck onto the master and say what needs a designer's eye."""
+    tuning = load_guidelines(args.guidelines).tuning
+    result = rebuild(args.master, args.deck, args.out, tuning=tuning)
+    _report_rebuild(result)
+    return 1 if (result.unmatched or result.dropped) and args.strict else 0
+
+
+def _report_rebuild(result: RebuildResult) -> None:
+    """Print what moved and what did not, on stderr.
+
+    Weighted toward what is still wrong. A rebuild that reports only its
+    successes invites the deck being sent on unchecked, and the two things it
+    cannot do -- place loose content into the layout's regions, and carry a
+    chart across -- are exactly the two a designer has to finish by hand.
+    """
+    out = sys.stderr
+    print(f"{result.deck} rebuilt onto {result.master} -> {result.output}", file=out)
+    print(
+        f"  {len(result.slides)} slide(s), "
+        f"{result.sample_slides_removed} master sample slide(s) dropped",
+        file=out,
+    )
+    for name, count in sorted(result.layouts_used.items()):
+        print(f"    {count:>3}  {name}", file=out)
+
+    if result.size_note:
+        print(f"\n  Canvas: {result.size_note}", file=out)
+
+    print("\n  Every slide, by the job it does:", file=out)
+    for record in result.slides:
+        mark = "" if record.confident else "   <-- check"
+        print(
+            f"    slide {record.number:>3}  {record.kind.value:<9} -> "
+            f"{record.target_layout}{mark}",
+            file=out,
+        )
+
+    if result.unmatched:
+        print(
+            f"\n  {len(result.unmatched)} slide(s) had no good layout match; "
+            "check these first:",
+            file=out,
+        )
+        for record in result.unmatched:
+            print(
+                f"    slide {record.number} ({record.kind.value}): {record.basis}",
+                file=out,
+            )
+
+    unfilled = [r for r in result.slides if r.unfilled]
+    if unfilled:
+        print(
+            f"\n  {len(unfilled)} slide(s) have empty layout regions, because "
+            "the copy sits in\n  loose text boxes that were moved across as "
+            "they are. Deciding which box\n  belongs in which region is a "
+            "judgement call, so it is left to you:",
+            file=out,
+        )
+        for record in unfilled:
+            print(
+                f"    slide {record.number}: {len(record.unfilled)} empty "
+                f"({', '.join(record.unfilled)})",
+                file=out,
+            )
+
+    if result.dropped:
+        print(
+            f"\n  {len(result.dropped)} shape(s) could not be carried across "
+            "and are missing\n  from the rebuild. Copy them over by hand:",
+            file=out,
+        )
+        for shape in result.dropped:
+            print(f"    {shape}", file=out)
+
+    print(
+        f"\nCheck the result:\n"
+        f"  python -m formatting_tool validate --master {result.master} "
+        f"--deck {result.output}",
+        file=out,
+    )
+
+
 def _cmd_profile(args: argparse.Namespace) -> int:
     """Dump the extracted DeckProfile. The first thing to check when a rule
     misfires: if the value is wrong here, the rule is not the problem."""
@@ -186,7 +406,7 @@ def _cmd_profile(args: argparse.Namespace) -> int:
 
 
 def _cmd_rules(args: argparse.Namespace) -> int:
-    rules = describe_rules(build_default_rules())
+    rules = describe_rules(build_default_rules() + build_master_rules())
     if args.format == "json":
         json.dump(rules, sys.stdout, indent=2)
         sys.stdout.write("\n")
@@ -197,6 +417,19 @@ def _cmd_rules(args: argparse.Namespace) -> int:
         needs = " (needs guidelines)" if rule["requires_guidelines"] == "True" else ""
         print(f"{rule['id']:<{width}}  {rule['severity']:<8}  {rule['description']}{needs}")
     return 0
+
+
+def _cmd_ui(args: argparse.Namespace) -> int:
+    """Serve the browser UI. Imported here so the CLI does not pay for the
+    web module on every other invocation."""
+    from .web import serve  # noqa: PLC0415
+
+    return serve(
+        port=args.port,
+        host=args.host,
+        root=args.root,
+        open_browser=not args.no_browser,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -282,9 +515,73 @@ def _build_parser() -> argparse.ArgumentParser:
         help="exit 1 when a finding at this severity or above is present",
     )
 
+    classify_cmd = sub.add_parser(
+        "classify",
+        help="say what each slide is and which master layout fits it",
+        description=(
+            "Classify every slide by the job it does -- cover, agenda, section, "
+            "content, columns, diagram, closing -- and name the layout in the "
+            "master that serves it. Reports the kinds of slide the master has "
+            "no layout for. Reads only; writes nothing."
+        ),
+    )
+    _add_shared(classify_cmd)
+    classify_cmd.add_argument(
+        "--master", type=Path, required=True, help="the approved master deck"
+    )
+    classify_cmd.add_argument(
+        "--deck", type=Path, required=True, help="the deck to classify"
+    )
+    classify_cmd.add_argument(
+        "--guidelines", type=Path,
+        help="brand guidelines .yaml or .json; only tuning.layout_match_floor is read",
+    )
+    classify_cmd.add_argument(
+        "--format", choices=["text", "json"], default="text", help="output format"
+    )
+    classify_cmd.add_argument(
+        "--strict", action="store_true",
+        help="exit 1 when the master has no layout for a kind the deck uses",
+    )
+
+    rebuild_cmd = sub.add_parser(
+        "rebuild",
+        help="rebuild a deck onto the master's layouts and write a new file",
+        description=(
+            "Open the master as the base file and recreate every slide on the "
+            "layout it belongs to. Placeholder copy moves across and loses its "
+            "direct formatting, so the master's geometry and type take effect; "
+            "loose shapes are transplanted as they are. The input deck is "
+            "never modified."
+        ),
+    )
+    _add_shared(rebuild_cmd)
+    rebuild_cmd.add_argument(
+        "--master", type=Path, required=True, help="the approved master deck"
+    )
+    rebuild_cmd.add_argument(
+        "--deck", type=Path, required=True, help="the deck to rebuild"
+    )
+    rebuild_cmd.add_argument(
+        "--out", type=Path, required=True, help="where to write the rebuilt deck"
+    )
+    rebuild_cmd.add_argument(
+        "--guidelines",
+        type=Path,
+        help=(
+            "brand guidelines .yaml or .json; only its tuning block is read, "
+            "for layout_match_floor"
+        ),
+    )
+    rebuild_cmd.add_argument(
+        "--strict",
+        action="store_true",
+        help="exit 1 when a slide matched no layout or a shape was left behind",
+    )
+
     extract = sub.add_parser(
         "extract-guidelines",
-        help="read a brand reference PDF into a reviewable guidelines file",
+        help="read a brand reference into a reviewable guidelines file",
     )
     _add_shared(extract)
     extract.add_argument(
@@ -292,14 +589,19 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="source",
         type=Path,
         required=True,
-        help="the brand reference PDF",
+        help=(
+            "the brand reference: a .pdf brand book, whose stated rules are "
+            "read as authored, or an approved .pptx, whose values are read as "
+            "inferred"
+        ),
     )
     extract.add_argument(
         "--master",
         type=Path,
         help=(
             "master deck used to infer values the reference file does not "
-            "state; without it those values are left unspecified"
+            "state; without it those values are left unspecified. Not accepted "
+            "when --from is already a deck"
         ),
     )
     extract.add_argument(
@@ -323,6 +625,22 @@ def _build_parser() -> argparse.ArgumentParser:
     rules = sub.add_parser("rules", help="list the deterministic rules")
     _add_shared(rules)
     rules.add_argument("--format", choices=["text", "json"], default="text")
+
+    ui = sub.add_parser("ui", help="serve the browser UI on localhost")
+    _add_shared(ui)
+    ui.add_argument("--port", type=int, default=8000, help="first port to try")
+    ui.add_argument(
+        "--host", default="127.0.0.1", help="interface to bind; loopback by default"
+    )
+    ui.add_argument(
+        "--root",
+        type=Path,
+        default=None,
+        help="project root the guidelines dropdown reads config/ from",
+    )
+    ui.add_argument(
+        "--no-browser", action="store_true", help="do not open a browser window"
+    )
 
     return parser
 
@@ -359,6 +677,12 @@ def _configure_logging(verbose: int, quiet: bool) -> None:
     logging.basicConfig(
         level=level, format="%(levelname)s %(name)s: %(message)s", stream=sys.stderr
     )
+    # The Gemini SDK narrates its own internals -- automatic function calling
+    # is on, and a recommendation not to use it that does not apply to a
+    # single-shot generate_content. None of it is actionable, and it drowns
+    # our own lines. Full debug logging (-vv) still shows it.
+    if level > logging.DEBUG:
+        logging.getLogger("google_genai").setLevel(logging.ERROR)
 
 
 class _StdoutProxy:
@@ -389,7 +713,7 @@ def _filter_by_severity(
     ]
     # Stats are computed over what the report actually shows, so the header
     # counts and the body cannot disagree.
-    report.stats = summarize(report.issues)
+    report.stats = summarize_report(report)
     return report
 
 

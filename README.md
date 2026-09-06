@@ -52,7 +52,7 @@ master.pptx + messy.pptx + config/brand.yaml   [validate, every run]
         v
   ai/client.py      Gemini, structured JSON out
         |
-        |  Issue(source=ai) + dismissals of false positives
+        |  Issue(source=ai), plus context folded onto rule findings
         v
   report/           merge, dedupe, order -> list of inconsistencies
 ```
@@ -97,6 +97,13 @@ AI payload sends `master_theme_*` as the reference and attaches the deck's own
 theme only when the two disagree, labelled as the foreign one. A theme
 mismatch is logged at the start of the run, because it explains why so much of
 the deck is being reported.
+
+`safe_margins` are read off the master's own layouts when no brand file states
+them: the extent of a layout's *content* placeholders is where the designer
+decided content may go, which is a far better frame than measuring where
+content happens to sit on sample slides, and it works on a master with no
+slides at all. Footer, date and page-number placeholders are excluded from the
+frame and exempt from the check, because they live in the margin by design.
 
 A value the brand book does not state and the master deck cannot settle stays
 `missing`, and the checks that need it stay silent rather than testing an
@@ -209,21 +216,11 @@ Exit codes: `0` clean, `1` findings at or above `--fail-on`, `2` could not run.
 
 ### What the report does not show
 
-A short report can mean a clean deck, or it can mean most of the checks were
-turned off and the rest were argued away. Every report accounts for the
-difference, in two sections and two stat counters:
+Nothing removes a finding. Every rule finding reaches the report, so the only
+thing standing between what was checked and what is printed is the checks that
+never ran:
 
 ```
-Dismissed by the AI layer (360 rule finding(s))
------------------------------------------------
-  Proved from the file, then judged a false positive in context.
-  Re-run with --no-ai to see them all.
-
-   255  font.family.theme_drift
-         reason: the hardcoded typeface is the brand face
-    65  space.overlap
-         reason: overlap is normal inside a dense diagram
-
 Not checked (6 rule(s) did not run)
 -----------------------------------
   color.text.off_palette: no brand guidelines file was supplied
@@ -232,68 +229,97 @@ Not checked (6 rule(s) did not run)
              MASTER.pptx), then validate --guidelines that file
 ```
 
-A dismissal deletes something the deterministic layer proved from the file, so
-it is a claim in its own right and is recorded with its reason rather than
-dropped. `--no-ai` reproduces the unfiltered list. In JSON both sections are
-first-class: `report.dismissals` and `report.skipped_rules`.
+The AI layer has **no way to suppress a rule finding**. That is enforced in
+the response schema, not in the prompt: `dismissed_refs` does not exist, so
+the model cannot ask for something the contract does not allow, and a reworded
+instruction cannot bring it back. When the AI thinks a finding is defensible
+in context, it says so on the finding: a lowered `confidence` and an
+explanation in `suggestion`. The judgement survives, and so does the finding,
+and the designer decides.
 
-The counters `stats.dismissed` and `stats.rules_skipped` sit alongside the
-severity counts so the numbers reconcile.
+This was not always true. An earlier build let the model dismiss with a
+reason, and on a real deck it dropped 88 of 113 findings in one call,
+including a 2.79 sq in text overlap it had called an error on the previous
+run. A layer that can delete most of what the other layer proved is a filter,
+not a review.
 
-### Classify the slides and see which layouts fit
+`stats.rules_skipped` sits alongside the severity counts, and
+`report.skipped_rules` carries the same in JSON.
+
+### Apply the fixes a designer ticked
+
+`validate` says what is wrong and changes nothing. This is the other half.
 
 ```powershell
-python -m formatting_tool classify --master master.pptx --deck messy.pptx
+# what can be applied, and what needs a designer
+python -m formatting_tool apply --deck messy.pptx --report review.json --list
+
+# apply exactly the findings that were ticked
+python -m formatting_tool apply --deck messy.pptx --report review.json `
+    --out out/fixed.pptx --fix bb8e6162 --fix ace721b5
+
+# everything mechanical, then rebuild onto the master's layouts, in one pass
+python -m formatting_tool apply --deck messy.pptx --report review.json `
+    --out out/fixed.pptx --all --master master.pptx
 ```
 
-Reads only, writes nothing. Every slide is classified by the job it does, and
-named against the master layout that serves it:
+Every finding in the report carries a short `id`. That is what a designer
+ticks and what `--fix` takes, so a selection made in the browser applies from
+the CLI and means the same thing. The id is derived from what the finding is
+about, not from its position in the list, so it survives other findings coming
+and going. The input deck is never modified.
 
-```
-The master offers:
-  content   13_Content slide _ VCS_to use, 14_Content slide _ VCS_to use
+**What has a fixer.** Only findings that name a shape and a target, where
+there is one way to reach the target:
 
-  #  is a      conf  fits      layout
-  1  cover     0.85  none      13_Content slide _ VCS_to use  <-- no such layout
-     because an image covers the canvas behind 115 characters
-  3  agenda    0.90  none      13_Content slide _ VCS_to use  <-- no such layout
-     because the title says 'Table of contents'
-  5  content   0.40  loose     13_Content slide _ VCS_to use  <-- check
-     because 41 content region(s), 2920 characters
-
-The master has no layout for: agenda, cover.
-```
-
-Kinds: `cover`, `agenda`, `section`, `content`, `columns`, `diagram`,
-`closing`, `unknown`. Fits:
-
-| | Means |
+| Rule | Fix |
 | --- | --- |
-| `good` | the master has a layout for this slide and the content fits it |
-| `loose` | the layout is the right kind, but the slide carries more or fewer blocks than it offers |
-| `none` | the master has no layout for this kind of slide. Not a fit to adjust, a layout that does not exist |
+| `space.off_canvas` | moves the shape back inside the canvas, the shortest distance |
+| `space.alignment_grid` | snaps the left edge to the grid line the finding names |
+| `typography.whitespace` | strips trailing spaces, collapses repeated ones |
+| `typography.manual_line_break` | replaces soft returns with a space |
+| `font.family.theme_drift` | clears the hardcoded typeface so the run inherits |
+| `space.safe_margin` | moves the shape inside the frame, only on the edges the finding names |
+| `space.repeat_out_of_line` | puts the shape back on the edge the rest of its set shares |
 
-**How a slide is classified.** Wording first: a title reading "Table of
-contents" or "المحتويات" settles it, and is only trusted on a slide light
-enough to be what it says. Then the shape of a cover, which is a full-bleed
-image or a title-and-subtitle with almost no copy. Then sparseness, then
-parallel bands, then content regions.
+**Every move is checked against the shapes around it**, because a slide is a
+composition and satisfying a rule by shoving a shape into its neighbour trades
+a measurable finding for a visible one. Three guards, each of which exists
+because it was missing once and a designer sent back a screenshot:
 
-**Why not structure alone.** A photo cover is an image across the canvas with
-three floating text boxes, which counts as three content regions and matches a
-three-region content layout perfectly. So purpose decides for `cover`,
-`agenda`, `section` and `closing`, where structure is not comparable to
-anything, and structure decides for the rest, where it is measurable and a
-guess about purpose is not.
+- A shape lying **wholly off the slide** is never dragged into view. It is
+  invisible where it is, so nobody is looking at a defect; it is parked or
+  left over, and either way that is a designer's call. A shape only
+  *straddling* an edge is still brought back.
+- A move that **covers more of a neighbour** than before is reverted. Area, not
+  which neighbours are touched: a caption already overlapping the portrait
+  above it gains no new neighbour by sliding further under it.
+- `space.alignment_grid` **has no fixer at all.** A real slide carries several
+  legitimate columns and the rule snaps to the busiest; which column a given
+  shape belongs to is a design call. The detection stays.
 
-**Missing layouts** are only reported for those four kinds. A content layout
-will hold a columns slide awkwardly; nothing will hold a cover, so that is a
-real blocker and the rest is a preference. `--strict` exits 1 when the master
-cannot serve a kind the deck uses. `--format json` gives the whole thing as
-data.
+On the deck those screenshots came from, the guards cut the moves from 141 to
+4, took the report from 171 findings to 37, and left every other rule count
+unchanged -- no finding anywhere got worse.
 
-`rebuild` uses the same classification, so the layout `classify` names is the
-layout the slide is rebuilt onto.
+Fixes run in a fixed order, not report order: preferences first, hard
+constraints last, so a grid snap cannot push a shape back off the canvas and
+the safe margin has the last word over both.
+
+Everything else is reported as needing a designer, with the reason:
+`space.overlap` names two boxes and cannot know which should move,
+`logo.missing` needs a logo file, `title.missing` needs copy that has to be
+written, `layout.not_in_master` is what `rebuild` is for.
+
+**Two things this got wrong first, and now tests for.** Shape names are not
+unique -- a real deck carried sixteen shapes called "Pentagon 7" on one slide
+-- so fixes are matched on the OOXML shape id, and an ambiguous name with no
+id is skipped rather than guessed. And two fixes can touch one shape: snapping
+a box to a grid line after clamping it onto the canvas pushed it straight back
+off, so hard constraints now run after preferences.
+
+On a real deck, `--all` took it from 165 findings to 29, and the 29 left are
+exactly the ones above that need a person.
 
 ### Rebuild a deck onto the master
 
@@ -318,6 +344,19 @@ the master's geometry and type actually take effect.
 | Loose shapes | Transplanted as they are, position included. They were never governed by a layout and are not now |
 | Pictures | Transplanted with the image itself, so crops and effects survive |
 | Charts, SmartArt, media, embedded objects | Left behind and reported by name. Their content lives in parts this cannot rebuild, and a silently broken chart is worse than a missing one |
+| Customer-data tags, empty `r:id` hyperlinks, hd/svg image alternates | Stripped, and the shape kept. None is content: an empty `r:id` is the idiom for "no hyperlink", a tag is metadata, and an `hdphoto` is a second copy of a picture the shape already carries |
+
+**think-cell is the real casualty.** Its charts are OLE objects with their own
+part graphs, so they cannot cross and are reported by name. On a consulting
+deck that is usually the most important thing on the slide, so check the
+dropped list before sending a rebuild anywhere.
+
+**Rebasing onto a master repaints the deck.** Theme-bound colour and inherited
+type re-resolve through the *master's* theme, which is the point of rebuilding
+and also a very large visual change: on a real deck 35 theme-bound runs went
+from a red brand to the master's yellow, and the master's own logo and
+furniture appeared on every slide. Nothing is lost, but render before and
+after before sending it on.
 | Speaker notes | Carried across as plain text |
 | The master's own sample slides | Dropped. The master is a template here, not content |
 
@@ -343,8 +382,31 @@ behind, which makes it usable as a gate.
 ### In the browser
 
 ```powershell
-python -m formatting_tool ui
+python -m formatting_tool ui --reload
 ```
+
+**Use `--reload`.** Python imports a module once and never re-reads it, so a
+server started before an edit serves the old code for as long as it runs,
+without saying so. An afternoon of reports once came out of a stale process
+and looked exactly like a tool that had not changed. With `--reload` a
+supervisor restarts the server whenever a source file changes; without it the
+banner says `Reload: OFF` so at least the state is visible.
+
+The page is the whole loop: drop in a master and a deck, run the check, tick
+the findings you want, apply them, and render before and after to see what
+changed before downloading the corrected deck.
+
+- Every fixable finding gets a checkbox. Findings that need a designer do not,
+  and keep an empty column so the list still reads down the page.
+- **Apply** sends the ticked ids to `/api/apply`, which runs exactly the same
+  `apply_fixes` the CLI does, against the deck you uploaded. Optionally rebuild
+  onto the master's layouts in the same pass.
+- **Render before / after** draws the affected slides through PowerPoint, side
+  by side. "moved 0.65in back onto the canvas" is a claim; two pictures are
+  the evidence, and you can reject the result before it reaches a client.
+
+The uploaded deck is kept for four hours so the ticking and the applying can be
+minutes apart. Nothing leaves the machine except the AI call, if it is on.
 
 Serves a page on `http://127.0.0.1:8000` and opens it. Drop in a master and one
 or more decks, pick a guidelines file from `config/`, run. It is the same
@@ -386,14 +448,19 @@ fixture deck.
 | `formatting_tool/extract/master_spec.py` | Merges guidelines with observed master values. |
 | `formatting_tool/rules/` | One module per category, one class per check. |
 | `formatting_tool/rules/layouts.py` | Slide-to-layout binding, and whether the master's layouts are complete. |
+| `formatting_tool/rules/repeats.py` | One of a set of identical shapes out of line with the rest. |
 | `formatting_tool/classify.py` | What job a slide does, what job a layout is drawn for, and the fit. |
 | `formatting_tool/rebuild/matcher.py` | Which master layout a messy slide belongs on. |
-| `formatting_tool/rebuild/builder.py` | Recreates the deck on the master. The only module that writes a `.pptx`. |
+| `formatting_tool/rebuild/builder.py` | Recreates the deck on the master. |
+| `formatting_tool/apply/fixers.py` | One fixer per rule, for the findings a machine can correct. |
+| `formatting_tool/apply/applier.py` | Applies the ticked findings, then optionally the rebuild. |
+| `formatting_tool/report/reader.py` | Reads a report back from JSON, so a selection round-trips. |
 | `formatting_tool/ai/payload.py` | Builds the cached prefix and the per-batch payload. |
 | `formatting_tool/ai/schema.py` | The JSON contract, enforced server-side. |
 | `formatting_tool/ai/client.py` | The Gemini call. |
 | `formatting_tool/report/` | Merge, dedupe, order, write. |
 | `formatting_tool/web/` | The browser UI: a stdlib server and one HTML page. |
+| `formatting_tool/render.py` | Renders slides through PowerPoint, for the AI layer and the previews. |
 | `formatting_tool/colorutil.py` | Perceptual colour distance. |
 | `formatting_tool/linemetrics.py` | Where rendered line breaks would come from. |
 | `config/brand_guidelines.example.yaml` | Annotated brand file to copy. |
@@ -445,9 +512,11 @@ from.
 
 **Two layers, not one.** The deterministic layer is precise and literal: it
 will report a full-bleed image crossing the safe margin. The AI layer sees the
-same finding with its `ref` and the slide around it, and can dismiss it with a
-reason. Dismissals are applied in `report/merge.py`, so the final report keeps
-the rule layer's precision without its false positives.
+same finding with its `ref` and the slide around it, and can argue that the
+context justifies it, by naming the ref in `confirms_refs` with a low
+confidence and an explanation. `report/merge.py` folds that onto the rule
+finding, which keeps its own wording and gains the argument. What it cannot do
+is remove the finding: the response schema has no field for it.
 
 **Prompt caching drives the request shape.** Caching is a prefix match in
 `tools -> system -> messages` order, so the stable content has to come first:
@@ -478,6 +547,30 @@ regex over a chat reply, no retry loop for malformed JSON.
   and catches most of these in practice.
 - **Text overflow** has the same dependency (`space.TextOverflowRule`), though
   the two cheap proxies noted in its docstring are worth wiring first.
+- **`apply` does not re-check the deck afterwards.** The per-move guards stop
+  a fix making something worse, but they compare bounding boxes, which is not
+  the same as looking at the slide. Run `validate` on the output, or render
+  before and after in the UI. The report itself tells you to.
+- **Repeated elements on a curve are not checked.** `space.repeat_out_of_line`
+  finds a series of identical shapes and holds it to the row or column the
+  majority share. Eleven badges arranged around a hexagon have neither, and the
+  one that looks wrong there looks wrong to an eye rather than to a ruler.
+  Reporting a guess about it would be worse than silence, so that case belongs
+  to `--render`. The rule also only looks at top-level shapes: inside a group,
+  positions are relative to a drawing somebody composed on purpose.
+- **A vision pass is opt-in and narrow.** `validate --render` draws each slide
+  through PowerPoint and attaches it to the AI call, for the defects that only
+  exist once rendered: clipped text, type that actually collides rather than
+  boxes that merely overlap, contrast over an image, a shape hidden behind
+  another. Every AI finding carries `basis`, `render` or `geometry`, and a
+  claim that says it read something off a slide that was never rendered is
+  demoted to `geometry` rather than trusted. Measurements are never taken from
+  pixels: 0.06in off a grid line is real and invisible.
+- **Rendering needs PowerPoint and pywin32, on Windows.** `pip install
+  pywin32`. LibreOffice is the obvious portable fallback and is deliberately
+  not written: it needs a PDF rasteriser as a second dependency and wraps text
+  a few percent differently from PowerPoint, and the questions a render answers
+  are exactly the borderline ones.
 - **Theme-bound colours are not resolved.** A run bound to `accent2` is
   currently trusted rather than compared against the palette. Resolve it
   through `MasterSpec.theme_colors`, not the deck's own, in
@@ -491,12 +584,6 @@ regex over a chat reply, no retry loop for malformed JSON.
   turning it on silently multiplies findings: on a real deck here it took the
   deterministic layer from 418 to 1025. Run `extract-guidelines --from
   MASTER.pptx` and pass the result when you want those checks.
-- **The AI layer can dismiss in bulk.** It is free to drop every finding of a
-  class in one judgement, and on a dense deck it does: 360 of 418 in one
-  observed run. Nothing caps this. The dismissals are all on the report with
-  their reasons, so it is visible and arguable, but reading that section is
-  currently the only control. A per-rule cap, or a floor below which a
-  dismissal needs its own evidence, would be the next step.
 - **`delta_e` is CIE76, not CIEDE2000.** It overstates distance in the blues.
   The default `color_delta_e: 3.0` is calibrated for CIEDE2000, so re-check the
   tolerance either way.

@@ -92,11 +92,15 @@ class ThemeFontDriftRule(Rule):
         if not theme_fonts:
             return
 
-        counts: dict[tuple[int, str], int] = defaultdict(int)
-        seen: dict[tuple[int, str], tuple] = {}
+        # Keyed by shape id, not by shape name. Names repeat freely inside a
+        # slide -- sixteen shapes called "Pentagon 7" is a real deck -- and
+        # collapsing them into one finding would make it unfixable: a fix
+        # applies to one shape, so a finding has to mean one shape.
+        counts: dict[tuple[int, int], int] = defaultdict(int)
+        seen: dict[tuple[int, int], tuple] = {}
         for slide, shape, _paragraph, run in ctx.runs():
             if run.font_name and run.font_name.casefold() in theme_fonts:
-                key = (slide.number, shape.name)
+                key = (slide.number, shape.shape_id)
                 counts[key] += 1
                 seen.setdefault(key, (slide, shape, run.font_name))
 

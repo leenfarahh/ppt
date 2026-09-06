@@ -21,6 +21,7 @@ from .colors import (
 from .fonts import MixedFontsInShapeRule, ThemeFontDriftRule, UnapprovedFontRule
 from .layouts import LayoutBandRule, LayoutHeaderFooterRule, LayoutMissingRule
 from .logo import LogoGeometryRule, LogoPresenceRule, UnapprovedLogoAssetRule
+from .repeats import RepeatedElementRule
 from .sizes import AutofitShrinkRule, InconsistentRoleSizeRule, RoleFontSizeRule
 from .space import (
     AlignmentGridRule,
@@ -116,6 +117,7 @@ def build_default_rules(
         InconsistentColorUseRule(),
         TitlePositionConsistencyRule(),
         AlignmentGridRule(),
+        RepeatedElementRule(),
         # Space
         OffCanvasRule(),
         SafeMarginRule(),

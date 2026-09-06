@@ -209,9 +209,45 @@ details.advanced[open] summary::before { content: "\2212  "; }
 }
 
 .finding {
-  display: grid; grid-template-columns: 82px 1fr; gap: 14px;
+  display: grid; grid-template-columns: 22px 82px 1fr; gap: 14px;
   padding: 11px 0; border-bottom: 1px solid var(--line);
 }
+/* The tick column is always there, filled or not, so the severity labels stay
+   in one line down the page whether or not a finding can be applied. */
+.tick { display: flex; align-items: flex-start; padding-top: 2px; }
+.tick input { width: 15px; height: 15px; cursor: pointer; accent-color: var(--ink, #1f2a44); }
+.tick.empty { display: block; }
+.finding.fixable .msg { text-decoration: none; }
+
+/* ---------- apply ---------- */
+.applybar {
+  margin: 22px 0 4px; padding: 14px 16px;
+  border: 1px solid var(--line); border-radius: 8px; background: var(--card, #fbfbfa);
+}
+.applybar-line { font-size: 13px; }
+.applybar-actions {
+  display: flex; align-items: center; gap: 14px; margin-top: 10px; flex-wrap: wrap;
+}
+.applybar-actions .grow { flex: 1; }
+.applybar .reb { font-size: 12px; color: var(--faint); display: flex; align-items: center; gap: 6px; }
+.applybar button#apply {
+  padding: 7px 16px; border-radius: 6px; border: 1px solid transparent;
+  background: #1f2a44; color: #fff; font-size: 13px; cursor: pointer;
+}
+.applybar button#apply:disabled { opacity: .4; cursor: default; }
+
+.applied { margin: 18px 0; padding: 14px 16px; border: 1px solid var(--line); border-radius: 8px; }
+.applied-head { display: flex; align-items: center; gap: 10px; font-size: 13px; flex-wrap: wrap; }
+.applied-head .grow { flex: 1; }
+.applied-list { margin: 10px 0 0; padding-left: 18px; font-size: 12px; line-height: 1.7; }
+.applied-list .dim { color: var(--faint); }
+.applied a.dl { font-size: 12px; }
+
+.preview { margin: 18px 0; }
+.shots { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 12px; }
+.shot span { display: block; font-size: 11px; font-family: var(--mono); color: var(--faint); margin-bottom: 5px; }
+.shot img { width: 100%; border: 1px solid var(--line); border-radius: 4px; display: block; }
+@media (max-width: 860px) { .shots { grid-template-columns: 1fr; } }
 .finding .sev {
   display: flex; align-items: center; gap: 6px;
   /* Grid items stretch by default, which would centre the label against the
@@ -253,6 +289,11 @@ details.advanced[open] summary::before { content: "\2212  "; }
 }
 .runlog summary { cursor: pointer; color: var(--faint); list-style: none; width: fit-content; }
 .runlog summary::-webkit-details-marker { display: none; }
+.aidebug .batch { margin-top: 12px; }
+.aidebug .batch-head {
+  font-size: 11px; font-family: var(--mono); color: var(--faint); margin-bottom: 5px;
+}
+.aidebug pre { max-height: 380px; overflow: auto; }
 .runlog pre {
   font-family: var(--mono); font-size: 11.5px; line-height: 1.6;
   background: var(--surface); border: 1px solid var(--line);
@@ -341,6 +382,12 @@ const state = {
   result: null,
   hidden: new Set(),   // severities toggled off
   query: "",
+  session: null,
+  fixable: new Set(),  // ids the tool can correct on its own
+  ticked: new Set(),   // ids the designer has chosen
+  applied: null,       // the last apply result
+  preview: null,       // before/after renders
+  busy: false,
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -477,6 +524,10 @@ async function runCheck() {
 
   $("#run").disabled = true;
   $("#results").innerHTML = "";
+  state.ticked.clear();
+  state.applied = null;
+  state.preview = null;
+
   const started = Date.now();
   const tick = setInterval(() => {
     const secs = ((Date.now() - started) / 1000).toFixed(0);
@@ -505,6 +556,8 @@ async function runCheck() {
 
 function render() {
   const { report, logs, elapsed_s: elapsed, ai } = state.result;
+  state.session = state.result.session || state.session;
+  if (state.result.fixable) state.fixable = new Set(state.result.fixable);
   const issues = report.issues || [];
   const counts = Object.fromEntries(SEVERITIES.map((s) =>
     [s, issues.filter((i) => i.severity === s).length]));
@@ -514,7 +567,11 @@ function render() {
   $("#results").innerHTML = [
     summaryHTML(report, issues, counts, visible, elapsed),
     noticesHTML(logs, ai, report),
+    applyBarHTML(issues),
+    appliedHTML(),
+    previewHTML(),
     visible.length ? groupsHTML(visible) : emptyHTML(issues.length),
+    aiDebugHTML(report),
     logHTML(logs),
   ].join("");
 
@@ -624,7 +681,15 @@ function findingHTML(issue) {
   if (issue.rule_id) tags.push(esc(issue.rule_id));
   else tags.push(esc(issue.category));
 
-  return `<article class="finding ${esc(issue.severity)}">
+  const canFix = state.fixable.has(issue.id);
+  const box = canFix
+    ? `<label class="tick" title="Apply this fix">
+         <input type="checkbox" data-fix="${esc(issue.id)}"
+                ${state.ticked.has(issue.id) ? "checked" : ""}></label>`
+    : `<span class="tick empty" title="Needs a designer">&nbsp;</span>`;
+
+  return `<article class="finding ${esc(issue.severity)}${canFix ? " fixable" : ""}">
+    ${box}
     <div class="sev"><span class="dot"></span>${esc(issue.severity)}</div>
     <div>
       <div class="head">
@@ -638,10 +703,151 @@ function findingHTML(issue) {
   </article>`;
 }
 
+/* ---------------- apply ---------------- */
+
+function applyBarHTML(issues) {
+  const total = state.fixable.size;
+  if (!total) {
+    return `<div class="notice"><div><b>Nothing here can be applied automatically.</b>
+      <p>Every finding needs a designer: which of two overlapping boxes moves,
+      which logo file to use, what copy to write. Those are design calls.</p></div></div>`;
+  }
+  const n = state.ticked.size;
+  return `<section class="applybar">
+    <div class="applybar-line">
+      <b>${n}</b> of ${total} fixable finding${total === 1 ? "" : "s"} ticked
+      <span class="meta">&middot; ${issues.length - total} need a designer</span>
+    </div>
+    <div class="applybar-actions">
+      <button class="linkish" id="tick-all">Tick all fixable</button>
+      <button class="linkish" id="tick-none">Clear</button>
+      <span class="grow"></span>
+      <label class="reb"><input type="checkbox" id="rebuild">
+        Also rebuild onto the master's layouts</label>
+      <button id="apply" ${n ? "" : "disabled"}>Apply ${n || ""}</button>
+    </div>
+  </section>`;
+}
+
+function appliedHTML() {
+  const r = state.applied;
+  if (!r) return "";
+  const rows = r.applied.map((a) => `<li><code>${esc(a.id)}</code>
+    ${a.slide ? `slide ${a.slide}` : "deck"} &mdash; ${esc(a.detail)}</li>`).join("");
+  const skipped = r.skipped.map((a) => `<li class="dim"><code>${esc(a.id)}</code>
+    ${esc(a.detail)}</li>`).join("");
+  return `<section class="applied">
+    <div class="applied-head">
+      <b>${r.applied.length} fix${r.applied.length === 1 ? "" : "es"} applied</b>
+      ${r.skipped.length ? `<span class="meta">&middot; ${r.skipped.length} skipped</span>` : ""}
+      ${r.rebuilt ? `<span class="meta">&middot; rebuilt onto the master</span>` : ""}
+      <span class="grow"></span>
+      <button class="linkish" id="do-preview">Render before / after</button>
+      <a class="dl" href="${esc(r.download)}" download>Download the corrected deck</a>
+    </div>
+    <ul class="applied-list">${rows}${skipped}</ul>
+  </section>`;
+}
+
+function previewHTML() {
+  const p = state.preview;
+  if (!p) return "";
+  if (!p.renderer_ok) {
+    return `<div class="notice warn"><div><b>No preview.</b>
+      <p>Rendering needs PowerPoint and pywin32 on Windows
+      (<code>pip install pywin32</code>).</p></div></div>`;
+  }
+  return `<section class="preview">
+    <div class="applied-head"><b>Before and after</b>
+      <span class="meta">&middot; rendered by PowerPoint</span></div>
+    ${p.slides.map((s) => `
+      <div class="shots">
+        <div class="shot"><span>Slide ${s.slide} &mdash; before</span>
+          ${s.before ? `<img src="${esc(s.before)}" loading="lazy" alt="slide ${s.slide} before">` : "<i>not rendered</i>"}</div>
+        <div class="shot"><span>Slide ${s.slide} &mdash; after</span>
+          ${s.after ? `<img src="${esc(s.after)}" loading="lazy" alt="slide ${s.slide} after">` : "<i>not rendered</i>"}</div>
+      </div>`).join("")}
+  </section>`;
+}
+
+async function applyTicked() {
+  if (state.busy || !state.session) return;
+  state.busy = true;
+  const button = $("#apply");
+  if (button) { button.disabled = true; button.textContent = "Applying..."; }
+  try {
+    const res = await fetch("/api/apply", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session: state.session,
+        fix: [...state.ticked],
+        rebuild: !!($("#rebuild") && $("#rebuild").checked),
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "the apply failed");
+    state.applied = data;
+    state.preview = null;   // the deck changed; any earlier shots are stale
+    render();
+  } catch (err) {
+    setStatus(`<b>Could not apply.</b> ${esc(err.message)}`, "bad");
+  } finally {
+    state.busy = false;
+  }
+}
+
+async function loadPreview() {
+  if (state.busy || !state.session) return;
+  state.busy = true;
+  const button = $("#do-preview");
+  if (button) { button.disabled = true; button.textContent = "Rendering..."; }
+  try {
+    const slides = [...new Set((state.applied?.applied || [])
+      .map((a) => a.slide).filter(Boolean))];
+    const res = await fetch("/api/preview", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session: state.session, slides }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "the render failed");
+    state.preview = data;
+    render();
+  } catch (err) {
+    setStatus(`<b>Could not render.</b> ${esc(err.message)}`, "bad");
+  } finally {
+    state.busy = false;
+  }
+}
+
 function emptyHTML(total) {
   return `<div class="empty">${total
     ? "Nothing matches the current filter."
     : "No inconsistencies found. The deck matches its master and the guidelines supplied."}</div>`;
+}
+
+function aiDebugHTML(report) {
+  const ex = report.ai_exchanges || [];
+  if (!ex.length) return "";
+  const total = ex.reduce((n, e) => n + ((e.response?.issues || []).length), 0);
+  return `<details class="runlog aidebug">
+    <summary>AI exchange (${ex.length} batch${ex.length === 1 ? "" : "es"},
+      ${total} finding${total === 1 ? "" : "s"} returned)</summary>
+    ${ex.map((e) => `
+      <div class="batch">
+        <div class="batch-head">
+          Batch ${esc(e.batch?.index)} of ${esc(e.batch?.of)}
+          &middot; slides ${esc((e.slides || []).join(", "))}
+          &middot; ${e.rule_findings_sent} rule finding(s) sent
+          &middot; ${(e.images_attached || []).length
+            ? `${e.images_attached.length} slide image(s) attached`
+            : "no images"}
+          &middot; finished ${esc(e.finish_reason || "?")}
+        </div>
+        <pre>${esc(JSON.stringify(e.response, null, 2))}</pre>
+      </div>`).join("")}
+  </details>`;
 }
 
 function logHTML(logs) {
@@ -679,6 +885,39 @@ function wireResults() {
 
   const save = $("#save");
   if (save) save.addEventListener("click", saveJSON);
+
+  for (const box of document.querySelectorAll("input[data-fix]")) {
+    box.addEventListener("change", () => {
+      box.checked ? state.ticked.add(box.dataset.fix)
+                  : state.ticked.delete(box.dataset.fix);
+      // Only the bar's count changes, so redraw it rather than the whole list:
+      // a full render would scroll the reader back to the top mid-tick.
+      const bar = $(".applybar");
+      if (bar) {
+        bar.outerHTML = applyBarHTML(state.result.report.issues || []);
+        wireApplyBar();
+      }
+    });
+  }
+  wireApplyBar();
+
+  const preview = $("#do-preview");
+  if (preview) preview.addEventListener("click", loadPreview);
+}
+
+function wireApplyBar() {
+  const all = $("#tick-all");
+  if (all) all.addEventListener("click", () => {
+    state.ticked = new Set(state.fixable);
+    render();
+  });
+  const none = $("#tick-none");
+  if (none) none.addEventListener("click", () => {
+    state.ticked.clear();
+    render();
+  });
+  const apply = $("#apply");
+  if (apply) apply.addEventListener("click", applyTicked);
 }
 
 function debounce(fn, ms) {

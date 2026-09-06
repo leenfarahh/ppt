@@ -36,9 +36,9 @@ from .ai.payload import DEFAULT_BATCH_SIZE, build_batches, estimate_tokens, payl
 from .extract import derive_master_spec, read_deck
 from .guidelines import load_guidelines
 from .linemetrics import LineMetricsProvider, default_provider
+from .render import SlideImages, render_deck
 from .models import (
     DeckProfile,
-    Dismissal,
     Provenance,
     Issue,
     MasterSpec,
@@ -68,6 +68,8 @@ class RunConfig:
     payload_dir: Optional[Path] = None
     batch_size: int = DEFAULT_BATCH_SIZE
     min_confidence: float = 0.0
+    render: bool = False        # attach rendered slides to the AI layer
+    ai_debug: bool = False      # keep the raw AI exchange on the report
     ai: AIConfig = field(default_factory=AIConfig)
 
 
@@ -134,25 +136,15 @@ def run(config: RunConfig) -> ValidationReport:
         if ai_result.summary:
             summaries.append(f"{deck.name}: {ai_result.summary}")
 
-        dismissed: list[Dismissal] = []
         merged = merge_issues(
             rule_issues=rule_issues,
             ai_issues=ai_result.issues,
-            dismissals=ai_result.dismissals,
             ref_lookup={ref_for(i): issue for i, issue in enumerate(rule_issues)},
             min_confidence=config.min_confidence,
-            record=dismissed,
         )
         all_issues.extend(merged)
-        report.dismissals.extend(dismissed)
-        if dismissed:
-            log.info(
-                "%s: the AI layer dismissed %d of %d rule finding(s); they are "
-                "listed on the report",
-                deck.name,
-                len(dismissed),
-                len(rule_issues),
-            )
+        if config.ai_debug and ai_result.exchanges:
+            report.ai_exchanges.extend(ai_result.exchanges)
 
         if ai_result.calls:
             log.info(
@@ -165,8 +157,12 @@ def run(config: RunConfig) -> ValidationReport:
             )
 
     report.issues = all_issues
-    # Counted alongside the issues so the numbers reconcile: what the rules
-    # found is what is reported, plus what was dismissed.
+    # Assigned here, once, on the finished list: a finding that has been
+    # merged, absorbed and sorted is what the designer sees and ticks.
+    for issue in report.issues:
+        issue.id = issue.fingerprint()
+    # Every rule finding reaches the report, so the only thing standing
+    # between what was checked and what is printed is the skipped rules.
     report.stats = summarize_report(report)
     report.ai_summary = " ".join(summaries) or None
     return report
@@ -207,30 +203,72 @@ def _run_ai_layer(
         return result
 
     validator = AIValidator(spec, config.ai)
+    images = _render(deck, config)
 
-    for payload in build_batches(deck, rule_issues, config.batch_size, spec=spec):
-        if config.ai_dry_run:
-            _dump_payload(payload, validator, config)
-            continue
-        try:
-            result.merge(validator.validate_batch(payload, deck.name))
-        except AIValidationError as exc:
-            # The deterministic findings are still worth reporting, so the run
-            # continues without the AI layer rather than failing outright.
-            #
-            # AIValidationError already carries the actionable message, so the
-            # traceback through the SDK adds nothing at normal verbosity. It is
-            # kept for -vv, where an unexpected SDK error needs the frames.
-            log.error(
-                "AI layer failed on %s: %s -- reporting rule findings only",
-                deck.name,
-                exc,
-                exc_info=log.isEnabledFor(logging.DEBUG),
-            )
-            if not log.isEnabledFor(logging.DEBUG):
-                log.info("run with -vv for the full traceback")
-            break
+    try:
+        for payload in build_batches(deck, rule_issues, config.batch_size, spec=spec):
+            if config.ai_dry_run:
+                _dump_payload(payload, validator, config)
+                continue
+            batch = images.for_slides(payload.get("batch", {}).get("slides", []))
+            try:
+                result.merge(validator.validate_batch(payload, deck.name, batch))
+            except AIValidationError as exc:
+                # The deterministic findings are still worth reporting, so the
+                # run continues without the AI layer rather than failing.
+                #
+                # AIValidationError already carries the actionable message, so
+                # the traceback through the SDK adds nothing at normal
+                # verbosity. It is kept for -vv, where an unexpected SDK error
+                # needs the frames.
+                log.error(
+                    "AI layer failed on %s: %s -- reporting rule findings only",
+                    deck.name,
+                    exc,
+                    exc_info=log.isEnabledFor(logging.DEBUG),
+                )
+                if not log.isEnabledFor(logging.DEBUG):
+                    log.info("run with -vv for the full traceback")
+                break
+    finally:
+        images.cleanup()
+
+    _check_evidence(result, images)
     return result
+
+
+def _render(deck: DeckProfile, config: RunConfig) -> SlideImages:
+    """Render the deck for the AI layer, or explain why there are no pictures."""
+    if not config.render or config.ai_dry_run:
+        return SlideImages(renderer="none", reason="rendering was not requested")
+
+    images = render_deck(deck.path)
+    if not images:
+        log.warning(
+            "%s: no rendered slides, so the AI layer sees geometry only (%s)",
+            deck.name,
+            images.reason,
+        )
+    return images
+
+
+def _check_evidence(result: AIResult, images: SlideImages) -> None:
+    """Demote any claim that says it looked at a slide there was no picture of.
+
+    The label is the whole value of the render: a designer weighing "the text
+    does not collide" needs to know whether that was seen or supposed. A model
+    that says "render" for a slide it was never shown would quietly turn a
+    guess into evidence, so the claim is kept and the label is not.
+    """
+    for issue in result.issues:
+        if issue.evidence != "render":
+            continue
+        if issue.slide is None or issue.slide not in images.images:
+            log.debug(
+                "slide %s was not rendered; recording the finding as geometry",
+                issue.slide,
+            )
+            issue.evidence = "geometry"
 
 
 def _dump_payload(payload: dict, validator: AIValidator, config: RunConfig) -> None:

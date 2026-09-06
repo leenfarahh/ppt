@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections import Counter
 from typing import Iterable
 
-from ..models import Category, Geometry, Issue, Severity
+from ..models import Category, Geometry, Issue, Severity, TextRole
 from .base import Rule, RuleContext
 
 
@@ -64,12 +64,14 @@ class SafeMarginRule(Rule):
 
     id = "space.safe_margin"
     category = Category.SPACE
-    description = "Content sits inside the safe margin."
+    description = "Content crosses the safe margin."
     default_severity = Severity.WARNING
-    requires_guidelines = True
 
     def check(self, ctx: RuleContext) -> Iterable[Issue]:
-        margins = ctx.guidelines.safe_margins
+        # The spec's margins, not the brand file's: authored where stated, read
+        # off the master's layouts where not. Requiring a brand file meant this
+        # never ran on a master-only run, which is most of them.
+        margins = ctx.spec.safe_margins
         width, height = ctx.deck.width_in, ctx.deck.height_in
         tolerance = ctx.spec.tolerances.position_in
 
@@ -78,7 +80,24 @@ class SafeMarginRule(Rule):
             # or bleed image is supposed to cross it.
             if not shape.paragraphs or not shape.text.strip():
                 continue
+            # Footers, page numbers and dates live in the margin by design.
+            # The frame is derived from the content placeholders precisely so
+            # that it describes where body copy belongs, and holding the
+            # furniture to it would report every slide in every deck.
+            if shape.role is TextRole.FOOTER:
+                continue
             box = shape.geometry
+            # The same exemption by geometry, for furniture that carries no
+            # footer role: a date line or a navigation tab sitting *entirely*
+            # in the margin strip was put there on purpose. Overflow looks
+            # different -- it starts inside the content band and spills out --
+            # so a shape that straddles the edge is still reported.
+            #
+            # Without this the rule flags the footer row on every slide, and
+            # the fixer then shoves those shapes up into the real footer,
+            # trading a margin finding for a collision.
+            if _outside_the_band(box, margins, width, height):
+                continue
             breaches = []
             # An edge the brand does not specify is not tested. Guessing one
             # would report every deck against a frame nobody set.
@@ -200,6 +219,24 @@ class TextOverflowRule(Rule):
 
     def check(self, ctx: RuleContext) -> Iterable[Issue]:
         return ()
+
+
+def _outside_the_band(box: Geometry, margins, width: float, height: float) -> bool:
+    """True when the shape sits wholly in a margin strip rather than crossing into it.
+
+    The distinction the rule turns on. Content that overflows starts inside
+    the usable area and runs past its edge; furniture is drawn in the strip
+    and never enters the content band at all.
+    """
+    if margins.bottom_in is not None and box.top_in >= height - margins.bottom_in:
+        return True
+    if margins.top_in is not None and box.bottom_in <= margins.top_in:
+        return True
+    if margins.left_in is not None and box.right_in <= margins.left_in:
+        return True
+    if margins.right_in is not None and box.left_in >= width - margins.right_in:
+        return True
+    return False
 
 
 def _margin_summary(margins) -> str:

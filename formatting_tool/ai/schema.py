@@ -37,6 +37,15 @@ AI_ISSUE_SCHEMA: dict[str, Any] = {
             "type": "number",
             "description": "0.0-1.0. Below 0.5 means a judgement call, not a defect.",
         },
+        "basis": {
+            "type": "string",
+            "enum": ["render", "geometry"],
+            "description": (
+                "'render' only when a rendered image of the slide was "
+                "supplied and you actually read this from it. 'geometry' for "
+                "anything reasoned from the numbers."
+            ),
+        },
         "confirms_refs": {
             "type": "array",
             "items": {"type": "string"},
@@ -56,6 +65,7 @@ AI_ISSUE_SCHEMA: dict[str, Any] = {
         "found",
         "suggestion",
         "confidence",
+        "basis",
         "confirms_refs",
     ],
     "additionalProperties": False,
@@ -66,28 +76,17 @@ AI_RESPONSE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
         "issues": {"type": "array", "items": AI_ISSUE_SCHEMA},
-        "dismissed_refs": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "ref": {"type": "string"},
-                    "reason": {"type": "string"},
-                },
-                "required": ["ref", "reason"],
-                "additionalProperties": False,
-            },
-            "description": (
-                "Rule findings that are false positives in context, with the "
-                "reason. Used to suppress them from the final report."
-            ),
-        },
+        # There is deliberately no way to dismiss a rule finding. The
+        # deterministic layer proves what it reports, and a model judging a
+        # whole class of finding away in one call is not a review, it is a
+        # filter nobody asked for. Context that argues against a finding
+        # belongs on the finding, as a low confidence and an explanation.
         "summary": {
             "type": "string",
             "description": "Two or three sentences on the state of the deck.",
         },
     },
-    "required": ["issues", "dismissed_refs", "summary"],
+    "required": ["issues", "summary"],
     "additionalProperties": False,
 }
 
@@ -135,7 +134,7 @@ def to_gemini_schema(schema: dict[str, Any]) -> dict[str, Any]:
 def issues_from_response(
     payload: dict[str, Any],
     deck_name: str,
-) -> tuple[list[Issue], dict[str, str], str]:
+) -> tuple[list[Issue], str]:
 
     issues: list[Issue] = []
     for raw in payload.get("issues", []):
@@ -157,15 +156,11 @@ def issues_from_response(
                 found=raw.get("found"),
                 suggestion=raw.get("suggestion"),
                 confidence=_confidence(raw.get("confidence")),
+                evidence=_basis(raw.get("basis")),
             )
         )
 
-    dismissals = {
-        str(entry.get("ref")): str(entry.get("reason", ""))
-        for entry in payload.get("dismissed_refs", [])
-        if entry.get("ref")
-    }
-    return issues, dismissals, str(payload.get("summary", "")).strip()
+    return issues, str(payload.get("summary", "")).strip()
 
 
 def _category(value: Any) -> Category:
@@ -187,6 +182,16 @@ def _confidence(value: Any) -> Optional[float]:
         return max(0.0, min(1.0, float(value)))
     except (TypeError, ValueError):
         return None
+
+
+def _basis(value: Any) -> Optional[str]:
+    """Only the two words mean anything; anything else is discarded.
+
+    A claim that says it came from the render when no render was supplied is
+    the failure mode worth guarding, and the caller checks that separately.
+    """
+    text = str(value or "").strip().lower()
+    return text if text in ("render", "geometry") else None
 
 
 def _first_ref(refs: Any) -> Optional[str]:

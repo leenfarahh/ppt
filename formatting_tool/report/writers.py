@@ -78,28 +78,13 @@ def write_text(report: ValidationReport, stream: TextIO) -> None:
 
 
 def _write_omissions_text(report: ValidationReport, stream: TextIO) -> None:
-    """What the list above does not contain.
+    """What was not checked at all.
 
     Printed after the findings and before the summary, because it is the
     context for both: a short report can mean a clean deck or a report with
     most of its checks turned off, and the reader cannot tell those apart from
     the findings alone.
     """
-    if report.dismissals:
-        heading = (
-            f"Dismissed by the AI layer ({len(report.dismissals)} rule finding(s))"
-        )
-        stream.write(heading + "\n" + "-" * len(heading) + "\n")
-        stream.write(
-            "  Proved from the file, then judged a false positive in context.\n"
-            "  Re-run with --no-ai to see them all.\n\n"
-        )
-        for rule_id, group in _by_rule(report.dismissals):
-            stream.write(f"  {len(group):>4}  {rule_id}\n")
-            for reason in sorted({d.reason for d in group if d.reason})[:2]:
-                stream.write(f"        reason: {reason}\n")
-        stream.write("\n")
-
     if report.skipped_rules:
         heading = f"Not checked ({len(report.skipped_rules)} rule(s) did not run)"
         stream.write(heading + "\n" + "-" * len(heading) + "\n")
@@ -157,19 +142,6 @@ def write_markdown(report: ValidationReport, stream: TextIO) -> None:
 
 
 def _write_omissions_markdown(report: ValidationReport, stream: TextIO) -> None:
-    if report.dismissals:
-        stream.write(
-            f"> **{len(report.dismissals)} rule finding(s) dismissed by the AI "
-            f"layer** and not listed below. Each was proved from the file, then "
-            f"judged a false positive in context. Re-run with `--no-ai` to see "
-            f"them all.\n\n"
-        )
-        stream.write("| Dismissed | Rule | Reason given |\n| --- | --- | --- |\n")
-        for rule_id, group in _by_rule(report.dismissals):
-            reason = next((d.reason for d in group if d.reason), "")
-            stream.write(f"| {len(group)} | `{rule_id}` | {_cell(reason)} |\n")
-        stream.write("\n")
-
     if report.skipped_rules:
         stream.write(
             f"> **{len(report.skipped_rules)} check(s) did not run.** "
@@ -186,19 +158,6 @@ def _write_omissions_markdown(report: ValidationReport, stream: TextIO) -> None:
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
-
-def _by_rule(dismissals: list) -> list[tuple[str, list]]:
-    """Dismissals grouped by rule, commonest first.
-
-    Grouped because they arrive in bulk: the AI dismisses a whole class of
-    finding at once, and a flat list of several hundred would bury the report
-    it is supposed to qualify.
-    """
-    buckets: dict[str, list] = defaultdict(list)
-    for dismissal in dismissals:
-        buckets[dismissal.rule_id or "(unattributed)"].append(dismissal)
-    return sorted(buckets.items(), key=lambda item: (-len(item[1]), item[0]))
-
 
 def _grouped(issues: list[Issue]):
     buckets: dict[tuple[str, object], list[Issue]] = defaultdict(list)
@@ -220,12 +179,22 @@ def _counts_line(report: ValidationReport) -> str:
 
 
 def _provenance(issue: Issue) -> str:
+    """Where the finding came from, and for an AI one, whether it looked.
+
+    "the text does not collide" is worth very different things as something
+    seen in a render and as something supposed from two bounding boxes, so the
+    report never prints one as if it were the other.
+    """
     if issue.source is Source.RULE:
         return f"[rule {issue.rule_id}]"
-    confidence = (
-        f", confidence {issue.confidence:.2f}" if issue.confidence is not None else ""
-    )
-    return f"[ai review{confidence}]"
+    parts = ["ai review"]
+    if issue.evidence == "render":
+        parts.append("from the rendered slide")
+    elif issue.evidence == "geometry":
+        parts.append("from the numbers")
+    if issue.confidence is not None:
+        parts.append(f"confidence {issue.confidence:.2f}")
+    return f"[{', '.join(parts)}]"
 
 
 def _cell(value: object) -> str:

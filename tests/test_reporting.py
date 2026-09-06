@@ -1,11 +1,11 @@
 """Tests for what the report says it left out, and for whose theme is authority.
 
 Two themes run through these. First, a report has to account for the gap
-between what the rules found and what it prints: a finding the AI dismissed
-and a check that never ran are both invisible in an issue list, and both
-change what the list means. Second, a messy deck arrives carrying the theme
-and layouts of the file it was built from, and none of that is a standard to
-measure it against.
+between what was checked and what it prints: a check that never ran is
+invisible in an issue list and changes what the list means, and nothing else
+may reduce that list -- no layer can remove a finding. Second, a messy deck
+arrives carrying the theme and layouts of the file it was built from, and none
+of that is a standard to measure it against.
 """
 
 from __future__ import annotations
@@ -18,7 +18,6 @@ from formatting_tool.models import (
     BrandGuidelines,
     Category,
     DeckProfile,
-    Dismissal,
     Geometry,
     Issue,
     ParagraphProfile,
@@ -50,44 +49,43 @@ def _rule_issue(rule_id: str, slide: int, found: str = "x") -> Issue:
 
 
 # --------------------------------------------------------------------------- #
-# Dismissals are recorded, not deleted
+# Nothing removes a rule finding
 # --------------------------------------------------------------------------- #
 
-def test_a_dismissal_is_recorded_with_its_reason() -> None:
-    """Dropping a proved finding is a claim, and has to be reviewable.
+def test_every_rule_finding_survives_the_merge() -> None:
+    """The deterministic layer proves what it reports, so it is not filtered.
 
-    Without this the report is indistinguishable from one where the rule never
-    fired, and the reader has no way to disagree with the AI.
+    A model judging a whole class of finding away in one call is not a review,
+    and the designer never sees what was taken from them.
     """
-    rules = [_rule_issue("space.overlap", 1), _rule_issue("space.overlap", 2)]
+    rules = [_rule_issue("space.overlap", n) for n in (1, 2, 3)]
     lookup = {ref_for(i): issue for i, issue in enumerate(rules)}
-    record: list[Dismissal] = []
 
-    kept = merge_issues(
-        rules, [], dismissals={"R1": "overlap is by design"},
-        ref_lookup=lookup, record=record,
+    kept = merge_issues(rules, [], ref_lookup=lookup)
+
+    assert len(kept) == len(rules)
+
+
+def test_context_against_a_finding_lands_on_it_rather_than_removing_it() -> None:
+    """The judgement survives; the finding survives too.
+
+    The AI's way of saying "this one is defensible" is a low confidence and an
+    explanation on the finding itself, which a designer can weigh.
+    """
+    rule = _rule_issue("space.overlap", 1, found="2.79 sq in")
+    argued = Issue(
+        category=Category.SPACE, severity=Severity.ERROR, source=Source.AI,
+        message="Boxes overlap.", confirms="R1", slide=1, deck="d.pptx",
+        found="different wording", confidence=0.2,
+        suggestion="Tight line spacing; the text does not visually collide.",
     )
+
+    kept = merge_issues([rule], [argued], ref_lookup={ref_for(0): rule})
 
     assert len(kept) == 1
-    assert len(record) == 1
-    assert record[0].rule_id == "space.overlap"
-    assert record[0].reason == "overlap is by design"
-    assert record[0].slide == 1
-
-
-def test_dismissals_reach_the_written_report() -> None:
-    report = ValidationReport(
-        master="m.pptx", decks=["d.pptx"], generated_at="now",
-        issues=[_rule_issue("space.overlap", 3)],
-        dismissals=[Dismissal(rule_id="space.overlap", reason="by design",
-                              deck="d.pptx", slide=1, message="overlap")],
-    )
-    for writer in (write_text, write_markdown):
-        buf = io.StringIO()
-        writer(report, buf)
-        out = buf.getvalue()
-        assert "space.overlap" in out
-        assert "by design" in out
+    assert kept[0].source is Source.RULE
+    assert kept[0].confidence == 0.2
+    assert "does not visually collide" in kept[0].suggestion
 
 
 def test_omissions_are_printed_even_when_nothing_was_found() -> None:
@@ -146,27 +144,6 @@ def test_an_ai_finding_with_no_ref_is_kept() -> None:
     kept = merge_issues([rule], [fresh], ref_lookup={ref_for(0): rule})
 
     assert len(kept) == 2
-
-
-def test_a_ref_pointing_at_a_dismissed_finding_does_not_resurrect_it() -> None:
-    """Dismissed and confirmed at once is contradictory; dismissal wins.
-
-    Folding the restatement into a finding that is no longer in the list would
-    put it back in the report through the side door.
-    """
-    rule = _rule_issue("space.overlap", 1)
-    restatement = Issue(
-        category=Category.SPACE, severity=Severity.ERROR, source=Source.AI,
-        message="Boxes overlap.", confirms="R1", slide=1, deck="d.pptx",
-        found="different wording",
-    )
-
-    kept = merge_issues([rule], [restatement],
-                        dismissals={"R1": "by design"},
-                        ref_lookup={ref_for(0): rule})
-
-    assert [i.source for i in kept] == [Source.AI]
-    assert all(i.rule_id != "space.overlap" for i in kept)
 
 
 # --------------------------------------------------------------------------- #

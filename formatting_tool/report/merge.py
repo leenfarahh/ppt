@@ -1,18 +1,13 @@
 """Merge the two validation layers into one ordered list of inconsistencies.
 
-Three things happen here, in order:
+Two things happen here, in order:
 
-1. Dismissal. A rule finding the AI layer judged a false positive is dropped
-   from the issue list and recorded as a Dismissal, with its reason. It is not
-   deleted: removing something the deterministic layer proved from the file is
-   a claim, and an unreviewable claim is worth less than the finding it
-   removed.
-2. Deduplication. When the AI layer restates a rule finding, the two collapse
+1. Deduplication. When the AI layer restates a rule finding, the two collapse
    into one entry that keeps the rule's precision and the AI's explanation.
    The AI names the finding it is restating by ref, and that is what decides
    it -- matching on the wording of `found` never worked, because the two
    layers describe the same defect in different words.
-3. Ordering. Severity first, then deck, then slide, so the report reads in the
+2. Ordering. Severity first, then deck, then slide, so the report reads in the
    order a designer would work through it.
 """
 
@@ -21,7 +16,7 @@ from __future__ import annotations
 import logging
 from typing import Iterable, Optional, Sequence
 
-from ..models import SEVERITY_RANK, Dismissal, Issue, Source
+from ..models import SEVERITY_RANK, Issue, Source
 
 log = logging.getLogger(__name__)
 
@@ -29,38 +24,19 @@ log = logging.getLogger(__name__)
 def merge_issues(
     rule_issues: Sequence[Issue],
     ai_issues: Sequence[Issue] = (),
-    dismissals: Optional[dict[str, str]] = None,
     ref_lookup: Optional[dict[str, Issue]] = None,
     min_confidence: float = 0.0,
-    record: Optional[list[Dismissal]] = None,
 ) -> list[Issue]:
     """Combine both layers into the final list.
 
-    `record`, when given, collects a Dismissal for every rule finding the AI
-    layer dropped, so the caller can put them on the report.
+    Every rule finding survives. The AI layer has no way to remove one: what
+    the deterministic layer proved from the file reaches the report, and
+    context that argues against a finding rides along on it as a lowered
+    confidence and an explanation.
     """
-    dismissals = dismissals or {}
     ref_lookup = ref_lookup or {}
-    dismissed = _resolve_dismissals(dismissals, ref_lookup)
-
-    kept: list[Issue] = []
-    for issue in rule_issues:
-        reason = dismissed.get(id(issue))
-        if reason is not None:
-            log.info(
-                "dismissed %s on slide %s: %s", issue.rule_id, issue.slide, reason
-            )
-            if record is not None:
-                record.append(_as_dismissal(issue, reason))
-            continue
-        kept.append(issue)
-
-    # Identity, not equality: two rule findings can be equal by value (the same
-    # defect on two shapes with the same name) and only one of them is the ref.
-    alive = {id(issue) for issue in kept}
-    by_ref = {
-        ref: issue for ref, issue in ref_lookup.items() if id(issue) in alive
-    }
+    kept: list[Issue] = list(rule_issues)
+    by_ref = dict(ref_lookup)
     by_key = {issue.dedupe_key(): issue for issue in kept}
 
     for issue in ai_issues:
@@ -78,31 +54,6 @@ def merge_issues(
     return sort_issues(kept)
 
 
-def _as_dismissal(issue: Issue, reason: str) -> Dismissal:
-    return Dismissal(
-        rule_id=issue.rule_id,
-        reason=reason,
-        deck=issue.deck,
-        slide=issue.slide,
-        shape=issue.shape,
-        message=issue.message,
-        severity=issue.severity.value,
-    )
-
-
-def _resolve_dismissals(
-    dismissals: dict[str, str],
-    ref_lookup: dict[str, Issue],
-) -> dict[int, str]:
-    """Map ref -> reason onto the identities of the Issues to drop."""
-    resolved: dict[int, str] = {}
-    for ref, reason in dismissals.items():
-        issue = ref_lookup.get(ref)
-        if issue is None:
-            log.debug("dismissal names an unknown ref: %s", ref)
-            continue
-        resolved[id(issue)] = reason
-    return resolved
 
 
 def _absorb(rule_issue: Issue, ai_issue: Issue) -> None:
@@ -132,16 +83,14 @@ def sort_issues(issues: Iterable[Issue]) -> list[Issue]:
 
 
 def summarize_report(report) -> dict[str, int]:
-    """Counts for the report, including what it does not show.
+    """Counts for the report, including the checks that never ran.
 
     Separate from `summarize` because the issue list alone cannot answer "is
     this a short report or a quiet one". Anything that recomputes stats after
-    filtering has to come through here, or the omission counts vanish and the
+    filtering has to come through here, or the skipped count vanishes and the
     report silently goes back to looking complete.
     """
     stats = summarize(report.issues)
-    if report.dismissals:
-        stats["dismissed"] = len(report.dismissals)
     if report.skipped_rules:
         stats["rules_skipped"] = len(report.skipped_rules)
     return dict(sorted(stats.items()))

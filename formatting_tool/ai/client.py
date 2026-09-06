@@ -6,7 +6,14 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from ..models import Issue, MasterSpec
-from .gemini import AIValidationError, build_client, count as _count, generate_json
+from .gemini import (
+    AIValidationError,
+    finish_reason as _finish_reason,
+    build_client,
+    count as _count,
+    file_part,
+    generate_json,
+)
 from .payload import build_reference_block, payload_to_text
 from .schema import AI_RESPONSE_SCHEMA, issues_from_response, to_gemini_schema
 
@@ -51,16 +58,33 @@ You receive three things:
 
 Your job is the judgement the deterministic layer cannot make:
 
-- Confirm or dismiss the rule findings. A finding is a false positive when the
-  context justifies it (a deliberate accent colour on a section divider, a
-  full-bleed image crossing the safe margin, a legal line set small by design).
-  Dismiss it with a reason and do not restate it as an issue.
+- You cannot remove a rule finding. Every one of them was proved from the file
+  and every one reaches the report. If the context justifies a finding -- a
+  deliberate accent colour on a section divider, a full-bleed image crossing
+  the safe margin, a legal line set small by design -- say so by naming it in
+  confirms_refs with a low confidence and an explanation in `suggestion`. The
+  designer decides whether to act on it; you do not decide for them.
 - Report inconsistencies the rules missed: visual hierarchy that inverts
   between slides, a section divider styled like a content slide, spacing that
   is technically legal and visibly uneven, mixed capitalisation or tone across
   parallel elements, an element that reads as pasted from another deck.
 - Judge severity in context. A logo missing from the cover is a blocker. A
   caption 1pt off is not.
+
+When a rendered image of a slide is attached:
+
+- Use it for what only exists once rendered: text clipped by its box, type
+  that actually collides as opposed to boxes that merely overlap, contrast
+  and legibility over an image, a shape hidden behind another, a line that
+  reads as crooked. This is the reason the image is there.
+- Do not use it to measure. The numbers in the payload are exact and the
+  image is not: a 0.06in miss against a grid line is real and invisible, a
+  colour eyedropped off a JPEG is not the colour in the file. Never contradict
+  a measurement with an impression of one.
+- Set `basis` to "render" only for a claim you actually read off the image,
+  and "geometry" for everything else. A slide with no image attached is always
+  "geometry". This is the difference between an observation and a guess, and
+  the designer is told which they are reading.
 
 Rules of engagement:
 
@@ -97,8 +121,11 @@ class AIConfig:
 @dataclass
 class AIResult:
     issues: list[Issue] = field(default_factory=list)
-    dismissals: dict[str, str] = field(default_factory=dict)
     summaries: list[str] = field(default_factory=list)
+    # What each batch actually sent and got back. The AI layer is the part of
+    # this tool you cannot read the source of to find out why it said
+    # something, so the exchange is kept rather than discarded.
+    exchanges: list[dict[str, Any]] = field(default_factory=list)
     calls: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
@@ -111,8 +138,8 @@ class AIResult:
 
     def merge(self, other: "AIResult") -> None:
         self.issues.extend(other.issues)
-        self.dismissals.update(other.dismissals)
         self.summaries.extend(other.summaries)
+        self.exchanges.extend(other.exchanges)
         self.calls += other.calls
         self.input_tokens += other.input_tokens
         self.output_tokens += other.output_tokens
@@ -139,13 +166,18 @@ class AIValidator:
 
     # -- the call ----------------------------------------------------------- #
 
-    def validate_batch(self, payload: dict[str, Any], deck_name: str) -> AIResult:
+    def validate_batch(
+        self,
+        payload: dict[str, Any],
+        deck_name: str,
+        images: Optional[list[tuple[int, Any]]] = None,
+    ) -> AIResult:
         client = self._ensure_client()
 
         data, response = generate_json(
             client,
             model=self.config.model,
-            contents=payload_to_text(payload),
+            contents=self._contents(payload, client, images),
             system_instruction=self.system_instruction(),
             schema=self._response_schema,
             translate_schema=False,      # translated once in __init__
@@ -155,20 +187,52 @@ class AIValidator:
         )
 
         result = self._build_result(data, response, deck_name)
+        result.exchanges = [
+            {
+                "batch": payload.get("batch", {}),
+                "slides": payload.get("batch", {}).get("slides", []),
+                "images_attached": [n for n, _ in (images or [])],
+                "rule_findings_sent": len(payload.get("rule_findings", [])),
+                "response": data,
+                "finish_reason": _finish_reason(response),
+            }
+        ]
         self._log_usage(response, payload)
         return result
+
+    def _contents(
+        self,
+        payload: dict[str, Any],
+        client: Any,
+        images: Optional[list[tuple[int, Any]]],
+    ) -> Any:
+        """The payload, then one labelled image per slide in this batch.
+
+        Labelled, because a bare run of images leaves the model to infer which
+        slide is which from the order, and a misattributed finding names the
+        wrong slide in a designer's list.
+        """
+        text = payload_to_text(payload)
+        if not images:
+            return text
+
+        parts: list[Any] = [text]
+        for number, path in images:
+            parts.append(f"Slide {number}, as PowerPoint renders it:")
+            parts.append(file_part(client, path, "image/png"))
+        log.debug("attaching %d rendered slide(s) to the batch", len(images))
+        return parts
 
     # -- response handling -------------------------------------------------- #
 
     def _build_result(
         self, data: dict[str, Any], response: Any, deck_name: str
     ) -> AIResult:
-        issues, dismissals, summary = issues_from_response(data, deck_name)
+        issues, summary = issues_from_response(data, deck_name)
         usage = getattr(response, "usage_metadata", None)
         cached = _count(usage, "cached_content_token_count")
         return AIResult(
             issues=issues,
-            dismissals=dismissals,
             summaries=[summary] if summary else [],
             calls=1,
             # prompt_token_count already includes the cached prefix, so it

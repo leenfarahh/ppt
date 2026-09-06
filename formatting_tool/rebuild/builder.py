@@ -370,10 +370,25 @@ def _remap_relationships(element: Any, src_part: Any, tgt_part: Any) -> set[str]
     """
     unsupported: set[str] = set()
 
-    for node in element.iter():
+    for node in list(element.iter()):
         for attr, rid in list(node.attrib.items()):
             if not attr.startswith(_R_NS):
                 continue
+
+            # An empty r:id is the idiom for "no hyperlink here", left behind
+            # when one is removed. It is not a reference and there is nothing
+            # to rebuild; treating it as a broken one cost fifteen shapes on a
+            # real deck, including a cover title.
+            if not rid:
+                continue
+
+            if _is_tag(node):
+                # Customer-data tags carry no content. Dropping the shape over
+                # metadata loses the shape; dropping the metadata loses
+                # nothing anybody can see.
+                _detach(node)
+                break
+
             rel = _relationship(src_part, rid)
             if rel is None:
                 unsupported.add("a missing relationship")
@@ -383,17 +398,46 @@ def _remap_relationships(element: Any, src_part: Any, tgt_part: Any) -> set[str]
                     new_rid = tgt_part.relate_to(
                         rel.target_ref, rel.reltype, is_external=True
                     )
-                elif rel.reltype.endswith("/image"):
+                elif _kind(rel.reltype) in _IMAGE_KINDS:
                     new_rid = _reimport_image(rel, tgt_part)
                 else:
                     unsupported.add(_kind(rel.reltype))
                     continue
             except Exception:
+                if _is_alternate_image(node):
+                    # A high-definition or vector copy of an image the shape
+                    # already carries in `a:blip`. Losing the enhancement is
+                    # invisible; losing the shape is two missing portraits.
+                    log.debug("dropping an alternate image reference on %s", node.tag)
+                    _detach(node)
+                    break
                 unsupported.add(_kind(rel.reltype))
                 continue
             node.set(attr, new_rid)
 
     return unsupported
+
+
+# Parts that are a picture and nothing else, so copying the bytes copies
+# everything. `hdphoto` is the Windows Media Photo alternate PowerPoint writes
+# alongside a JPEG; `svg` is the vector original beside its raster fallback.
+_IMAGE_KINDS = frozenset({"image", "hdphoto"})
+
+_ALTERNATE_TAGS = ("imgLayer", "svgBlip")
+
+
+def _is_tag(node: Any) -> bool:
+    return node.tag.rsplit("}", 1)[-1] == "tags"
+
+
+def _is_alternate_image(node: Any) -> bool:
+    return node.tag.rsplit("}", 1)[-1] in _ALTERNATE_TAGS
+
+
+def _detach(node: Any) -> None:
+    parent = node.getparent()
+    if parent is not None:
+        parent.remove(node)
 
 
 def _reimport_image(rel: Any, tgt_part: Any) -> str:

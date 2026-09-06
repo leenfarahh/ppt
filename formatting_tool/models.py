@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from enum import Enum
+from hashlib import sha1
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
@@ -99,36 +100,45 @@ class Issue:
     confirms: Optional[str] = None
     slide: Optional[int] = None         # 1-based slide number; None = deck-level
     shape: Optional[str] = None         # shape name as it appears in the deck
+    # The OOXML shape id, unique within its slide. Names are not: a real deck
+    # routinely carries sixteen shapes called "Pentagon 7" on one slide, so a
+    # fix matched on name alone would land on whichever came first.
+    shape_id: Optional[int] = None
     deck: Optional[str] = None          # filled in by the pipeline
     expected: Optional[str] = None
     found: Optional[str] = None
     suggestion: Optional[str] = None
     confidence: Optional[float] = None  # AI layer only
+    # AI layer only: whether the claim was made by looking at the rendered
+    # slide ("render") or reasoned from the numbers ("geometry"). It is the
+    # difference between "the text does not collide" as an observation and as
+    # a guess, and a designer weighing a finding needs to know which.
+    evidence: Optional[str] = None
+    # Short stable handle, assigned once the finding is final. It is what a
+    # designer ticks and what `apply --fix` takes, so it has to survive a
+    # round trip through JSON and mean the same thing on the next run over an
+    # unchanged deck. Derived from what the finding is about, never from its
+    # position in the list, which moves as other findings come and go.
+    id: Optional[str] = None
 
     def dedupe_key(self) -> tuple:
         """Identity used to collapse a rule finding and its AI restatement."""
         return (self.deck, self.slide, self.shape, self.category.value, self.found)
 
+    def fingerprint(self) -> str:
+        parts = [
+            self.deck or "",
+            str(self.slide or ""),
+            self.shape or "",
+            str(self.shape_id or ""),
+            self.rule_id or self.category.value,
+            self.found or "",
+            self.message,
+        ]
+        return sha1("\x1f".join(parts).encode("utf-8")).hexdigest()[:8]
+
     def to_dict(self) -> dict[str, Any]:
         return enum_safe(asdict(self))
-
-
-@dataclass
-class Dismissal:
-    """A rule finding the AI layer judged a false positive, and its reason.
-
-    Recorded rather than merely dropped. A dismissal deletes something the
-    deterministic layer proved from the file, so it is a claim in its own
-    right and has to be as reviewable as the finding it removes.
-    """
-
-    rule_id: Optional[str]
-    reason: str
-    deck: Optional[str] = None
-    slide: Optional[int] = None
-    shape: Optional[str] = None
-    message: str = ""
-    severity: Optional[str] = None
 
 
 @dataclass
@@ -159,10 +169,13 @@ class ValidationReport:
     # in the reference file. Findings resting on these are the weaker claims in
     # the report, so it says which they are.
     inferred_values: list[str] = field(default_factory=list)
-    # What the report does not show, and why. Between them these two account
-    # for the gap between what the rules found and what is printed.
-    dismissals: list[Dismissal] = field(default_factory=list)
+    # The checks that never ran. Nothing else stands between what the rules
+    # found and what is printed: no layer can remove a finding.
     skipped_rules: list[SkippedRule] = field(default_factory=list)
+    # What the AI layer was sent and what it returned, verbatim, per batch.
+    # Populated on request: it is the only way to tell a model that missed
+    # something from a payload that never described it.
+    ai_exchanges: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return enum_safe(asdict(self))
@@ -380,6 +393,12 @@ class RuleTuning:
     # Placeholder-signature overlap a layout must reach before a slide is
     # rebuilt onto it without the match being called out for review.
     layout_match_floor: float = 0.5
+    # Identical shapes that have to be present before they read as a series
+    # laid out on purpose rather than a coincidence of two equal boxes.
+    repeat_min_members: int = 3
+    # How far a member of a series can sit from the shared edge and still be
+    # drift rather than a deliberate placement somewhere else.
+    repeat_max_drift_in: float = 0.75
 
 
 @dataclass
@@ -458,6 +477,11 @@ class MasterSpec:
     # to a theme downstream reads these, never DeckProfile.theme_*.
     theme_fonts: dict[str, str] = field(default_factory=dict)
     theme_colors: dict[str, str] = field(default_factory=dict)
+    # The usable area, per edge. Authored values win; the rest are read off
+    # the master's own layouts, which is where a designer actually drew the
+    # frame. Without this the safe-margin check needed a brand file and so
+    # never ran on a master-only run, which is most runs.
+    safe_margins: Margins = field(default_factory=Margins)
 
     @property
     def tolerances(self) -> Tolerances:

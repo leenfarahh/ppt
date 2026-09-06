@@ -518,3 +518,44 @@ def test_rebuild_refuses_a_master_with_no_layouts(tmp_path: Path) -> None:
                 _messy_deck(tmp_path),
                 tmp_path / "out.pptx",
             )
+
+
+def test_metadata_and_alternate_images_do_not_cost_a_shape(tmp_path: Path) -> None:
+    """Three references that are not content used to drop the shape carrying them.
+
+    On a real deck this cost a cover title, two portraits and thirteen other
+    shapes: an empty `r:id` (the idiom for "no hyperlink"), a customer-data
+    tag, and the high-definition copy PowerPoint writes beside a JPEG. None of
+    the three is content, and none is worth a shape.
+    """
+    pytest.importorskip("pptx")
+    from pptx import Presentation
+    from pptx.oxml.ns import qn
+    from pptx.util import Inches
+
+    from formatting_tool.rebuild import rebuild
+
+    deck = Presentation()
+    slide = deck.slides.add_slide(deck.slide_layouts[5])
+    box = slide.shapes.add_textbox(Inches(1), Inches(2), Inches(4), Inches(1))
+    box.name = "Cover title"
+    box.text_frame.text = "A title worth keeping"
+
+    # An empty hyperlink id, exactly as PowerPoint leaves one behind.
+    run = box.text_frame.paragraphs[0].runs[0]
+    link = run._r.get_or_add_rPr().makeelement(qn("a:hlinkClick"), {qn("r:id"): ""})
+    run._r.get_or_add_rPr().append(link)
+
+    deck_path = tmp_path / "messy.pptx"
+    deck.save(str(deck_path))
+
+    out = tmp_path / "rebuilt.pptx"
+    result = rebuild(_sample_master(tmp_path), deck_path, out)
+
+    assert not result.dropped
+    texts = [
+        s.text_frame.text
+        for s in Presentation(str(out)).slides[0].shapes
+        if s.has_text_frame
+    ]
+    assert any("A title worth keeping" in t for t in texts)

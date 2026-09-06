@@ -136,28 +136,35 @@ def test_ai_response_maps_onto_issues() -> None:
                 "confirms_refs": ["R2"],
             }
         ],
-        "dismissed_refs": [{"ref": "R1", "reason": "deliberate accent"}],
         "summary": "One colour defect.",
     }
-    issues, dismissals, summary = issues_from_response(response, "messy.pptx")
+    issues, summary = issues_from_response(response, "messy.pptx")
     assert len(issues) == 1
     assert issues[0].source.value == "ai"
-    assert dismissals == {"R1": "deliberate accent"}
+    assert issues[0].confirms == "R2"
     assert summary == "One colour defect."
 
 
-def test_merge_dismisses_and_dedupes() -> None:
+def test_the_response_schema_cannot_carry_a_dismissal() -> None:
+    """The AI layer has no way to remove a rule finding.
+
+    Enforced in the contract rather than in the prompt: the model cannot ask
+    for something the schema does not allow, so this cannot regress by a
+    wording change.
+    """
+    assert "dismissed_refs" not in AI_RESPONSE_SCHEMA["properties"]
+    assert AI_RESPONSE_SCHEMA["required"] == ["issues", "summary"]
+
+
+def test_merge_keeps_every_rule_finding() -> None:
     ctx = _context()
     rule_issues = run_rules(ctx, build_default_rules())
-    target = rule_issues[0]
 
     merged = merge_issues(
         rule_issues=rule_issues,
-        dismissals={"R1": "by design"},
-        ref_lookup={"R1": target},
+        ref_lookup={"R1": rule_issues[0]},
     )
-    assert target not in merged
-    assert len(merged) == len(rule_issues) - 1
+    assert len(merged) == len(rule_issues)
     assert summarize(merged)["total"] == len(merged)
 
 

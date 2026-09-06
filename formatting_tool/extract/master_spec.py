@@ -15,6 +15,7 @@ from typing import Optional
 
 from ..models import (
     BrandGuidelines,
+    Margins,
     DeckProfile,
     Geometry,
     MasterSpec,
@@ -44,6 +45,7 @@ def derive_master_spec(
         layouts=list(master.layouts),
         theme_fonts=dict(master.theme_fonts),
         theme_colors=dict(master.theme_colors),
+        safe_margins=_safe_margins(master, guidelines),
     )
     return spec
 
@@ -117,6 +119,65 @@ def _roles(
             required=spec.required,
         )
     return roles
+
+
+# --------------------------------------------------------------------------- #
+# Safe margins
+# --------------------------------------------------------------------------- #
+
+# Placeholders that frame a slide rather than hold its content. A footer sits
+# at the very bottom edge by design, and letting it set the bottom margin
+# would put the frame outside anything a body of copy could breach.
+_CHROME = frozenset({"FOOTER", "SLIDE_NUMBER", "DATE"})
+
+
+def _safe_margins(master: DeckProfile, guidelines: BrandGuidelines) -> Margins:
+    """The usable area, authored where stated and read off the layouts where not.
+
+    A layout's content placeholders are where the designer decided content may
+    go, which makes their extent the frame -- a far better source than
+    measuring where content happens to sit on sample slides, and one that works
+    on a master with no slides at all.
+
+    The most permissive layout wins each edge: any layout in the master is
+    allowed, so content reaching the edge of the roomiest one is inside the
+    system.
+    """
+    stated = guidelines.safe_margins
+    observed = _layout_frame(master)
+    return Margins(
+        top_in=stated.top_in if stated.top_in is not None else observed.top_in,
+        right_in=stated.right_in if stated.right_in is not None else observed.right_in,
+        bottom_in=stated.bottom_in if stated.bottom_in is not None else observed.bottom_in,
+        left_in=stated.left_in if stated.left_in is not None else observed.left_in,
+    )
+
+
+def _layout_frame(master: DeckProfile) -> Margins:
+    edges: dict[str, list[float]] = {"top": [], "right": [], "bottom": [], "left": []}
+    for layout in master.layouts:
+        boxes = [
+            shape.geometry
+            for shape in layout.placeholders
+            if shape.placeholder_token not in _CHROME
+        ]
+        if not boxes:
+            continue
+        edges["left"].append(min(b.left_in for b in boxes))
+        edges["top"].append(min(b.top_in for b in boxes))
+        edges["right"].append(master.width_in - max(b.right_in for b in boxes))
+        edges["bottom"].append(master.height_in - max(b.bottom_in for b in boxes))
+
+    def edge(side: str) -> Optional[float]:
+        values = [v for v in edges[side] if v >= 0]
+        return round(min(values), 2) if values else None
+
+    return Margins(
+        top_in=edge("top"),
+        right_in=edge("right"),
+        bottom_in=edge("bottom"),
+        left_in=edge("left"),
+    )
 
 
 # --------------------------------------------------------------------------- #

@@ -18,12 +18,14 @@ import json
 import logging
 import os
 import re
+import sys
 import tempfile
 import threading
 import time
 import traceback
 import webbrowser
-from dataclasses import dataclass
+import secrets
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from shutil import rmtree
@@ -32,9 +34,12 @@ from typing import Any, Optional
 from .. import __version__
 from ..ai.client import AIConfig, AIValidationError, DEFAULT_EFFORT, DEFAULT_MODEL
 from ..ai.payload import DEFAULT_BATCH_SIZE
+from ..apply import ApplyError, apply_fixes, fixable
 from ..extract import DeckReadError
 from ..guidelines import GuidelinesError
 from ..pipeline import RunConfig, run
+from ..render import render_deck
+from ..report.reader import _issue as _issue_from_dict
 from ..rules import build_default_rules, describe_rules
 
 log = logging.getLogger(__name__)
@@ -55,6 +60,76 @@ _RUN_LOCK = threading.Lock()
 
 class _BadRequest(Exception):
     """Something wrong with what the page sent, not with the pipeline."""
+
+
+# --------------------------------------------------------------------------- #
+# Sessions
+# --------------------------------------------------------------------------- #
+
+# How long an uploaded deck is kept after its run. Ticking findings and
+# applying them happens minutes after the check, so the deck has to outlive
+# the request that produced the report; it does not have to outlive the day.
+SESSION_TTL_S = 4 * 3600
+MAX_SESSIONS = 8
+
+
+@dataclass
+class _Session:
+    """One upload, kept so its findings can be applied to it later.
+
+    The page ticks findings against a report and then asks for them to be
+    applied. Re-uploading a 25 MB deck to do that would be absurd, and
+    re-deriving it would risk applying findings to a different file, so the
+    deck stays on disk with the report that describes it.
+    """
+
+    id: str
+    directory: Path
+    master: Path
+    deck: Path
+    report: dict[str, Any]
+    created: float = field(default_factory=time.time)
+
+    @property
+    def fixed(self) -> Path:
+        return self.directory / f"fixed-{self.deck.name}"
+
+    def cleanup(self) -> None:
+        rmtree(self.directory, ignore_errors=True)
+
+
+_SESSIONS: dict[str, _Session] = {}
+_SESSION_LOCK = threading.Lock()
+
+
+def _remember(session: _Session) -> None:
+    with _SESSION_LOCK:
+        _SESSIONS[session.id] = session
+        stale = [
+            key
+            for key, value in _SESSIONS.items()
+            if time.time() - value.created > SESSION_TTL_S
+        ]
+        # Oldest first, so a burst of checks does not fill the disk with decks
+        # nobody is going to apply anything to.
+        while len(_SESSIONS) - len(stale) > MAX_SESSIONS:
+            oldest = min(
+                (k for k in _SESSIONS if k not in stale),
+                key=lambda k: _SESSIONS[k].created,
+            )
+            stale.append(oldest)
+        for key in stale:
+            _SESSIONS.pop(key).cleanup()
+
+
+def _session(session_id: str) -> _Session:
+    with _SESSION_LOCK:
+        found = _SESSIONS.get(session_id)
+    if found is None:
+        raise _BadRequest(
+            "that check has expired; run it again before applying fixes"
+        )
+    return found
 
 
 # --------------------------------------------------------------------------- #
@@ -173,30 +248,163 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_file(STATIC / "index.html", "text/html; charset=utf-8")
         elif route == "/api/context":
             self._send_json(200, _context(self.server.root))
+        elif route.startswith("/api/preview/"):
+            self._preview(route)
+        elif route.startswith("/api/download/"):
+            self._download(route)
         else:
             self._send_json(404, {"error": f"no route for {route}"})
 
     def do_POST(self) -> None:
         route = self.path.split("?", 1)[0]
-        if route != "/api/validate":
+        if route == "/api/validate":
+            code, payload = self._guarded(self._run_pipeline)
+        elif route == "/api/apply":
+            code, payload = self._guarded(self._run_apply)
+        elif route == "/api/preview":
+            code, payload = self._guarded(self._run_preview)
+        else:
             self._send_json(404, {"error": f"no route for {route}"})
             return
-        code, payload = self._validate()
         self._send_json(code, payload)
+
+    # -- apply and preview -------------------------------------------------- #
+
+    def _run_apply(self) -> dict[str, Any]:
+        """Apply the ticked findings to the session's deck."""
+        body = self._json_body()
+        session = _session(str(body.get("session", "")))
+        chosen = [str(i) for i in body.get("fix", [])]
+        rebuild_too = bool(body.get("rebuild"))
+
+        if not chosen and not rebuild_too:
+            raise _BadRequest("nothing was ticked")
+
+        issues = [_issue_from_dict(e) for e in session.report.get("issues", [])]
+        for issue in issues:
+            if not issue.id:
+                issue.id = issue.fingerprint()
+
+        with _RUN_LOCK, _capture() as collected:
+            started = time.perf_counter()
+            result = apply_fixes(
+                deck=session.deck,
+                issues=issues,
+                out=session.fixed,
+                selected=chosen,
+                master=session.master if rebuild_too else None,
+            )
+            elapsed = time.perf_counter() - started
+
+        return {
+            "session": session.id,
+            "applied": [
+                {"id": o.issue.id, "detail": o.detail, "slide": o.issue.slide}
+                for o in result.applied
+            ],
+            "skipped": [
+                {"id": o.issue.id, "detail": o.detail, "slide": o.issue.slide}
+                for o in result.skipped
+            ],
+            "download": f"/api/download/{session.id}",
+            "rebuilt": result.rebuilt is not None,
+            "logs": collected.records,
+            "elapsed_s": round(elapsed, 2),
+        }
+
+    def _run_preview(self) -> dict[str, Any]:
+        """Render the deck before and, if it exists, after the fixes.
+
+        Rendering is what makes a fix reviewable. "moved 0.65in back onto the
+        canvas" is a claim; two pictures are the evidence, and a designer can
+        reject the result before it reaches a client.
+        """
+        body = self._json_body()
+        session = _session(str(body.get("session", "")))
+        slides = [int(n) for n in body.get("slides", [])] or None
+
+        before = _render_into(session.deck, session.directory / "before")
+        after: dict[int, str] = {}
+        if session.fixed.exists():
+            after = _render_into(session.fixed, session.directory / "after")
+
+        numbers = sorted(set(before) | set(after))
+        if slides:
+            numbers = [n for n in numbers if n in slides]
+
+        return {
+            "session": session.id,
+            "renderer_ok": bool(before),
+            "slides": [
+                {
+                    "slide": n,
+                    "before": f"/api/preview/{session.id}/before/{n}" if n in before else None,
+                    "after": f"/api/preview/{session.id}/after/{n}" if n in after else None,
+                }
+                for n in numbers
+            ],
+        }
+
+    def _preview(self, route: str) -> None:
+        parts = route.strip("/").split("/")      # api preview <id> <which> <n>
+        if len(parts) != 5 or parts[3] not in ("before", "after"):
+            self._send_json(404, {"error": "bad preview path"})
+            return
+        try:
+            session = _session(parts[2])
+        except _BadRequest as exc:
+            self._send_json(404, {"error": str(exc)})
+            return
+
+        directory = session.directory / parts[3]
+        image = _image_for(directory, parts[4])
+        if image is None:
+            self._send_json(404, {"error": "no such rendered slide"})
+            return
+        self._send_file(image, "image/png")
+
+    def _download(self, route: str) -> None:
+        session_id = route.rsplit("/", 1)[-1]
+        try:
+            session = _session(session_id)
+        except _BadRequest as exc:
+            self._send_json(404, {"error": str(exc)})
+            return
+        if not session.fixed.exists():
+            self._send_json(404, {"error": "nothing has been applied yet"})
+            return
+        body = session.fixed.read_bytes()
+        self.send_response(200)
+        self.send_header(
+            "Content-Type",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        )
+        self.send_header(
+            "Content-Disposition", f'attachment; filename="{session.fixed.name}"'
+        )
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _json_body(self) -> dict[str, Any]:
+        try:
+            return json.loads(self._body().decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise _BadRequest(f"could not read the request body: {exc}") from exc
 
     # -- the one real endpoint --------------------------------------------- #
 
-    def _validate(self) -> tuple[int, dict[str, Any]]:
+    def _guarded(self, work) -> tuple[int, dict[str, Any]]:
         try:
-            return 200, self._run_pipeline()
+            return 200, work()
         except _BadRequest as exc:
             return 400, {"error": str(exc)}
-        except (DeckReadError, GuidelinesError, AIValidationError) as exc:
+        except (DeckReadError, GuidelinesError, AIValidationError, ApplyError) as exc:
             # The CLI exits 2 on these and prints the message alone; they are
             # explained errors, so the page gets the same treatment.
             return 400, {"error": str(exc)}
         except Exception as exc:  # noqa: BLE001 - a local tool wants the trace
-            log.exception("unhandled error during validation")
+            log.exception("unhandled error handling a request")
             return 500, {"error": str(exc), "detail": traceback.format_exc()}
 
     def _run_pipeline(self) -> dict[str, Any]:
@@ -212,6 +420,7 @@ class _Handler(BaseHTTPRequestHandler):
             raise _BadRequest("no deck to check was sent")
 
         workdir = Path(tempfile.mkdtemp(prefix="formatting-tool-ui-"))
+        keep = False
         try:
             config = RunConfig(
                 master=_spill(workdir / "master", masters[0]),
@@ -220,6 +429,10 @@ class _Handler(BaseHTTPRequestHandler):
                 decks=[_spill(workdir / f"deck{i}", p) for i, p in enumerate(decks)],
                 guidelines=_resolve_guidelines(self.server.root, options.get("guidelines")),
                 use_ai=bool(options.get("use_ai")),
+                render=bool(options.get("render")),
+                # Always on in the page: it is a local tool, and the raw
+                # exchange is what makes an AI miss debuggable at all.
+                ai_debug=True,
                 min_confidence=float(options.get("min_confidence") or 0.0),
                 batch_size=int(options.get("batch_size") or DEFAULT_BATCH_SIZE),
                 ai=AIConfig(
@@ -234,7 +447,19 @@ class _Handler(BaseHTTPRequestHandler):
                 elapsed = time.perf_counter() - started
 
             records = collected.records
+            session = _Session(
+                id=secrets.token_hex(8),
+                directory=workdir,
+                master=config.master,
+                deck=config.decks[0],
+                report=report.to_dict(),
+            )
+            _remember(session)
+            keep = True
+
             return {
+                "session": session.id,
+                "fixable": [i.id for i in fixable(report.issues)],
                 "report": report.to_dict(),
                 "logs": records,
                 "elapsed_s": round(elapsed, 2),
@@ -248,7 +473,10 @@ class _Handler(BaseHTTPRequestHandler):
                 },
             }
         finally:
-            rmtree(workdir, ignore_errors=True)
+            # The deck stays on disk when a session owns it: the page will ask
+            # for fixes to be applied to this exact file, minutes from now.
+            if not keep:
+                rmtree(workdir, ignore_errors=True)
 
     # -- plumbing ---------------------------------------------------------- #
 
@@ -308,6 +536,52 @@ def _spill(directory: Path, part: _Part) -> Path:
     return target
 
 
+def _render_into(deck: Path, directory: Path) -> dict[int, str]:
+    """Render a deck into `directory`, reusing what is already there.
+
+    Rendering drives PowerPoint and costs seconds, and the before-images do not
+    change between one apply and the next, so they are rendered once.
+    """
+    existing = _existing_images(directory)
+    if existing:
+        return existing
+
+    images = render_deck(deck)
+    if not images:
+        log.info("no preview for %s: %s", deck.name, images.reason)
+        return {}
+    directory.mkdir(parents=True, exist_ok=True)
+    out: dict[int, str] = {}
+    for number, path in images.images.items():
+        target = directory / f"{number}.png"
+        target.write_bytes(path.read_bytes())
+        out[number] = target.name
+    images.cleanup()
+    return out
+
+
+def _existing_images(directory: Path) -> dict[int, str]:
+    if not directory.is_dir():
+        return {}
+    found: dict[int, str] = {}
+    for path in directory.glob("*.png"):
+        if path.stem.isdigit():
+            found[int(path.stem)] = path.name
+    return found
+
+
+def _image_for(directory: Path, number: str) -> Optional[Path]:
+    """One rendered slide, refusing anything that is not a plain number.
+
+    The number arrives from a URL, and joining an arbitrary string onto a path
+    is how a local tool starts serving files it was never asked about.
+    """
+    if not number.isdigit():
+        return None
+    candidate = directory / f"{int(number)}.png"
+    return candidate if candidate.is_file() else None
+
+
 def _guidelines_dir(root: Path) -> Path:
     return root / "config"
 
@@ -361,13 +635,83 @@ class _Server(ThreadingHTTPServer):
         self.root = root
 
 
+# Set in the child so it knows not to supervise in turn.
+_CHILD_ENV = "FORMATTING_TOOL_RELOAD_CHILD"
+
+
+def _watched_files() -> list[Path]:
+    package = Path(__file__).resolve().parents[1]
+    return list(package.rglob("*.py")) + list(STATIC.glob("*"))
+
+
+def _mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return -1.0
+
+
+def _supervise() -> int:
+    """Run the server as a child and restart it whenever the source changes.
+
+    Python imports a module once and never re-reads it, so a server started
+    before an edit serves the old code for as long as it runs, silently. That
+    is not theoretical: an afternoon of reports came out of a stale process,
+    looked like the tool had not changed, and cost an investigation to explain.
+
+    A supervisor rather than `os.execv`, which on Windows re-joins the argument
+    list without quoting and tears a path containing a space in half. A
+    supervisor rather than `importlib.reload`, which leaves old classes alive
+    in other modules' namespaces so half the process is new and half is not.
+    """
+    import subprocess  # noqa: PLC0415
+
+    command = [sys.executable, "-m", "formatting_tool", *sys.argv[1:]]
+    env = {**os.environ, _CHILD_ENV: "1"}
+
+    child = subprocess.Popen(command, env=env)
+    stamps = {p: _mtime(p) for p in _watched_files()}
+    try:
+        while True:
+            time.sleep(1.0)
+            if child.poll() is not None:
+                return child.returncode or 0
+            changed = next(
+                (p for p, was in stamps.items() if _mtime(p) != was), None
+            )
+            if changed is None:
+                continue
+            print(f"\n{changed.name} changed, restarting...", flush=True)
+            child.terminate()
+            try:
+                child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                child.kill()
+            child = subprocess.Popen(command, env=env)
+            stamps = {p: _mtime(p) for p in _watched_files()}
+    except KeyboardInterrupt:
+        print()
+    finally:
+        if child.poll() is None:
+            child.terminate()
+            try:
+                child.wait(timeout=5)
+            except Exception:
+                child.kill()
+    return 0
+
+
 def serve(
     port: int = 8000,
     host: str = "127.0.0.1",
     root: Optional[Path] = None,
     open_browser: bool = True,
+    reload: bool = False,
 ) -> int:
     """Run the UI until interrupted. Returns a CLI exit code."""
+    if reload and not os.environ.get(_CHILD_ENV):
+        return _supervise()
+
     root = Path(root or Path.cwd()).resolve()
 
     server = None
@@ -384,6 +728,11 @@ def serve(
     url = f"http://{host}:{server.server_address[1]}"
     print(f"Deck check UI on {url}")
     print(f"Guidelines read from {_guidelines_dir(root)}")
+    print(f"Build: {__version__} from {Path(__file__).resolve().parents[1]}")
+    if os.environ.get(_CHILD_ENV):
+        print("Reload: on. The server restarts when a source file changes.")
+    else:
+        print("Reload: OFF. Restart after editing the source, or use --reload.")
     print("Ctrl+C to stop.")
     if open_browser:
         threading.Timer(0.4, webbrowser.open, args=(url,)).start()

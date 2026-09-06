@@ -115,6 +115,7 @@ class Rule(ABC):
             rule_id=self.id,
             slide=slide.number if slide else None,
             shape=shape.name if shape else None,
+            shape_id=shape.shape_id if shape else None,
             expected=expected,
             found=found,
             suggestion=suggestion,

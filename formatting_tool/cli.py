@@ -30,6 +30,7 @@ from . import __version__
 from .ai.client import AIConfig, DEFAULT_EFFORT, DEFAULT_MODEL
 from .ai.gemini import AIValidationError
 from .ai.payload import DEFAULT_BATCH_SIZE
+from .apply import ApplyError, apply_fixes, fixable, fixer_for, why_not_fixable
 from .classify import fit_slide, layout_coverage, missing_kinds
 from .brandbook import (
     BrandBookError,
@@ -44,7 +45,14 @@ from .models import SEVERITY_RANK, Severity, ValidationReport, enum_safe
 from .pipeline import RunConfig, run
 from .rebuild import RebuildError, RebuildResult, rebuild
 from .rebuild.matcher import structure_score
-from .report import summarize_report, write_json, write_markdown, write_text
+from .report import (
+    ReportError,
+    load_report,
+    summarize_report,
+    write_json,
+    write_markdown,
+    write_text,
+)
 from .rules import build_default_rules, build_master_rules, describe_rules
 
 log = logging.getLogger("formatting_tool")
@@ -67,6 +75,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return _cmd_validate(args)
         if args.command == "classify":
             return _cmd_classify(args)
+        if args.command == "apply":
+            return _cmd_apply(args)
         if args.command == "rebuild":
             return _cmd_rebuild(args)
         if args.command == "profile":
@@ -82,6 +92,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         GuidelinesError,
         BrandBookError,
         RebuildError,
+        ApplyError,
+        ReportError,
         AIValidationError,
     ) as exc:
         log.error("%s", exc)
@@ -126,6 +138,8 @@ def _cmd_validate(args: argparse.Namespace) -> int:
         payload_dir=args.payload_dir,
         batch_size=args.batch_size,
         min_confidence=args.min_confidence,
+        render=args.render,
+        ai_debug=args.ai_debug,
         ai=AIConfig(model=args.model, effort=args.effort),
     )
 
@@ -222,6 +236,83 @@ def _report_extraction(result, inference, out: Optional[Path]) -> None:
             f"--deck DECK.pptx --guidelines {out}",
             file=sys.stderr,
         )
+
+
+def _cmd_apply(args: argparse.Namespace) -> int:
+    """Apply the findings a designer ticked, and optionally the master layouts."""
+    report = load_report(args.report)
+
+    if args.list:
+        _print_fix_menu(report)
+        return 0
+
+    if not args.fix and not args.all and args.master is None:
+        raise ApplyError(
+            "nothing to do: pass --fix ID (repeatable) to apply chosen "
+            "findings, --all for every mechanical fix, or --master to rebuild "
+            "onto the master layouts. Run with --list to see the ids."
+        )
+
+    selected = None if args.all else list(args.fix or [])
+    result = apply_fixes(
+        deck=args.deck,
+        issues=report.issues,
+        out=args.out,
+        selected=selected,
+        master=args.master,
+        tuning=load_guidelines(args.guidelines).tuning,
+    )
+    _report_apply(result)
+    return 1 if result.skipped and args.strict else 0
+
+
+def _print_fix_menu(report: ValidationReport) -> None:
+    """The tick list: what can be applied, and what cannot, with reasons."""
+    can = fixable(report.issues)
+    cannot = [i for i in report.issues if fixer_for(i) is None]
+
+    print(f"{len(can)} of {len(report.issues)} finding(s) can be applied\n")
+    if can:
+        width = max(len(i.rule_id or "") for i in can)
+        for issue in can:
+            where = f"slide {issue.slide}" if issue.slide else "deck"
+            print(
+                f"  {issue.id}  {issue.rule_id or '':<{width}}  {where:>8}  "
+                f"{issue.shape or '-'}"
+            )
+    if cannot:
+        print(f"\n{len(cannot)} need a designer:")
+        seen: set[str] = set()
+        for issue in cannot:
+            key = issue.rule_id or issue.category.value
+            if key in seen:
+                continue
+            seen.add(key)
+            print(f"  {key}: {why_not_fixable(issue)}")
+
+    print(
+        "\nApply them with:\n"
+        "  python -m formatting_tool apply --deck DECK.pptx --report REPORT.json "
+        "--out FIXED.pptx --fix ID --fix ID"
+    )
+
+
+def _report_apply(result) -> None:
+    out = sys.stderr
+    print(f"{result.deck} -> {result.output}", file=out)
+    print(
+        f"  {len(result.applied)} fix(es) applied, {len(result.skipped)} skipped",
+        file=out,
+    )
+    for outcome in result.applied:
+        print(f"    {outcome}", file=out)
+    if result.skipped:
+        print("\n  Skipped:", file=out)
+        for outcome in result.skipped:
+            print(f"    {outcome}", file=out)
+    if result.rebuilt is not None:
+        print("", file=out)
+        _report_rebuild(result.rebuilt)
 
 
 def _cmd_classify(args: argparse.Namespace) -> int:
@@ -429,6 +520,7 @@ def _cmd_ui(args: argparse.Namespace) -> int:
         host=args.host,
         root=args.root,
         open_browser=not args.no_browser,
+        reload=args.reload,
     )
 
 
@@ -476,6 +568,26 @@ def _build_parser() -> argparse.ArgumentParser:
         "--no-ai", action="store_true", help="deterministic layer only"
     )
     validate.add_argument(
+        "--render",
+        action="store_true",
+        help=(
+            "render each slide and show it to the AI layer, so it can judge "
+            "what only exists once drawn: clipped text, real collisions, "
+            "contrast over an image. Needs PowerPoint and pywin32 on Windows; "
+            "without them the run continues on geometry alone"
+        ),
+    )
+    validate.add_argument(
+        "--ai-debug",
+        action="store_true",
+        help=(
+            "keep the raw AI exchange on the report, per batch: which slides "
+            "and images went out, how many rule findings went with them, and "
+            "the model's verbatim JSON back. The only way to tell a model that "
+            "missed something from a payload that never described it"
+        ),
+    )
+    validate.add_argument(
         "--ai-dry-run",
         action="store_true",
         help="build the AI payload and report its size without calling the API",
@@ -513,6 +625,55 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=[s.value for s in Severity] + ["never"],
         default="never",
         help="exit 1 when a finding at this severity or above is present",
+    )
+
+    apply_cmd = sub.add_parser(
+        "apply",
+        help="apply the findings a designer ticked, and the master layouts",
+        description=(
+            "Make exactly the changes that were asked for. Findings are chosen "
+            "by the id the report gives them, so a designer ticks a list and "
+            "the tool applies that list and nothing else. With --master the "
+            "corrected deck is then rebuilt onto the master's layouts. The "
+            "input deck is never modified."
+        ),
+    )
+    _add_shared(apply_cmd)
+    apply_cmd.add_argument(
+        "--deck", type=Path, required=True, help="the deck the report was run against"
+    )
+    apply_cmd.add_argument(
+        "--report", type=Path, required=True, help="the JSON report from validate"
+    )
+    apply_cmd.add_argument("--out", type=Path, help="where to write the corrected deck")
+    apply_cmd.add_argument(
+        "--fix",
+        action="append",
+        metavar="ID",
+        help="apply this finding; repeat for each one the designer ticked",
+    )
+    apply_cmd.add_argument(
+        "--all",
+        action="store_true",
+        help="apply every finding that has a fixer, without picking",
+    )
+    apply_cmd.add_argument(
+        "--master",
+        type=Path,
+        help="also rebuild the corrected deck onto this master's layouts",
+    )
+    apply_cmd.add_argument(
+        "--guidelines",
+        type=Path,
+        help="brand guidelines .yaml or .json; only its tuning block is read",
+    )
+    apply_cmd.add_argument(
+        "--list",
+        action="store_true",
+        help="show the ids that can be applied, and what needs a designer",
+    )
+    apply_cmd.add_argument(
+        "--strict", action="store_true", help="exit 1 when a fix was skipped"
     )
 
     classify_cmd = sub.add_parser(
@@ -640,6 +801,15 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     ui.add_argument(
         "--no-browser", action="store_true", help="do not open a browser window"
+    )
+    ui.add_argument(
+        "--reload",
+        action="store_true",
+        help=(
+            "restart the server when a source file changes. Without it a "
+            "server started before an edit keeps serving the old code, "
+            "silently, for as long as it runs"
+        ),
     )
 
     return parser

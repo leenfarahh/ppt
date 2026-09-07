@@ -28,6 +28,7 @@ from ..models import (
 )
 
 _DRAWINGML_NS = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+_P_NS = "{http://schemas.openxmlformats.org/presentationml/2006/main}"
 
 # Placeholder types that map onto a brand text role. python-pptx reports these
 # as PP_PLACEHOLDER members, rendered as "SUBTITLE (4)"; the lookup is on the
@@ -102,7 +103,85 @@ def _read_slide(slide: Any, number: int) -> SlideProfile:
     return profile
 
 
-def _read_shape(shape: Any) -> ShapeProfile:
+class _Frame:
+    """The transform from a shape's own coordinates into slide coordinates.
+
+    A shape inside a group does not store where it sits on the slide. It stores
+    where it sits in the group's *child* space, an arbitrary coordinate system
+    the group declares with chOff and chExt, which the group then maps onto the
+    slide through its own off and ext. Read `shape.left` on a grouped shape and
+    you get a number in that private system: on one real deck a badge whose
+    slide position is 8.06in reports 7.63in, and its neighbour in the same group
+    reports a width of 1.09in while occupying 0.64in.
+
+    Left uncomposed, every geometric rule that descends into a group is
+    comparing inches from two different coordinate systems, which is how a
+    misplaced element inside a group stays invisible to a checker that is
+    otherwise measuring correctly.
+
+    The identity frame is the slide itself, so a top-level shape is unaffected.
+    """
+
+    __slots__ = ("dx", "dy", "sx", "sy")
+
+    def __init__(self, dx: float = 0.0, dy: float = 0.0, sx: float = 1.0, sy: float = 1.0):
+        self.dx, self.dy, self.sx, self.sy = dx, dy, sx, sy
+
+    def apply(self, left: float, top: float, width: float, height: float):
+        return (
+            self.dx + left * self.sx,
+            self.dy + top * self.sy,
+            width * self.sx,
+            height * self.sy,
+        )
+
+    def descend(self, group: Any) -> "_Frame":
+        """The frame for the children of `group`, expressed in slide space."""
+        xfrm = _group_xfrm(group)
+        if xfrm is None:
+            return self
+        off, ext = xfrm.find(_DRAWINGML_NS + "off"), xfrm.find(_DRAWINGML_NS + "ext")
+        child_off = xfrm.find(_DRAWINGML_NS + "chOff")
+        child_ext = xfrm.find(_DRAWINGML_NS + "chExt")
+        if off is None or ext is None or child_off is None or child_ext is None:
+            return self
+        try:
+            cx, cy = int(child_ext.get("cx")), int(child_ext.get("cy"))
+            # A zero child extent is a degenerate group. Scaling by it would
+            # divide by zero; leaving the frame alone keeps the child's own
+            # numbers, which is no worse than before.
+            sx = self.sx * (int(ext.get("cx")) / cx) if cx else self.sx
+            sy = self.sy * (int(ext.get("cy")) / cy) if cy else self.sy
+            gx = self.dx + int(off.get("x")) * self.sx
+            gy = self.dy + int(off.get("y")) * self.sy
+            return _Frame(
+                gx - int(child_off.get("x")) * sx,
+                gy - int(child_off.get("y")) * sy,
+                sx,
+                sy,
+            )
+        except (TypeError, ValueError):
+            return self
+
+
+def _group_xfrm(group: Any) -> Any:
+    """The group's *own* transform, off its grpSpPr.
+
+    Searched one level down rather than with `.//xfrm`, which is a document
+    order descendant search and would happily return the first child shape's
+    transform for any group whose grpSpPr carries none.
+    """
+    element = _safe(lambda: group._element)
+    if element is None:
+        return None
+    for child in element:
+        if str(child.tag).endswith("}grpSpPr") or str(child.tag) == "grpSpPr":
+            return child.find(_DRAWINGML_NS + "xfrm")
+    return None
+
+
+def _read_shape(shape: Any, frame: Optional[_Frame] = None) -> ShapeProfile:
+    frame = frame or _Frame()
     shape_type = str(_safe(lambda: shape.shape_type) or "UNKNOWN")
     placeholder_type = None
     placeholder_idx = None
@@ -114,13 +193,7 @@ def _read_shape(shape: Any) -> ShapeProfile:
         shape_id=_safe(lambda: shape.shape_id) or -1,
         name=_safe(lambda: shape.name) or "",
         shape_type=shape_type,
-        geometry=Geometry(
-            left_in=_inches(_safe(lambda: shape.left)),
-            top_in=_inches(_safe(lambda: shape.top)),
-            width_in=_inches(_safe(lambda: shape.width)),
-            height_in=_inches(_safe(lambda: shape.height)),
-            rotation=float(_safe(lambda: shape.rotation) or 0.0),
-        ),
+        geometry=_geometry(shape, frame),
         placeholder_type=placeholder_type,
         placeholder_idx=placeholder_idx if placeholder_idx is None else int(placeholder_idx),
         role=_role_for(placeholder_type, _safe(lambda: shape.name) or ""),
@@ -128,6 +201,7 @@ def _read_shape(shape: Any) -> ShapeProfile:
         line_hex=_line_hex(shape),
         is_picture="PICTURE" in shape_type,
         is_group="GROUP" in shape_type,
+        alt_text=_alt_text(shape),
     )
 
     if profile.is_picture:
@@ -142,10 +216,46 @@ def _read_shape(shape: Any) -> ShapeProfile:
             profile.paragraphs.append(_read_paragraph(paragraph))
 
     if profile.is_group:
+        inner = frame.descend(shape)
         for child in _safe(lambda: list(shape.shapes)) or []:
-            profile.children.append(_read_shape(child))
+            profile.children.append(_read_shape(child, inner))
 
     return profile
+
+
+def _alt_text(shape: Any) -> str:
+    """cNvPr/@descr, "" when the shape carries none.
+
+    Read off the element rather than through python-pptx, which exposes this
+    only on pictures (`shape._element` is the same object either way, and every
+    shape kind carries a cNvPr). Searched from the shape root because the tag
+    sits under nvSpPr, nvPicPr, nvGrpSpPr or nvGraphicFramePr depending on what
+    the shape is, and the first match in document order is the shape's own.
+    """
+    element = _safe(lambda: shape._element)
+    if element is None:
+        return ""
+    cNvPr = element.find(".//" + _P_NS + "cNvPr")
+    if cNvPr is None:
+        return ""
+    return cNvPr.get("descr") or ""
+
+
+def _geometry(shape: Any, frame: _Frame) -> Geometry:
+    """The shape's box in slide inches, whatever frame it was authored in."""
+    left, top, width, height = frame.apply(
+        float(_safe(lambda: shape.left) or 0),
+        float(_safe(lambda: shape.top) or 0),
+        float(_safe(lambda: shape.width) or 0),
+        float(_safe(lambda: shape.height) or 0),
+    )
+    return Geometry(
+        left_in=_inches(left),
+        top_in=_inches(top),
+        width_in=_inches(width),
+        height_in=_inches(height),
+        rotation=float(_safe(lambda: shape.rotation) or 0.0),
+    )
 
 
 def _read_paragraph(paragraph: Any) -> ParagraphProfile:

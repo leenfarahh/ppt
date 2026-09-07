@@ -22,6 +22,7 @@ import re
 from typing import Any, Callable, Optional
 
 from ..models import Issue
+from ..rules.space import DECLARED_GRID
 
 log = logging.getLogger(__name__)
 
@@ -110,15 +111,35 @@ def fix_off_canvas(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[str]
 def fix_alignment_grid(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[str]:
     """Snap the left edge to the grid line the finding names.
 
-    Deliberately not registered. `space.alignment_grid` finds the edge the most
-    shapes on a slide share, but a real slide has several columns, and the
-    busiest one is not necessarily the one a given shape belongs to. On a real
-    deck this snapped a section label 0.20in away from the table it captioned
-    and onto a grid line borrowed from the other half of the slide.
+    Registered, after a spell disabled. `space.alignment_grid` used to find
+    the edge the most shapes on a slide share, and the busiest one is not
+    necessarily the one a given shape belongs to: on a real deck this snapped
+    a section label 0.20in away from the table it captioned and onto a grid
+    line borrowed from the other half of the slide.
 
-    Kept because the detection is sound and the move is right whenever the
-    column is known. It is the "which column" question that needs a person.
+    Two things answer that now. The grid can come from the master rather than
+    from the deck being audited, so the candidate lines are a handful the
+    designer drew instead of every habit four shapes share. And the applier
+    refuses a move that ends an alignment the shape already had, which is
+    exactly what the label-and-table failure was: no new overlap, a broken
+    relationship. See `applier._aligned`.
+
+    Neither makes "which column" certain, so this refuses to act on an
+    INFERRED grid at all, and the move is bounded by the near-miss window the
+    rule reports in: at most four position tolerances, 0.20in by default.
+
+    The refusal is not caution for its own sake. Run against an inferred grid
+    on a real deck, this snapped a 5.48in section header 0.20in onto a line
+    whose entire support was five 1.67in pentagon labels elsewhere on the
+    slide -- the original failure, reproduced. A line four shapes happen to
+    share is not a column; a line the master draws is.
     """
+    if DECLARED_GRID not in (issue.message or ""):
+        raise LeaveAlone(
+            "the grid line here is inferred from this deck's own habits, not "
+            "declared by the master, and which column a shape belongs to is "
+            "a design call. Mark the master's presentation space to enable this"
+        )
     target = _inches(issue.expected)
     if target is None or shape.left is None:
         return None
@@ -293,6 +314,7 @@ def fix_theme_font_drift(shape: Any, issue: Issue, ctx: "FixContext") -> Optiona
 Fixer = Callable[[Any, Issue, "FixContext"], Optional[str]]
 
 FIXERS: dict[str, Fixer] = {
+    "space.alignment_grid": fix_alignment_grid,
     "space.off_canvas": fix_off_canvas,
     "space.safe_margin": fix_safe_margin,
     "space.repeat_out_of_line": fix_repeat_out_of_line,
@@ -327,10 +349,6 @@ def fix_order(issue: Issue) -> int:
 # `apply --list` can say "needs a designer, because ..." rather than leaving a
 # finding unexplained, which reads like an oversight.
 NEEDS_A_PERSON: dict[str, str] = {
-    "space.alignment_grid": (
-        "a slide carries several legitimate columns and the rule snaps to the "
-        "busiest one; which column a shape belongs to is a design call"
-    ),
     "space.overlap": "names two boxes and cannot know which one should move",
     "logo.missing": "needs the approved logo file, which the tool does not have",
     "logo.unapproved_asset": "needs the approved logo file to swap in",

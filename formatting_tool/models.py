@@ -230,6 +230,24 @@ class ParagraphProfile:
     runs: list[RunProfile] = field(default_factory=list)
 
 
+# The alt text that marks a shape as the presentation space: the area a layout
+# offers for content. Matched on the whole string, casefolded, so a shape
+# described "PS logo lockup" is not mistaken for a frame.
+#
+# Deliberately not "pres_space", which is what some existing masters carry.
+# The convention being asked of designers is "PS", and a reader that quietly
+# accepted both would leave nobody able to tell which masters had been updated.
+# A master still on the old mark reads as having no presentation space, and
+# falls back to the frame derived from its placeholders.
+PRESENTATION_SPACE_ALT = "ps"
+
+# Placeholders that sit in the margin on purpose, so they never widen the
+# usable frame. Shared with extract.master_spec, which derives the deck-wide
+# frame from the same tokens: two copies would let the per-layout frame and the
+# deck-wide one disagree about whether a footer counts as content.
+MARGIN_CHROME = frozenset({"FOOTER", "SLIDE_NUMBER", "DATE"})
+
+
 @dataclass
 class ShapeProfile:
     shape_id: int
@@ -248,11 +266,19 @@ class ShapeProfile:
     image_sha1: Optional[str] = None    # identifies a logo asset across decks
     autofit: Optional[str] = None
     word_wrap: Optional[bool] = None
+    # cNvPr/@descr. Carried because a designer can put a machine-readable mark
+    # in it, and one convention depends on that: a rectangle described "PS"
+    # marks out the presentation space (see PRESENTATION_SPACE_ALT).
+    alt_text: str = ""
     children: list["ShapeProfile"] = field(default_factory=list)
 
     @property
     def placeholder_token(self) -> Optional[str]:
         return placeholder_token(self.placeholder_type)
+
+    @property
+    def is_presentation_space(self) -> bool:
+        return self.alt_text.strip().casefold() == PRESENTATION_SPACE_ALT
 
 
 @dataclass
@@ -282,6 +308,71 @@ class LayoutProfile:
     @property
     def placeholders(self) -> list[ShapeProfile]:
         return [s for s in self.shapes if s.placeholder_type]
+
+    @property
+    def presentation_space(self) -> list[ShapeProfile]:
+        """The shapes this layout marks "PS": where content may go.
+
+        A layout can carry several. Two columns are drawn as two rectangles,
+        which is the point of reading them per layout rather than deck-wide:
+        a two-column layout genuinely offers a different area than a
+        full-width one, and one frame for the whole master cannot say so.
+        """
+        return [s for s in walk_shapes(self.shapes) if s.is_presentation_space]
+
+    @property
+    def declared_left_edges(self) -> list[float]:
+        """Every left edge this layout offers content to start at.
+
+        Both kinds of declaration count: a PS rectangle and a content
+        placeholder are each the master saying "content goes here", and a
+        two-column layout states three of them (its outer edge and one per
+        column). One number per side cannot hold that, which is why the
+        margin frame and this are separate readings of the same shapes.
+
+        Chrome is excluded for the same reason it is excluded from the frame:
+        a page number's left edge is furniture, not a column.
+        """
+        boxes = [s.geometry for s in self.presentation_space]
+        boxes += [
+            s.geometry
+            for s in self.placeholders
+            if s.placeholder_token not in MARGIN_CHROME
+        ]
+        return sorted({round(b.left_in, 3) for b in boxes})
+
+    def content_frame(self) -> Optional[Geometry]:
+        """The area this layout offers, as one box, or None if it says nothing.
+
+        The union of the PS rectangles *and* the layout's own content
+        placeholders, which is not the same as the PS union alone. Every real
+        master drawn so far puts PS around the body area only, leaving the
+        title band outside it: on one, PS runs from 2.00in down while the title
+        sits at 0.40in. Taking PS by itself would put every title outside the
+        frame it was placed by, so the placeholders are unioned in and PS does
+        what it is for -- widening the frame past them, which is also what
+        those masters do, PS reaching 0.59in where the placeholders stop at
+        0.92in.
+
+        Chrome is left out: a footer or page number lives in the margin by
+        design, so including it would open the frame to the slide edge.
+        """
+        boxes = [s.geometry for s in self.presentation_space]
+        if not boxes:
+            return None
+        boxes += [
+            s.geometry
+            for s in self.placeholders
+            if s.placeholder_token not in MARGIN_CHROME
+        ]
+        left = min(b.left_in for b in boxes)
+        top = min(b.top_in for b in boxes)
+        return Geometry(
+            left_in=round(left, 4),
+            top_in=round(top, 4),
+            width_in=round(max(b.right_in for b in boxes) - left, 4),
+            height_in=round(max(b.bottom_in for b in boxes) - top, 4),
+        )
 
 
 @dataclass
@@ -374,6 +465,10 @@ class RuleTuning:
     min_overlap_in2: float = 0.02
     # Shapes that must share a left edge before it counts as a grid line.
     grid_support: int = 4
+    # Fraction of a set that has to agree before the agreement reads as the
+    # intent and the rest as departures from it. Below this there is no
+    # majority, only a scatter, and a scatter has no odd one out.
+    majority_fraction: float = 0.6
     # Multiple of position tolerance within which a miss is drift rather than
     # deliberate placement. Beyond it, the shape was put there on purpose.
     near_miss_factor: float = 4.0
@@ -399,6 +494,29 @@ class RuleTuning:
     # How far a member of a series can sit from the shared edge and still be
     # drift rather than a deliberate placement somewhere else.
     repeat_max_drift_in: float = 0.75
+    # A satellite is a repeated shape that travels with a partner: a number on
+    # a badge, an icon in a card, a tick beside a bullet. Its offset from that
+    # partner should be the same on every copy, and these govern that check.
+    #
+    # How far apart two offsets can be and still count as the same placement.
+    satellite_cluster_in: float = 0.05
+    # Centres this close are the same place, not two places. Decks stack a
+    # filled shape and its glyph in one box, and counting both makes a set of
+    # five icons look like ten.
+    satellite_colocated_in: float = 0.01
+    # Pairs that have to share an offset before it reads as the intended one.
+    # A mirrored layout has two such groups and both are legitimate, so this
+    # is a floor on each rather than a majority of the whole.
+    #
+    # It sets the size of the smallest set worth looking at, too: a cohort plus
+    # one member departing from it, so one above this. That is deliberately not
+    # a second knob, because two knobs can be set to contradict each other and
+    # the smaller would then be dead.
+    satellite_cohort_min: int = 3
+    # How far a satellite may sit from its partner, in multiples of the
+    # partner's diagonal. Keeps pairing local: two repeated things at opposite
+    # ends of a slide are not a component.
+    satellite_reach: float = 2.5
 
 
 @dataclass
@@ -482,6 +600,16 @@ class MasterSpec:
     # frame. Without this the safe-margin check needed a brand file and so
     # never ran on a master-only run, which is most runs.
     safe_margins: Margins = field(default_factory=Margins)
+    # The left edges the master declares content may start at, deduped within
+    # the position tolerance. Empty when no layout marks its presentation
+    # space, and the alignment check then falls back to inferring a grid from
+    # the deck it is auditing, which is what it always did.
+    #
+    # Separate from safe_margins because they answer different questions off
+    # the same shapes. "Is this inside the usable area" needs one number per
+    # side. "Is this on the grid" needs all of them: a two-column layout has
+    # three legitimate left edges and a frame can only report the outermost.
+    grid_edges_in: list[float] = field(default_factory=list)
 
     @property
     def tolerances(self) -> Tolerances:

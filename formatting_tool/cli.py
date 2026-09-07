@@ -261,6 +261,7 @@ def _cmd_apply(args: argparse.Namespace) -> int:
         selected=selected,
         master=args.master,
         tuning=load_guidelines(args.guidelines).tuning,
+        tolerances=load_guidelines(args.guidelines).tolerances,
     )
     _report_apply(result)
     return 1 if result.skipped and args.strict else 0

@@ -9,9 +9,15 @@ the deck follows.
 from __future__ import annotations
 
 from collections import Counter
-from typing import Iterable
+from typing import Iterable, Optional
 
-from ..models import Category, Geometry, Issue, Severity, TextRole
+from ..models import Category, Geometry, Issue, Margins, Severity, SlideProfile, TextRole
+
+# How a grid finding says its lines came from the master rather than from
+# the deck under audit. A constant because the fixer keys on it: only a
+# declared grid is safe to snap to, and a phrase drifting on one side of
+# that would silently disable or silently enable the fix.
+DECLARED_GRID = "the master declares"
 from .base import Rule, RuleContext
 
 
@@ -71,9 +77,13 @@ class SafeMarginRule(Rule):
         # The spec's margins, not the brand file's: authored where stated, read
         # off the master's layouts where not. Requiring a brand file meant this
         # never ran on a master-only run, which is most of them.
-        margins = ctx.spec.safe_margins
+        deck_wide = ctx.spec.safe_margins
         width, height = ctx.deck.width_in, ctx.deck.height_in
         tolerance = ctx.spec.tolerances.position_in
+
+        # Resolved once per layout, not once per shape: the lookup walks every
+        # shape in the layout, and a 200-slide deck asks thousands of times.
+        frames: dict[Optional[str], Optional[Margins]] = {}
 
         for slide, shape in ctx.shapes():
             # Only text is judged against the safe margin; a background panel
@@ -86,6 +96,18 @@ class SafeMarginRule(Rule):
             # furniture to it would report every slide in every deck.
             if shape.role is TextRole.FOOTER:
                 continue
+            # Per slide, against the layout it is on. A two-column layout
+            # offers a different area than a full-width one, and one frame for
+            # the whole master cannot say so: it has to take the roomiest edge
+            # any layout offers, which is the loosest of them everywhere.
+            #
+            # Only where the layout marks its presentation space, though. A
+            # layout that marks none falls back to the deck-wide frame rather
+            # than to its own placeholders, which would be a much stricter
+            # reading than the one this rule has always applied.
+            if slide.layout_name not in frames:
+                frames[slide.layout_name] = self._frame_for(ctx, slide)
+            margins = frames[slide.layout_name] or deck_wide
             box = shape.geometry
             # The same exemption by geometry, for furniture that carries no
             # footer role: a date line or a navigation tab sitting *entirely*
@@ -127,6 +149,35 @@ class SafeMarginRule(Rule):
                     expected=_margin_summary(margins),
                     found="; ".join(breaches),
                 )
+
+    def _frame_for(self, ctx: RuleContext, slide: SlideProfile) -> Optional[Margins]:
+        """The presentation space of this slide's layout, as margins.
+
+        None when the layout is unknown to the master or marks no presentation
+        space, which is the caller's signal to use the deck-wide frame.
+
+        An authored edge still wins. The brand file is a statement of intent
+        and a PS rectangle is a drawing; where they disagree the guidelines are
+        the ones somebody signed off on.
+        """
+        layout = ctx.spec.layout_named(slide.layout_name)
+        if layout is None:
+            return None
+        frame = layout.content_frame()
+        if frame is None:
+            return None
+        stated = ctx.guidelines.safe_margins
+        width, height = ctx.deck.width_in, ctx.deck.height_in
+        return Margins(
+            left_in=stated.left_in if stated.left_in is not None
+            else round(frame.left_in, 2),
+            top_in=stated.top_in if stated.top_in is not None
+            else round(frame.top_in, 2),
+            right_in=stated.right_in if stated.right_in is not None
+            else round(width - frame.right_in, 2),
+            bottom_in=stated.bottom_in if stated.bottom_in is not None
+            else round(height - frame.bottom_in, 2),
+        )
 
 
 class OverlapRule(Rule):
@@ -172,18 +223,12 @@ class AlignmentGridRule(Rule):
 
     def check(self, ctx: RuleContext) -> Iterable[Issue]:
         tolerance = ctx.spec.tolerances.position_in
-        # A left edge shared by this many shapes is an intended grid line.
-        support = ctx.tuning.grid_support
 
-        lefts = Counter(
-            round(shape.geometry.left_in, 2)
-            for _slide, shape in ctx.shapes()
-            if shape.text.strip()
-        )
-        grid = [edge for edge, count in lefts.items() if count >= support]
+        grid, source = self._grid(ctx)
         if not grid:
             return
 
+        misses: dict[tuple, list] = {}
         for slide, shape in ctx.shapes():
             if not shape.text.strip():
                 continue
@@ -192,14 +237,84 @@ class AlignmentGridRule(Rule):
             drift = abs(nearest - left)
             # Only near-misses: a shape deliberately placed elsewhere is not a
             # defect, a shape 0.06in off a grid line is.
-            if tolerance < drift <= tolerance * ctx.tuning.near_miss_factor:
+            if not tolerance < drift <= tolerance * ctx.tuning.near_miss_factor:
+                continue
+            # Keyed on the line missed and the position missed from, bucketed
+            # by tolerance so 0.48 and 0.49 are one position rather than two.
+            misses.setdefault((nearest, round(left / tolerance)), []).append(
+                (slide, shape, left, drift)
+            )
+
+        for (nearest, _bucket), members in sorted(misses.items()):
+            # A near-miss the whole deck makes is not a near-miss. It is the
+            # deck using a column of its own, which is one fact about the deck
+            # rather than a defect per shape: measuring a real deck against a
+            # marked-up master turned a single 0.11in difference into
+            # thirty-two identical findings, and a report nobody reads to the
+            # end is the same as no report.
+            #
+            # Reported all the same, because it is worth knowing and the old
+            # inferred grid hid it completely: taking the deck's own 0.48in as
+            # the grid line made every shape on it correct by definition.
+            if len(members) >= ctx.tuning.grid_support:
+                slides = sorted({slide.number for slide, _s, _l, _d in members})
+                left = members[0][2]
+                drift = members[0][3]
+                where = (
+                    f"slide {slides[0]}" if len(slides) == 1
+                    else f"{len(slides)} slides"
+                )
                 yield self.issue(
-                    f"Left edge is {drift:.2f}in off the {nearest:.2f}in grid line.",
+                    f"{len(members)} shapes on {where} sit at "
+                    f"{left:.2f}in, {drift:.2f}in off the {nearest:.2f}in grid "
+                    f"line {source}. The deck is using a column of its own, "
+                    f"not missing this one by accident.",
+                    expected=f"{nearest:.2f}in",
+                    found=f"{left:.2f}in on slides {_runs(slides)}",
+                )
+                continue
+            for slide, shape, left, drift in members:
+                yield self.issue(
+                    f"Left edge is {drift:.2f}in off the {nearest:.2f}in "
+                    f"grid line {source}.",
                     slide=slide,
                     shape=shape,
+                    # Bare inches, because the (unregistered) grid fixer parses
+                    # this back as its target.
                     expected=f"{nearest:.2f}in",
                     found=f"{left:.2f}in",
                 )
+
+    @staticmethod
+    def _grid(ctx: RuleContext) -> tuple[list[float], str]:
+        """The edges to measure against, and where they came from.
+
+        The master's own declarations when it has any. Inference is what this
+        rule did before and still does for an unmarked master, but it takes
+        the audited deck's word for what the grid is: on one real deck it
+        derived eight grid lines, not one of which the master declares, and
+        blessed 0.48in and 0.49in as two separate intentions. A deck that
+        consistently sits off the master's column has that position certified
+        as its own grid and reports nothing.
+
+        Which source is in play changes what a finding means, so it is said in
+        the message rather than left for the reader to assume.
+        """
+        declared = ctx.spec.grid_edges_in
+        if declared:
+            return list(declared), DECLARED_GRID
+
+        # A left edge shared by this many shapes is an intended grid line.
+        support = ctx.tuning.grid_support
+        lefts = Counter(
+            round(shape.geometry.left_in, 2)
+            for _slide, shape in ctx.shapes()
+            if shape.text.strip()
+        )
+        return (
+            [edge for edge, count in lefts.items() if count >= support],
+            "the rest of the deck follows",
+        )
 
 
 class TextOverflowRule(Rule):
@@ -237,6 +352,26 @@ def _outside_the_band(box: Geometry, margins, width: float, height: float) -> bo
     if margins.right_in is not None and box.left_in >= width - margins.right_in:
         return True
     return False
+
+
+def _runs(numbers: list[int]) -> str:
+    """[1,2,3,7,9,10] -> "1-3, 7, 9-10".
+
+    A deck-wide finding names every slide it covers, and thirty slide numbers
+    in a row is not a list a designer reads.
+    """
+    if not numbers:
+        return ""
+    parts: list[str] = []
+    start = previous = numbers[0]
+    for number in numbers[1:] + [None]:
+        if number is not None and number == previous + 1:
+            previous = number
+            continue
+        parts.append(str(start) if start == previous else f"{start}-{previous}")
+        if number is not None:
+            start = previous = number
+    return ", ".join(parts)
 
 
 def _margin_summary(margins) -> str:

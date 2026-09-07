@@ -15,7 +15,18 @@ from ..models import (
     enum_safe,
 )
 
-DEFAULT_BATCH_SIZE = 10
+# One slide per call. Ten slides in one request is cheaper per slide and the
+# reference block caches across calls either way, but the model's attention has
+# to cover every shape on every slide in the batch, and what it misses first is
+# the small stuff: the badge 0.2in out of line, the caption a point adrift. A
+# single slide per call is the same total payload split so that each part gets
+# read properly.
+#
+# The cost is that no call can see two slides at once, so a cross-slide pattern
+# is invisible to this layer. It always partly was, which is why the reviewer
+# instructions have never let the model report a deck-level pattern from one
+# batch; the deterministic rules read the whole deck and carry those findings.
+DEFAULT_BATCH_SIZE = 1
 
 
 # cached half: guidelines and expected values
@@ -31,7 +42,13 @@ def build_reference_block(spec: MasterSpec) -> str:
         "arabic_fonts": guidelines.arabic_fonts,
         "roles": enum_safe({k: v for k, v in spec.roles.items()}),
         "logo": enum_safe(guidelines.logo),
-        "safe_margins_in": enum_safe(guidelines.safe_margins),
+        # The spec's frame, not the brand file's subset of it. These are the
+        # numbers the deterministic layer measures against -- authored where
+        # stated, read off the master's presentation space or its placeholders
+        # where not -- and on a master-only run, which is most runs, the brand
+        # file's own margins are empty. The model was being told there was no
+        # frame while the rules were checking against one.
+        "safe_margins_in": enum_safe(spec.safe_margins),
         "typography": enum_safe(guidelines.typography),
         "tolerances": enum_safe(guidelines.tolerances),
         "master_observed_sizes_pt": spec.observed_sizes_pt,

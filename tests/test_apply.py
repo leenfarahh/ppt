@@ -21,6 +21,7 @@ from formatting_tool.apply import (
     why_not_fixable,
 )
 from formatting_tool.apply.fixers import fix_order  # noqa: F401
+from formatting_tool.rules.space import DECLARED_GRID
 from formatting_tool.models import Category, Issue, Severity, Source
 from formatting_tool.report.reader import load_report
 
@@ -445,11 +446,176 @@ def test_a_move_that_buries_a_neighbour_is_reverted(tmp_path: Path) -> None:
     assert kept["TextBox 28"] == Inches(11.25)
 
 
-def test_grid_snapping_is_not_applied_automatically() -> None:
-    """A slide has several legitimate columns and the rule snaps to the busiest.
+def test_grid_snapping_is_available() -> None:
+    """Registered, after a spell disabled: a slide carries several legitimate
+    columns and snapping to the wrong one damaged a real deck. What changed is
+    that the grid can now come from the master rather than from the deck being
+    audited, and that the applier refuses a move which ends an alignment the
+    shape already had. See the two tests below."""
+    assert fixer_for(_issue("space.alignment_grid")) is not None
 
-    On a real deck that pulled a section label 0.20in off the table it
-    captioned. The detection stays; the move needs a person.
+
+def test_snapping_that_would_break_an_alignment_is_refused(tmp_path: Path) -> None:
+    """The exact failure that got this fixer disabled.
+
+    A section label sharing its left edge with the table it captions, and a
+    grid line 0.15in to the left of both. Snapping the label alone satisfies
+    the rule and pulls the label off the table, which is the defect a client
+    sees. No overlap changes, so the older guard could not catch it.
     """
-    assert fixer_for(_issue("space.alignment_grid")) is None
-    assert "design call" in why_not_fixable(_issue("space.alignment_grid"))
+    pytest.importorskip("pptx")
+    from pptx import Presentation
+    from pptx.util import Inches
+
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    table = slide.shapes.add_textbox(Inches(3.0), Inches(2.0), Inches(4.0), Inches(2.0))
+    table.name = "Table"
+    label = slide.shapes.add_textbox(Inches(3.0), Inches(4.2), Inches(2.0), Inches(0.4))
+    label.name = "Section label"
+    deck = tmp_path / "messy.pptx"
+    prs.save(str(deck))
+
+    issue = _issue(
+        "space.alignment_grid",
+        message=f"off the 2.85in grid line {DECLARED_GRID}.",
+        slide=1,
+        shape="Section label",
+        shape_id=label.shape_id,
+        expected="2.85in",
+        found="3.00in",
+    )
+    out = tmp_path / "fixed.pptx"
+
+    result = apply_fixes(deck, [issue], out)
+
+    assert result.applied == []
+    assert "break its alignment" in result.skipped[0].detail
+    kept = {s.name: s.left for s in Presentation(str(out)).slides[0].shapes}
+    assert kept["Section label"] == Inches(3.0)
+
+
+def test_a_shape_with_nothing_to_break_is_snapped(tmp_path: Path) -> None:
+    """The other side of that guard, so it cannot refuse everything."""
+    pytest.importorskip("pptx")
+    from pptx import Presentation
+    from pptx.util import Inches
+
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    stray = slide.shapes.add_textbox(Inches(3.0), Inches(4.2), Inches(2.0), Inches(0.4))
+    stray.name = "Stray"
+    deck = tmp_path / "messy.pptx"
+    prs.save(str(deck))
+
+    issue = _issue(
+        "space.alignment_grid",
+        message=f"off the 2.85in grid line {DECLARED_GRID}.",
+        slide=1,
+        shape="Stray",
+        shape_id=stray.shape_id,
+        expected="2.85in",
+        found="3.00in",
+    )
+    out = tmp_path / "fixed.pptx"
+
+    result = apply_fixes(deck, [issue], out)
+
+    assert len(result.applied) == 1
+    kept = {s.name: s.left for s in Presentation(str(out)).slides[0].shapes}
+    assert kept["Stray"] == Inches(2.85)
+
+
+def test_alignment_with_a_shape_the_report_also_faults_is_not_protected(
+    tmp_path: Path,
+) -> None:
+    """Two shapes wrong the same way are not a relationship worth keeping.
+
+    Both boxes sit off the canvas at the same left edge. Protecting that
+    alignment would refuse to bring either back, which is how this guard first
+    broke the off-canvas fixer.
+    """
+    pytest.importorskip("pptx")
+    from pptx import Presentation
+    from pptx.util import Inches
+
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    a = slide.shapes.add_textbox(Inches(-1), Inches(1), Inches(2), Inches(1))
+    a.name = "Stray A"
+    b = slide.shapes.add_textbox(Inches(-1), Inches(3), Inches(2), Inches(1))
+    b.name = "Stray B"
+    deck = tmp_path / "messy.pptx"
+    prs.save(str(deck))
+
+    issues = [
+        _issue("space.off_canvas", slide=1, shape="Stray A", shape_id=a.shape_id),
+        _issue("space.off_canvas", slide=1, shape="Stray B", shape_id=b.shape_id),
+    ]
+    out = tmp_path / "fixed.pptx"
+
+    result = apply_fixes(deck, issues, out, selected=[issues[0].id])
+
+    assert len(result.applied) == 1
+    kept = {s.name: s.left for s in Presentation(str(out)).slides[0].shapes}
+    assert kept["Stray A"] == 0
+
+
+def test_snapping_to_an_inferred_grid_is_refused(tmp_path: Path) -> None:
+    """The failure that got this fixer disabled, reproduced and then declined.
+
+    Run against a grid inferred from the deck's own habits, this snapped a
+    5.48in section header 0.20in onto a line whose entire support was five
+    1.67in pentagon labels elsewhere on the slide. A line four shapes happen
+    to share is not a column, so an inferred grid is not acted on at all.
+    """
+    pytest.importorskip("pptx")
+    from pptx import Presentation
+    from pptx.util import Inches
+
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    header = slide.shapes.add_textbox(Inches(7.46), Inches(1.0), Inches(5.48), Inches(0.4))
+    header.name = "Section header"
+    deck = tmp_path / "messy.pptx"
+    prs.save(str(deck))
+
+    issue = _issue(
+        "space.alignment_grid",
+        message="off the 7.66in grid line the rest of the deck follows.",
+        slide=1,
+        shape="Section header",
+        shape_id=header.shape_id,
+        expected="7.66in",
+        found="7.46in",
+    )
+    out = tmp_path / "fixed.pptx"
+
+    result = apply_fixes(deck, [issue], out)
+
+    assert result.applied == []
+    assert "inferred from this deck" in result.skipped[0].detail
+    kept = {s.name: s.left for s in Presentation(str(out)).slides[0].shapes}
+    assert kept["Section header"] == Inches(7.46)
+
+
+def test_a_deck_level_finding_says_so_rather_than_blaming_the_deck(
+    tmp_path: Path,
+) -> None:
+    """The systematic grid finding names no shape, because it is about the
+    deck. The missing-shape path would have said the deck had changed."""
+    pytest.importorskip("pptx")
+    from pptx import Presentation
+
+    prs = Presentation()
+    prs.slides.add_slide(prs.slide_layouts[6])
+    deck = tmp_path / "messy.pptx"
+    prs.save(str(deck))
+
+    issue = _issue("space.alignment_grid", expected="0.92in", found="0.48in")
+    out = tmp_path / "fixed.pptx"
+
+    result = apply_fixes(deck, [issue], out)
+
+    assert result.applied == []
+    assert "the deck as a whole" in result.skipped[0].detail

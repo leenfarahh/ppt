@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
-from ..models import Issue, RuleTuning
+from ..models import Issue, RuleTuning, Tolerances
 from .fixers import GEOMETRIC, LeaveAlone, fix_order, fixer_for, why_not_fixable
 
 log = logging.getLogger(__name__)
@@ -46,6 +46,11 @@ class FixContext:
 
     width_emu: int
     height_emu: int
+    # How close two edges have to be to read as deliberately aligned. The same
+    # number the rules measure with, so a fix cannot break a relationship the
+    # rules would have called aligned, and defaulted off the model rather than
+    # restated as a literal here.
+    align_tolerance_in: float = Tolerances().position_in
 
 
 @dataclass
@@ -89,6 +94,7 @@ def apply_fixes(
     selected: Optional[Iterable[str]] = None,
     master: Optional[str | Path] = None,
     tuning: Optional[RuleTuning] = None,
+    tolerances: Optional[Tolerances] = None,
 ) -> ApplyResult:
     """Apply the selected findings to `deck` and write the result to `out`.
 
@@ -113,13 +119,23 @@ def apply_fixes(
     context = FixContext(
         width_emu=presentation.slide_width,
         height_emu=presentation.slide_height,
+        align_tolerance_in=(tolerances or Tolerances()).position_in,
     )
     result = ApplyResult(deck=deck.name, output=out)
+
+    # Shapes the report already faults geometrically. An alignment with one of
+    # these is not a relationship worth protecting: it is two shapes wrong the
+    # same way, and often the neighbour is being moved in this very run.
+    in_breach = {
+        (issue.slide, issue.shape_id)
+        for issue in issues
+        if (issue.rule_id or "") in GEOMETRIC and issue.shape_id is not None
+    }
 
     # Stable sort, so findings of equal priority stay in report order and a
     # run is reproducible.
     for issue in sorted(wanted, key=fix_order):
-        result_line = _apply_one(issue, presentation, context)
+        result_line = _apply_one(issue, presentation, context, in_breach)
         (result.applied if result_line.applied else result.skipped).append(result_line)
 
     try:
@@ -144,10 +160,26 @@ def apply_fixes(
 # One finding
 # --------------------------------------------------------------------------- #
 
-def _apply_one(issue: Issue, presentation: Any, context: FixContext) -> FixOutcome:
+def _apply_one(
+    issue: Issue,
+    presentation: Any,
+    context: FixContext,
+    in_breach: Optional[set] = None,
+) -> FixOutcome:
     fixer = fixer_for(issue)
     if fixer is None:
         return FixOutcome(issue, False, f"needs a designer: {why_not_fixable(issue)}")
+
+    if not issue.slide or not issue.shape:
+        # A deck-level finding names no single shape because it is not about
+        # one: "thirty-six shapes sit on a column of their own" is a fact
+        # about the deck. Saying so beats the missing-shape message below,
+        # which would blame the deck for having changed.
+        return FixOutcome(
+            issue,
+            False,
+            "needs a designer: this describes the deck as a whole, not one shape",
+        )
 
     shape = _find_shape(presentation, issue)
     if shape is None:
@@ -162,6 +194,20 @@ def _apply_one(issue: Issue, presentation: Any, context: FixContext) -> FixOutco
     before = (shape.left, shape.top) if geometric else None
     neighbours = _neighbours(presentation, issue, shape) if geometric else []
     covered_before = _covered(shape, neighbours) if geometric else {}
+    partners = (
+        [
+            other
+            for other in neighbours
+            if (issue.slide, getattr(other, "shape_id", None)) not in (in_breach or set())
+        ]
+        if geometric
+        else []
+    )
+    aligned_before = (
+        _aligned(shape, partners, context.align_tolerance_in)
+        if geometric
+        else set()
+    )
 
     try:
         detail = fixer(shape, issue, context)
@@ -177,6 +223,29 @@ def _apply_one(issue: Issue, presentation: Any, context: FixContext) -> FixOutco
         return FixOutcome(issue, False, "already correct, nothing to change")
 
     if geometric:
+        # Alignment the shape already had, and would lose by moving.
+        #
+        # This is the guard that let `space.alignment_grid` be registered at
+        # all. Its recorded failure was a section label snapped 0.20in onto a
+        # grid line from the other half of the slide, away from the table it
+        # captioned. Nothing about that move increases overlap, so the check
+        # below could not see it; what it breaks is an alignment the label
+        # already had with the table, and that is readable.
+        #
+        # It is also the hazard `space.satellite_offset` reports, so without
+        # this an accepted fix could manufacture a finding for the next run.
+        broken = aligned_before - _aligned(
+            shape, partners, context.align_tolerance_in
+        )
+        if broken:
+            shape.left, shape.top = before
+            names = ", ".join(sorted(broken)[:3])
+            return FixOutcome(
+                issue,
+                False,
+                f"left alone: moving it would break its alignment with {names}",
+            )
+
         worse = _worsened(covered_before, _covered(shape, neighbours))
         if worse:
             # A slide is a composition. Satisfying a rule by pushing a shape
@@ -225,6 +294,43 @@ def _neighbours(presentation: Any, issue: Issue, shape: Any) -> list[Any]:
         return []
     own = {id(s) for s in _walk([shape])}
     return [s for s in slides[issue.slide - 1].shapes if id(s) not in own]
+
+
+EMU_PER_INCH = 914400
+
+
+def _aligned(shape: Any, neighbours: list[Any], tolerance_in: float) -> set[str]:
+    """Neighbours this shape currently shares an edge with, by name and edge.
+
+    Left, right and centre horizontally, top and bottom vertically. A caption
+    under a table shares the table's left edge; a label beside a chart shares
+    its top. Either is a relationship a designer made, and a move that ends it
+    is a move that broke the slide even when nothing overlaps.
+    """
+    box = _box(shape)
+    if box is None:
+        return set()
+    left, top, right, bottom = box
+    mine = {
+        "left": left, "right": right, "top": top, "bottom": bottom,
+        "centre-x": (left + right) // 2, "centre-y": (top + bottom) // 2,
+    }
+    slack = int(tolerance_in * EMU_PER_INCH)
+    out: set[str] = set()
+    for other in neighbours:
+        theirs = _box(other)
+        if theirs is None:
+            continue
+        o_left, o_top, o_right, o_bottom = theirs
+        edges = {
+            "left": o_left, "right": o_right, "top": o_top, "bottom": o_bottom,
+            "centre-x": (o_left + o_right) // 2,
+            "centre-y": (o_top + o_bottom) // 2,
+        }
+        for edge, value in edges.items():
+            if abs(mine[edge] - value) <= slack:
+                out.add(f"{_name_of(other)} ({edge})")
+    return out
 
 
 def _covered(shape: Any, neighbours: list[Any]) -> dict[str, int]:

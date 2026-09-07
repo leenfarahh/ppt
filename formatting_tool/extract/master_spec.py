@@ -15,6 +15,7 @@ from typing import Optional
 
 from ..models import (
     BrandGuidelines,
+    MARGIN_CHROME,
     Margins,
     DeckProfile,
     Geometry,
@@ -46,6 +47,7 @@ def derive_master_spec(
         theme_fonts=dict(master.theme_fonts),
         theme_colors=dict(master.theme_colors),
         safe_margins=_safe_margins(master, guidelines),
+        grid_edges_in=_grid_edges(master, guidelines.tolerances.position_in),
     )
     return spec
 
@@ -128,7 +130,9 @@ def _roles(
 # Placeholders that frame a slide rather than hold its content. A footer sits
 # at the very bottom edge by design, and letting it set the bottom margin
 # would put the frame outside anything a body of copy could breach.
-_CHROME = frozenset({"FOOTER", "SLIDE_NUMBER", "DATE"})
+# Shared with models.LayoutProfile.content_frame, which reads the same
+# tokens for the per-layout frame.
+_CHROME = MARGIN_CHROME
 
 
 def _safe_margins(master: DeckProfile, guidelines: BrandGuidelines) -> Margins:
@@ -154,13 +158,28 @@ def _safe_margins(master: DeckProfile, guidelines: BrandGuidelines) -> Margins:
 
 
 def _layout_frame(master: DeckProfile) -> Margins:
+    """The deck-wide frame: the roomiest edge any layout offers.
+
+    Where a layout marks its presentation space, that is the frame it
+    contributes, because a designer drawing a PS rectangle has stated the
+    answer this function otherwise has to infer. Where none does, its content
+    placeholders stand in as before.
+
+    This value is the fallback for slides whose own layout says nothing, and
+    what the AI payload is told. The per-slide check prefers the slide's own
+    layout; see `space.SafeMarginRule`.
+    """
     edges: dict[str, list[float]] = {"top": [], "right": [], "bottom": [], "left": []}
     for layout in master.layouts:
-        boxes = [
-            shape.geometry
-            for shape in layout.placeholders
-            if shape.placeholder_token not in _CHROME
-        ]
+        frame = layout.content_frame()
+        if frame is not None:
+            boxes = [frame]
+        else:
+            boxes = [
+                shape.geometry
+                for shape in layout.placeholders
+                if shape.placeholder_token not in _CHROME
+            ]
         if not boxes:
             continue
         edges["left"].append(min(b.left_in for b in boxes))
@@ -178,6 +197,46 @@ def _layout_frame(master: DeckProfile) -> Margins:
         bottom_in=edge("bottom"),
         left_in=edge("left"),
     )
+
+
+def _grid_edges(master: DeckProfile, tolerance: float) -> list[float]:
+    """The left edges the master declares, across all its layouts.
+
+    Only once some layout marks its presentation space. Every master has
+    placeholders and could therefore supply edges this way, but reading them
+    unasked would change the alignment check on every deck at once; a master
+    carrying PS is one somebody has deliberately marked up, and that is the
+    signal to trust its own declarations over the audited deck's habits.
+
+    Once trusted, both kinds count -- see LayoutProfile.declared_left_edges --
+    including on layouts that mark no PS themselves.
+    """
+    if not any(layout.presentation_space for layout in master.layouts):
+        return []
+    edges: list[float] = []
+    for layout in master.layouts:
+        edges.extend(layout.declared_left_edges)
+    return _collapse(edges, tolerance)
+
+
+def _collapse(values: list[float], tolerance: float) -> list[float]:
+    """Sorted values with near-duplicates merged to their mean.
+
+    A layout drawn by hand states 0.917 and 0.918 for the same column, and two
+    layouts state the same edge twice over. Left alone those are two grid lines
+    a thousandth of an inch apart, which is how the inferred grid ends up
+    blessing both 0.48 and 0.49 as intentional on a real deck.
+    """
+    out: list[float] = []
+    cluster: list[float] = []
+    for value in sorted(values):
+        if cluster and value - cluster[0] > tolerance:
+            out.append(round(sum(cluster) / len(cluster), 2))
+            cluster = []
+        cluster.append(value)
+    if cluster:
+        out.append(round(sum(cluster) / len(cluster), 2))
+    return out
 
 
 # --------------------------------------------------------------------------- #

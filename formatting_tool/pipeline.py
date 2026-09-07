@@ -115,12 +115,22 @@ def run(config: RunConfig) -> ValidationReport:
         RuleContext(deck=master, spec=spec), build_default_rules()
     )
     if report.skipped_rules:
+        # Named from the rules that actually opted out, not from a list kept
+        # by hand. The hand-kept one said safe margins were among them, which
+        # stopped being true when the frame started coming off the master's
+        # own layouts, and the report then warned that a finding could not
+        # appear directly above that finding.
+        categories = sorted({
+            rule.category.value.replace("_", " ")
+            for rule in build_default_rules()
+            if rule.id in {s.rule_id for s in report.skipped_rules}
+        })
         log.warning(
             "%d check(s) will not run: no brand guidelines were supplied. "
-            "Colour, typeface, type-scale and safe-margin findings cannot "
-            "appear in this report. Run extract-guidelines --from %s to "
-            "produce one.",
+            "No %s findings can appear in this report. Run "
+            "extract-guidelines --from %s to produce one.",
             len(report.skipped_rules),
+            ", ".join(categories) or "brand",
             master.name,
         )
 

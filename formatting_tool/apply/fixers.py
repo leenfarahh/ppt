@@ -61,6 +61,10 @@ _INCHES = re.compile(r"(-?\d+(?:\.\d+)?)\s*in")
 _EDGE = re.compile(r"\b(left|top)\s+(-?\d+(?:\.\d+)?)\s*in")
 _MARGIN = re.compile(r"\b(top|right|bottom|left)\s+(-?\d+(?:\.\d+)?)\s*in")
 _QUOTED_FONT = re.compile(r"explicit\s+(.+?)\s*$")
+# "theme:accent1 #C00000" -> C00000, and "#DADADA" -> DADADA. Six hex digits
+# anchored on the hash, so a delta-E or a shape name in the same sentence
+# cannot be mistaken for a colour.
+_HEX = re.compile(r"#([0-9A-Fa-f]{6})(?![0-9A-Fa-f])")
 
 
 # --------------------------------------------------------------------------- #
@@ -221,6 +225,72 @@ def fix_safe_margin(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[str
 
 
 # --------------------------------------------------------------------------- #
+# Colour
+# --------------------------------------------------------------------------- #
+#
+# Both of these snap to the nearest palette entry, which the finding already
+# names: the rule measured the distance in CIEDE2000 to decide the colour was
+# off-palette at all, so the nearest entry is a number it has in hand rather
+# than a guess made here.
+#
+# What they do NOT do is pick between two entries a colour sits between. The
+# rule reports only the nearest, and "nearest" is the whole claim; where the
+# brand meaning matters more than the distance -- an accent that should have
+# been the other accent -- the recolour is wrong in a way no palette maths can
+# see. That is why the finding stays on the report after the fix lands, so a
+# designer sees which colours were moved and where to.
+
+
+def fix_off_palette_text(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[str]:
+    """Recolour the runs that carry the off-palette colour, and only those.
+
+    Matched on the colour the finding measured, not on every run in the shape:
+    a shape routinely holds one run in the brand navy and one somebody typed
+    over in black, and the finding is about the second.
+    """
+    target = _hex_of(issue.expected)
+    current = _hex_of(issue.found)
+    if not target or not current or not _has_text(shape):
+        return None
+
+    from pptx.dml.color import RGBColor  # noqa: PLC0415 - lazy heavy dependency
+
+    changed = 0
+    for paragraph in shape.text_frame.paragraphs:
+        for run in paragraph.runs:
+            if _run_hex(run) != current:
+                continue
+            run.font.color.rgb = RGBColor.from_string(target)
+            changed += 1
+    if not changed:
+        return None
+    return (
+        f"recoloured {changed} run(s) from #{current} to the nearest palette "
+        f"entry #{target}"
+    )
+
+
+def fix_off_palette_shape(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[str]:
+    """Recolour a shape's fill or its outline, whichever the finding named."""
+    target = _hex_of(issue.expected)
+    if not target:
+        return None
+    wants_outline = "outline" in (issue.message or "").lower()
+
+    from pptx.dml.color import RGBColor  # noqa: PLC0415 - lazy heavy dependency
+
+    colour = RGBColor.from_string(target)
+    if wants_outline:
+        shape.line.color.rgb = colour
+        return f"recoloured the outline to the nearest palette entry #{target}"
+    # solid() first: a shape whose fill is inherited or themed has no fore
+    # colour to set until it has been made a solid fill of its own.
+    shape.fill.solid()
+    shape.fill.fore_color.rgb = colour
+    return f"recoloured the fill to the nearest palette entry #{target}"
+
+
+# --------------------------------------------------------------------------- #
 # Text
 # --------------------------------------------------------------------------- #
 
@@ -315,6 +385,8 @@ Fixer = Callable[[Any, Issue, "FixContext"], Optional[str]]
 
 FIXERS: dict[str, Fixer] = {
     "space.alignment_grid": fix_alignment_grid,
+    "color.text.off_palette": fix_off_palette_text,
+    "color.shape.off_palette": fix_off_palette_shape,
     "space.off_canvas": fix_off_canvas,
     "space.safe_margin": fix_safe_margin,
     "space.repeat_out_of_line": fix_repeat_out_of_line,
@@ -360,8 +432,6 @@ NEEDS_A_PERSON: dict[str, str] = {
     "layout.not_in_master": "use `rebuild`, which recreates the slide on the layout",
     "layout.header_footer_missing": "the master has to be edited, not the deck",
     "layout.band_missing": "the master has to be edited, not the deck",
-    "color.text.off_palette": "which palette entry was meant is a design call",
-    "color.shape.off_palette": "which palette entry was meant is a design call",
     "color.inconsistent_use": "which of the colours in play is correct is a design call",
     "font.family.unapproved": "which approved face replaces it is a design call",
     "font.family.mixed_in_shape": "which of the faces in play is correct is a design call",
@@ -431,6 +501,29 @@ def _margins(expected: Optional[str]) -> dict[str, float]:
     if not expected:
         return {}
     return {side: float(value) for side, value in _MARGIN.findall(expected)}
+
+
+def _hex_of(text: Optional[str]) -> Optional[str]:
+    """The six hex digits in a finding's expected/found, upper case."""
+    if not text:
+        return None
+    found = _HEX.search(text)
+    return found.group(1).upper() if found else None
+
+
+def _run_hex(run: Any) -> Optional[str]:
+    """A run's own colour as six hex digits, or None when it inherits one.
+
+    None for a theme-bound colour too: it is correct by construction, and the
+    rule does not report those.
+    """
+    try:
+        colour = run.font.color
+        if colour is None or colour.type is None or colour.rgb is None:
+            return None
+        return str(colour.rgb).upper()
+    except Exception:
+        return None
 
 
 def _font_name(found: Optional[str]) -> Optional[str]:

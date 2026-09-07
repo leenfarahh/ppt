@@ -6,6 +6,9 @@
     read decks -> derive the master spec        (extract/)
         |
         v
+    apply the master's layouts (optional)       (rebuild/)
+        |  which layout each slide belongs on is read off its render
+        v
     deterministic validation layer              (rules/)
         |  inconsistencies in sizing, fonts, colours, ...
         v
@@ -20,12 +23,20 @@
 Each stage is a function taking and returning dataclasses, so any stage can be
 run, tested, or replaced on its own. The AI layer is optional: with --no-ai the
 pipeline stops after the deterministic layer and still produces a report.
+
+Applying the master comes FIRST when it is asked for, and everything after it
+measures the restyled deck. That ordering is the point of it: putting content
+into the master's placeholders resolves a great many findings by itself and
+raises a few of its own, so a report made before it describes a deck nobody
+will send. It also has to be first because findings name shapes by id, and
+PowerPoint's placeholder matching renames and replaces them.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -71,6 +82,20 @@ class RunConfig:
     render: bool = False        # attach rendered slides to the AI layer
     ai_debug: bool = False      # keep the raw AI exchange on the report
     ai: AIConfig = field(default_factory=AIConfig)
+    # Put every slide on the master's layouts BEFORE anything is measured, and
+    # measure the restyled deck.
+    #
+    # This is the order that makes the findings actionable. Applying the master
+    # is what moves content into the master's placeholders, so it resolves a
+    # great many geometry findings on its own and creates a few of its own
+    # (content that now overlaps, a colour that now sits off the new theme's
+    # palette). Measuring first and applying afterwards produces a report about
+    # a deck that no longer exists: the findings name shapes by id, and
+    # PowerPoint's placeholder matching renames and replaces them.
+    apply_master: bool = False
+    # Where the restyled deck goes. None keeps it in a temporary directory,
+    # which is right for a validate-only run: the report is the output.
+    master_out: Optional[Path] = None
 
 
 def run(config: RunConfig) -> ValidationReport:
@@ -139,6 +164,11 @@ def run(config: RunConfig) -> ValidationReport:
         _warn_on_size_mismatch(deck, spec)
         _warn_on_foreign_theme(deck, spec)
 
+        if config.apply_master:
+            deck, applied = _apply_master_first(deck, deck_path, spec, config)
+            if applied is not None:
+                report.master_applied.append(applied)
+
         rule_issues = _run_rule_layer(deck, spec)
         log.info("%s: %d rule finding(s)", deck.name, len(rule_issues))
 
@@ -181,6 +211,81 @@ def run(config: RunConfig) -> ValidationReport:
 # --------------------------------------------------------------------------- #
 # Stages
 # --------------------------------------------------------------------------- #
+
+def _apply_master_first(
+    deck: DeckProfile,
+    deck_path: Path,
+    spec: MasterSpec,
+    config: RunConfig,
+) -> tuple[DeckProfile, Optional[dict]]:
+    """Restyle the deck onto the master, then re-read it.
+
+    Everything after this measures the restyled deck, which is the one the
+    designer will send. Returns the deck to carry on with -- the original when
+    the restyle could not run, so a host without PowerPoint still gets a report
+    rather than an error.
+    """
+    from .rebuild import rebuild  # noqa: PLC0415 - avoids a circular import
+
+    out = config.master_out or (
+        Path(tempfile.mkdtemp(prefix="formatting-tool-master-")) / deck_path.name
+    )
+
+    # What the model reads off the picture, before anything is changed. Only
+    # what a layout should be; the review of the restyled deck comes later.
+    seen = _layout_picks(deck, spec, config)
+
+    try:
+        result = rebuild(config.master, deck_path, out, tuning=spec.guidelines.tuning,
+                         seen=seen)
+    except Exception as exc:
+        log.error(
+            "could not put %s on %s's layouts (%s); measuring the deck as it "
+            "arrived instead", deck.name, spec.source, exc,
+        )
+        return deck, None
+
+    log.info(
+        "%s: restyled onto %s by %s, now measuring the result",
+        deck.name, spec.source, result.applied_by,
+    )
+    return read_deck(out), {
+        "deck": deck.name,
+        "output": str(out),
+        "applied_by": result.applied_by,
+        "layouts_used": result.layouts_used,
+        "unmatched": [record.number for record in result.unmatched],
+        "dropped": [str(shape) for shape in result.dropped],
+        "stragglers": result.stragglers,
+        "masters": result.masters,
+    }
+
+
+def _layout_picks(deck: DeckProfile, spec: MasterSpec, config: RunConfig):
+    """The model's reading of which layout each slide belongs on, or nothing.
+
+    Skipped without the AI layer or without a renderer, and the structural
+    matcher decides alone, which is what it did before this existed.
+    """
+    if not config.use_ai or config.ai_dry_run:
+        return []
+    images = _render(deck, config)
+    if not images:
+        log.info("no layout pass: %s", images.reason)
+        return []
+    try:
+        from .ai.layout import choose_layouts  # noqa: PLC0415 - lazy
+
+        return choose_layouts(
+            spec,
+            sorted(images.images.items()),
+            model=config.ai.model,
+            thinking_budget=config.ai.thinking_budget,
+            api_key_env=config.ai.api_key_env,
+        )
+    finally:
+        images.cleanup()
+
 
 def _run_rule_layer(
     deck: DeckProfile,

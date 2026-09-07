@@ -5,7 +5,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from ..models import Issue, MasterSpec
+from ..models import Issue, LayoutChoice, MasterSpec
 from .gemini import (
     AIValidationError,
     finish_reason as _finish_reason,
@@ -15,7 +15,12 @@ from .gemini import (
     generate_json,
 )
 from .payload import build_reference_block, payload_to_text
-from .schema import AI_RESPONSE_SCHEMA, issues_from_response, to_gemini_schema
+from .schema import (
+    AI_RESPONSE_SCHEMA,
+    issues_from_response,
+    layout_choices_from_response,
+    to_gemini_schema,
+)
 
 __all__ = [
     "AIConfig",
@@ -98,6 +103,24 @@ Rules of engagement:
   glance, not a defect.
 - You see one batch of slides at a time. Do not report a deck-level pattern you
   can only see part of; report what this batch shows.
+
+Choosing a layout, in `layout_choices`, one entry per slide you were given a
+picture of:
+
+- Pick the layout from `master_layouts` that the slide belongs on. Judge by
+  what the slide IS and how its content is arranged: a cover, a section
+  divider, a table of contents, one column of copy, two columns, a comparison,
+  a full-bleed image, a chart. Match that against the regions each layout
+  offers.
+- Copy the name exactly. A name that is not on the list is discarded, so the
+  slide keeps whatever the deterministic matcher chose.
+- This is why you were given the picture. The deterministic matcher counts
+  content regions from the slide's own text boxes, and a messy slide has many
+  loose ones, so it reads a table of contents as a four-region comparison. You
+  can see that it is a list.
+- Set a low confidence when the master offers nothing that fits, and say so in
+  `why`. That is a fact about the master worth having; a confident guess is
+  not.
 """
 
 
@@ -122,6 +145,10 @@ class AIConfig:
 class AIResult:
     issues: list[Issue] = field(default_factory=list)
     summaries: list[str] = field(default_factory=list)
+    # Which master layout each slide belongs on, read off its rendered image.
+    # Not findings, so not in `issues`: an input to applying the master rather
+    # than something a designer ticks.
+    layout_choices: list[LayoutChoice] = field(default_factory=list)
     # What each batch actually sent and got back. The AI layer is the part of
     # this tool you cannot read the source of to find out why it said
     # something, so the exchange is kept rather than discarded.
@@ -139,6 +166,7 @@ class AIResult:
     def merge(self, other: "AIResult") -> None:
         self.issues.extend(other.issues)
         self.summaries.extend(other.summaries)
+        self.layout_choices.extend(other.layout_choices)
         self.exchanges.extend(other.exchanges)
         self.calls += other.calls
         self.input_tokens += other.input_tokens
@@ -229,11 +257,17 @@ class AIValidator:
         self, data: dict[str, Any], response: Any, deck_name: str
     ) -> AIResult:
         issues, summary = issues_from_response(data, deck_name)
+        # Validated against the master's real layout names here, where the
+        # spec is in reach. A pick naming a layout that does not exist is
+        # dropped, and the slide keeps whatever the deterministic matcher
+        # chose.
+        picks = layout_choices_from_response(data, set(self.spec.layout_names))
         usage = getattr(response, "usage_metadata", None)
         cached = _count(usage, "cached_content_token_count")
         return AIResult(
             issues=issues,
             summaries=[summary] if summary else [],
+            layout_choices=picks,
             calls=1,
             # prompt_token_count already includes the cached prefix, so it
             # comes back out here to keep the two fields disjoint.

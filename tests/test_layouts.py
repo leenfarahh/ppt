@@ -365,14 +365,20 @@ def test_rebuild_resets_placeholder_geometry(tmp_path: Path) -> None:
 
 
 def test_rebuild_keeps_emphasis_and_drops_brand_formatting(tmp_path: Path) -> None:
-    """Bold is what the writer meant; 11pt is drift. They are treated apart."""
+    """Bold is what the writer meant; 11pt is drift. They are treated apart.
+
+    route="xml" throughout this group: these assert how the rebuild copies
+    content, and the PowerPoint route does not copy it -- PowerPoint's own
+    placeholder matching does, and it makes its own decisions about emphasis
+    and about which shapes become placeholders.
+    """
     pytest.importorskip("pptx")
     from pptx import Presentation
 
     from formatting_tool.rebuild import rebuild
 
     out = tmp_path / "rebuilt.pptx"
-    rebuild(_sample_master(tmp_path), _messy_deck(tmp_path), out)
+    rebuild(_sample_master(tmp_path), _messy_deck(tmp_path), out, route="xml")
 
     slide = Presentation(str(out)).slides[0]
     title = next(s for s in slide.shapes if s.is_placeholder and s.has_text_frame)
@@ -383,14 +389,20 @@ def test_rebuild_keeps_emphasis_and_drops_brand_formatting(tmp_path: Path) -> No
 
 
 def test_rebuild_drops_the_masters_sample_slides(tmp_path: Path) -> None:
-    """The master is a template here, not content. Its samples must not ship."""
+    """The master is a template here, not content. Its samples must not ship.
+
+    An XML-route concern only. The PowerPoint route opens the DECK and loads
+    the master as a design, so the master's own slides never enter the file and
+    there is nothing to remove.
+    """
     pytest.importorskip("pptx")
     from pptx import Presentation
 
     from formatting_tool.rebuild import rebuild
 
     out = tmp_path / "rebuilt.pptx"
-    result = rebuild(_sample_master(tmp_path), _messy_deck(tmp_path), out)
+    result = rebuild(_sample_master(tmp_path), _messy_deck(tmp_path), out,
+                     route="xml")
 
     assert result.sample_slides_removed == 1
     assert len(Presentation(str(out)).slides._sldIdLst) == 1
@@ -404,7 +416,8 @@ def test_rebuild_transplants_loose_shapes(tmp_path: Path) -> None:
     from formatting_tool.rebuild import rebuild
 
     out = tmp_path / "rebuilt.pptx"
-    result = rebuild(_sample_master(tmp_path), _messy_deck(tmp_path), out)
+    result = rebuild(_sample_master(tmp_path), _messy_deck(tmp_path), out,
+                     route="xml")
 
     assert result.slides[0].transplanted
     assert not result.dropped

@@ -152,8 +152,20 @@ def test_the_response_schema_cannot_carry_a_dismissal() -> None:
     for something the schema does not allow, so this cannot regress by a
     wording change.
     """
-    assert "dismissed_refs" not in AI_RESPONSE_SCHEMA["properties"]
-    assert AI_RESPONSE_SCHEMA["required"] == ["issues", "summary"]
+    properties = AI_RESPONSE_SCHEMA["properties"]
+    # By shape, not by an exact key list: the response grew a `layout_choices`
+    # field and an exact list would have failed for that, which says nothing
+    # about dismissals. What matters is that no key lets the model take a
+    # finding away.
+    assert not [
+        key for key in properties
+        if any(word in key for word in ("dismiss", "reject", "ignore", "waive"))
+    ]
+    assert {"issues", "summary"} <= set(AI_RESPONSE_SCHEMA["required"])
+    # And that the one field naming refs only ever ADDS agreement.
+    assert "confirms_refs" in AI_RESPONSE_SCHEMA["properties"]["issues"]["items"][
+        "properties"
+    ]
 
 
 def test_merge_keeps_every_rule_finding() -> None:

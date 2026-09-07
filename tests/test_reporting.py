@@ -162,11 +162,15 @@ def test_skipped_rules_name_the_checks_that_cannot_run() -> None:
     skipped = skipped_rules(ctx, build_default_rules())
     ids = {s.rule_id for s in skipped}
 
-    assert "color.text.off_palette" in ids
     assert "font.family.unapproved" in ids
     assert all(s.unlocked_by for s in skipped)
     # A rule that needs no brand file is not listed as skipped.
     assert "space.overlap" not in ids
+    # Nor are the palette checks any more. `spec.palette` is the authored
+    # palette extended with the master's own theme scheme, so a master-only
+    # run has a palette to measure against and these do run there.
+    assert "color.text.off_palette" not in ids
+    assert "color.shape.off_palette" not in ids
 
 
 # --------------------------------------------------------------------------- #

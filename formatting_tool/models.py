@@ -142,6 +142,21 @@ class Issue:
 
 
 @dataclass
+class LayoutChoice:
+    """Which master layout a slide belongs on, as read off its rendered image.
+
+    Separate from Issue because it is not a finding. A finding says something
+    is wrong; this says where the slide should go, and it is an input to
+    applying the master rather than something a designer ticks.
+    """
+
+    slide: int                  # 1-based
+    layout: str                 # a name the master actually has
+    confidence: float = 0.0
+    why: str = ""
+
+
+@dataclass
 class SkippedRule:
     """A check that never ran, and what it was waiting for.
 
@@ -176,6 +191,10 @@ class ValidationReport:
     # Populated on request: it is the only way to tell a model that missed
     # something from a payload that never described it.
     ai_exchanges: list[dict[str, Any]] = field(default_factory=list)
+    # What applying the master did, per deck, when it ran before the checks.
+    # On the report because it changes what every finding is about: these were
+    # measured on the restyled deck, not on the file that was uploaded.
+    master_applied: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return enum_safe(asdict(self))

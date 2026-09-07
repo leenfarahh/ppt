@@ -7,6 +7,7 @@ import json
 from typing import Any, Iterator, Optional, Sequence
 
 from ..models import (
+    MARGIN_CHROME,
     DeckProfile,
     Issue,
     MasterSpec,
@@ -52,10 +53,36 @@ def build_reference_block(spec: MasterSpec) -> str:
         "typography": enum_safe(guidelines.typography),
         "tolerances": enum_safe(guidelines.tolerances),
         "master_observed_sizes_pt": spec.observed_sizes_pt,
-        "master_layouts": spec.layout_names,
+        # Names AND what each offers. A name is not a description, and the
+        # model is being asked to choose between them: "title_comparison" and
+        # "title_two_columns" are indistinguishable from their names alone.
+        "master_layouts": _layout_inventory(spec),
         "notes": guidelines.notes,
     }
     return json.dumps(enum_safe(reference), indent=2, sort_keys=True)
+
+
+def _layout_inventory(spec: MasterSpec) -> list[dict[str, Any]]:
+    """Each layout, and the regions it offers content.
+
+    Chrome is left out: every layout carries a footer and a page number, so
+    listing them tells the model nothing and crowds what does.
+    """
+    out: list[dict[str, Any]] = []
+    for layout in spec.layouts:
+        regions: dict[str, int] = {}
+        for placeholder in layout.placeholders:
+            token = (placeholder.placeholder_token or "BODY").upper()
+            if token in MARGIN_CHROME:
+                continue
+            kind = (
+                "title" if "TITLE" in token
+                else "subtitle" if token == "SUBTITLE"
+                else "content"
+            )
+            regions[kind] = regions.get(kind, 0) + 1
+        out.append({"name": layout.name, "offers": regions})
+    return out
 
 
 # volatile half: rule findings and slides

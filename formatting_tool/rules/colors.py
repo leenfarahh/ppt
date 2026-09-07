@@ -14,7 +14,11 @@ class OffPaletteTextRule(Rule):
     category = Category.COLOR
     description = "Text colour is not in the brand palette."
     default_severity = Severity.ERROR
-    requires_guidelines = True
+    # Not gated on a brand file. `spec.palette` is the authored palette
+    # extended with the master's own theme scheme, so a master-only run -- which
+    # is most runs -- has a palette to measure against: the one the master
+    # declares. Requiring a brand file meant this never ran there, which is the
+    # same stale gate the safe-margin check carried.
 
     def check(self, ctx: RuleContext) -> Iterable[Issue]:
         tolerance = ctx.spec.tolerances.color_delta_e
@@ -48,7 +52,11 @@ class OffPaletteShapeRule(Rule):
     category = Category.COLOR
     description = "Shape fill or outline colour is not in the brand palette."
     default_severity = Severity.ERROR
-    requires_guidelines = True
+    # Not gated on a brand file. `spec.palette` is the authored palette
+    # extended with the master's own theme scheme, so a master-only run -- which
+    # is most runs -- has a palette to measure against: the one the master
+    # declares. Requiring a brand file meant this never ran there, which is the
+    # same stale gate the safe-margin check carried.
 
     def check(self, ctx: RuleContext) -> Iterable[Issue]:
         tolerance = ctx.spec.tolerances.color_delta_e

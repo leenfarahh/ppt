@@ -139,6 +139,8 @@ def _cmd_validate(args: argparse.Namespace) -> int:
         batch_size=args.batch_size,
         min_confidence=args.min_confidence,
         render=args.render,
+        apply_master=args.apply_master,
+        master_out=Path(args.master_out) if args.master_out else None,
         ai_debug=args.ai_debug,
         ai=AIConfig(model=args.model, effort=args.effort),
     )
@@ -567,6 +569,18 @@ def _build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--out", type=Path, help="write to a file instead of stdout")
     validate.add_argument(
         "--no-ai", action="store_true", help="deterministic layer only"
+    )
+    validate.add_argument(
+        "--apply-master",
+        action="store_true",
+        help=(
+            "put every slide on the master's layouts first, then check the "
+            "result; the report then describes the deck you would send"
+        ),
+    )
+    validate.add_argument(
+        "--master-out",
+        help="where to keep the restyled deck (default: a temporary file)",
     )
     validate.add_argument(
         "--render",

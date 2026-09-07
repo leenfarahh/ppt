@@ -27,7 +27,13 @@ from dataclasses import dataclass
 from typing import Optional, Sequence
 
 from ..classify import SlideKind, classify_layout, fit_slide
-from ..models import DeckProfile, LayoutProfile, SlideProfile, normalize_layout_name
+from ..models import (
+    DeckProfile,
+    LayoutChoice,
+    LayoutProfile,
+    SlideProfile,
+    normalize_layout_name,
+)
 
 # Placeholder tokens folded into the families that actually differ from each
 # other. PowerPoint distinguishes OBJECT from BODY from PICTURE, but a layout
@@ -73,8 +79,14 @@ def choose_layout(
     layouts: Sequence[LayoutProfile],
     floor: float,
     deck: Optional[DeckProfile] = None,
+    seen: Optional["LayoutChoice"] = None,
+    seen_floor: float = 0.5,
 ) -> Optional[LayoutMatch]:
-    """Pick the layout for one slide, or None when the master defines none."""
+    """Pick the layout for one slide, or None when the master defines none.
+
+    `seen` is what the AI layer read off the rendered slide, when there was a
+    render and it named a layout the master has.
+    """
     if not layouts:
         return None
     deck = deck or DeckProfile(path="", width_in=13.333, height_in=7.5,
@@ -90,6 +102,33 @@ def choose_layout(
             kind=classify_layout(named).kind,
         )
 
+    # Then what somebody looked at. Below the name match, because two files
+    # agreeing on a layout name is a designer's own statement and outranks any
+    # reading of a picture; above the structural fit below, because that fit is
+    # exactly what the render corrects.
+    #
+    # The structural signal counts content regions from the slide's own text
+    # boxes, and a messy slide is a pile of loose ones -- that is what makes it
+    # messy. On a real deck it read a table of contents as a four-region
+    # comparison and a two-column slide the same way, where the model looking
+    # at the render got both right. Measured on the five slides of that deck:
+    # the model matched or beat the structural pick on four, and the one it
+    # agreed on was the cover.
+    if seen is not None and seen.confidence >= seen_floor:
+        picked = _exactly(seen.layout, layouts)
+        if picked is not None:
+            return LayoutMatch(
+                layout=picked,
+                score=seen.confidence,
+                basis=(
+                    f"read off the rendered slide: {seen.why}"
+                    if seen.why else "read off the rendered slide"
+                ),
+                confident=True,
+                kind=classify_layout(picked).kind,
+                layout_kind=classify_layout(picked).kind,
+            )
+
     # What the slide is for, when that is knowable, beats what it is built
     # from. A photo cover reads structurally as a three-region content slide,
     # and matching it on structure alone puts it on a content layout.
@@ -102,6 +141,19 @@ def choose_layout(
         kind=fit.kind,
         layout_kind=fit.layout_kind,
     )
+
+
+def _exactly(name: str, layouts: Sequence[LayoutProfile]) -> Optional[LayoutProfile]:
+    """The layout with exactly this name.
+
+    Exact, not normalised. The name came back from a model and was already
+    checked against the master's list; being strict here means a pick can only
+    ever land on a layout that exists.
+    """
+    for layout in layouts:
+        if layout.name == name:
+            return layout
+    return None
 
 
 def structure_score(slide: SlideProfile, layout: LayoutProfile) -> float:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from ..models import Category, Issue, Severity, Source
+from ..models import Category, Issue, LayoutChoice, Severity, Source
 
 _CATEGORIES = [c.value for c in Category]
 _SEVERITIES = [s.value for s in Severity]
@@ -72,6 +72,35 @@ AI_ISSUE_SCHEMA: dict[str, Any] = {
 }
 
 
+LAYOUT_CHOICE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "slide": {"type": "integer", "description": "1-based slide number."},
+        "layout": {
+            "type": "string",
+            "description": (
+                "The layout's name, copied exactly from master_layouts in the "
+                "reference block. Never a name that is not on that list."
+            ),
+        },
+        "confidence": {
+            "type": "number",
+            "description": (
+                "0.0-1.0. Low when the master offers nothing that fits, which "
+                "is a fact about the master worth reporting rather than a "
+                "reason to guess."
+            ),
+        },
+        "why": {
+            "type": "string",
+            "description": "One clause: what the slide is, and what it needs.",
+        },
+    },
+    "required": ["slide", "layout", "confidence", "why"],
+    "additionalProperties": False,
+}
+
+
 AI_RESPONSE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -85,8 +114,24 @@ AI_RESPONSE_SCHEMA: dict[str, Any] = {
             "type": "string",
             "description": "Two or three sentences on the state of the deck.",
         },
+        # Which master layout each slide belongs on, read off the rendered
+        # picture. Asked of the model because the deterministic matcher counts
+        # content regions from a messy slide's loose text boxes, and a messy
+        # slide has a lot of them: on a real deck that put a table of contents
+        # and a two-column slide onto a four-region comparison layout, where
+        # the model read both correctly. It is a coarse categorical judgement
+        # about what a slide IS, which is what a render is good for -- unlike
+        # "which of these eleven badges is 0.2in out", which it is not.
+        "layout_choices": {
+            "type": "array",
+            "items": LAYOUT_CHOICE_SCHEMA,
+            "description": (
+                "One entry per slide in this batch that carried a rendered "
+                "image. Omit a slide you were given no picture of."
+            ),
+        },
     },
-    "required": ["issues", "summary"],
+    "required": ["issues", "summary", "layout_choices"],
     "additionalProperties": False,
 }
 
@@ -130,6 +175,34 @@ def to_gemini_schema(schema: dict[str, Any]) -> dict[str, Any]:
     return out
 
 # mapping back onto the shared model
+
+def layout_choices_from_response(
+    payload: dict[str, Any],
+    allowed: set[str],
+) -> list[LayoutChoice]:
+    """The model's layout picks, dropping any that names a layout that does
+    not exist.
+
+    Dropped rather than corrected: a pick the master cannot honour is not a
+    near miss to be snapped to something, it is the model having invented a
+    layout, and acting on it would put the slide somewhere nobody chose.
+    """
+    out: list[LayoutChoice] = []
+    for raw in payload.get("layout_choices") or []:
+        name = str(raw.get("layout") or "").strip()
+        number = raw.get("slide")
+        if not name or not isinstance(number, int) or name not in allowed:
+            continue
+        out.append(
+            LayoutChoice(
+                slide=number,
+                layout=name,
+                confidence=_confidence(raw.get("confidence")) or 0.0,
+                why=str(raw.get("why") or "").strip(),
+            )
+        )
+    return out
+
 
 def issues_from_response(
     payload: dict[str, Any],

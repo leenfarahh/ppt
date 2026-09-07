@@ -54,6 +54,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .. import powerpoint
+from . import pictures
 
 log = logging.getLogger(__name__)
 
@@ -210,6 +211,14 @@ def _drive(app: Any, deck: Path, master: Path, out: Path, plans: dict[int, str])
     working = staging / deck.name
     shutil.copyfile(deck, working)
 
+    # Written onto the working copy before PowerPoint sees it, because a
+    # picture placeholder's frame and its cropped-to shape belong to the
+    # layout it is about to stop pointing at. Doing it to the file rather than
+    # through automation is what makes it work for a `a:custGeom` mask, which
+    # COM cannot describe at all -- see `rebuild.pictures`. A no-op on a deck
+    # with no picture placeholders, which then reaches PowerPoint untouched.
+    pictures.freeze_file(working)
+
     presentation = None
     try:
         presentation = _retry(lambda: app.Presentations.Open(
@@ -294,8 +303,18 @@ def _restyle(presentation: Any, layouts: dict[str, Any], plans: dict[int, str]):
 
 
 # --------------------------------------------------------------------------- #
-# Photographs across the swap
+# Photographs across the swap -- the fallback
 # --------------------------------------------------------------------------- #
+#
+# A BACKSTOP, not the mechanism. `rebuild.pictures.freeze_file` has already
+# written the frame and the geometry onto the working copy by the time
+# PowerPoint opens it, and a frozen photograph is no longer a placeholder, so
+# on a deck python-pptx can read `_photographs` finds nothing and this does
+# nothing. What is left for it is the deck python-pptx cannot open and
+# PowerPoint can, where the freeze logged a warning and gave up. There it
+# recovers the frame in full and the geometry where it is a preset; a
+# `a:custGeom` mask is beyond COM either way, which is why the freeze moved
+# onto the file in the first place.
 #
 # What PowerPoint gets wrong here, from a real deck: a portrait cropped to a
 # circle came out square and hard against the left margin, while the
@@ -340,7 +359,7 @@ def _photographs(slide: Any) -> dict[int, tuple[float, float, float, float, int]
     `Left` and friends need no special handling: COM already answers with the
     effective value, so a placeholder inheriting its frame reports the
     layout's numbers. Geometry does not work that way -- see
-    `_designed_geometry`.
+    `_designed_geometry` and `_designed_for`.
     """
     designed = _designed_geometry(slide)
     found: dict[int, tuple[float, float, float, float, int]] = {}
@@ -350,23 +369,25 @@ def _photographs(slide: Any) -> dict[int, tuple[float, float, float, float, int]
                 continue
             if int(shape.PlaceholderFormat.ContainedType) != _MSO_PICTURE:
                 continue
-            geometry = int(shape.AutoShapeType)
-            if geometry in (_MSO_NOT_PRIMITIVE, _MSO_SHAPE_MIXED):
-                geometry = designed.get(str(shape.Name), _MSO_NOT_PRIMITIVE)
-            found[int(shape.Id)] = (
+            frame = (
                 float(shape.Left), float(shape.Top),
                 float(shape.Width), float(shape.Height),
-                geometry,
             )
+            geometry = int(shape.AutoShapeType)
+            name = str(shape.Name)
+            shape_id = int(shape.Id)
         except Exception:
             # An empty picture placeholder has no ContainedType and raises.
             # There is no photograph in it to preserve.
             continue
+        if geometry in (_MSO_NOT_PRIMITIVE, _MSO_SHAPE_MIXED):
+            geometry = _designed_for(frame, name, designed)
+        found[shape_id] = (*frame, geometry)
     return found
 
 
-def _designed_geometry(slide: Any) -> dict[str, int]:
-    """The preset each picture placeholder on the OLD layout is cropped to.
+def _designed_geometry(slide: Any) -> list[tuple[tuple, str, int]]:
+    """The preset each picture slot on the OLD layout is cropped to.
 
     Measured, because it is not where you would look for it. Asked about the
     slide's own shape COM answers `msoShapeNotPrimitive`, which is correct and
@@ -375,24 +396,69 @@ def _designed_geometry(slide: Any) -> dict[str, int]:
     answers `msoShapeOval`. So the circle has to be read off the layout, while
     the slide is still pointing at it.
 
-    Keyed by shape name, which PowerPoint carries from the layout placeholder
-    onto the slide's copy of it.
+    Returned as (frame, name, preset) per slot. Slots with no preset of their
+    own are left out: they have nothing to tell us.
     """
-    geometry: dict[str, int] = {}
+    slots: list[tuple[tuple, str, int]] = []
     try:
         layout = slide.CustomLayout
     except Exception:
-        return geometry
+        return slots
     for shape in _shapes(layout):
         try:
             if int(shape.PlaceholderFormat.Type) not in _PICTURE_SLOTS:
                 continue
             preset = int(shape.AutoShapeType)
+            frame = (
+                float(shape.Left), float(shape.Top),
+                float(shape.Width), float(shape.Height),
+            )
+            name = str(shape.Name)
         except Exception:
             continue
         if preset not in (_MSO_NOT_PRIMITIVE, _MSO_SHAPE_MIXED):
-            geometry[str(shape.Name)] = preset
-    return geometry
+            slots.append((frame, name, preset))
+    return slots
+
+
+def _designed_for(frame: tuple, name: str, slots: list) -> int:
+    """Which of the old layout's picture slots this photograph inherits from.
+
+    By frame first, and this is the correction that made it work on a real
+    deck. A placeholder inheriting its position reports the layout's own
+    numbers, so the two agree exactly, and that holds however PowerPoint has
+    renamed the shape -- which it does. Dropping a photo into a slot called
+    "Picture Placeholder 3" leaves a shape called "Picture 5", so matching on
+    the name misses in precisely the case this exists for. Matching on the
+    frame was already sitting in data that had to be read anyway.
+
+    Then by name, which separates two slots sitting on top of each other.
+    Then, where the layout has exactly one picture slot, that one: there is
+    nothing else the photograph could be inheriting from.
+    """
+    for slot_frame, _slot_name, preset in slots:
+        if _same_frame(slot_frame, frame):
+            return preset
+    for _slot_frame, slot_name, preset in slots:
+        if slot_name == name:
+            return preset
+    if len(slots) == 1:
+        return slots[0][2]
+    return _MSO_NOT_PRIMITIVE
+
+
+def _same_frame(one: tuple, other: tuple, tolerance: float = 0.5) -> bool:
+    """Equal to within half a point.
+
+    The two numbers come from the same place -- one read through the shape
+    that is inheriting it, one off the slot itself -- so in practice they
+    agree exactly. The tolerance is insurance against a float round trip
+    through COM, and half a point is far below the distance between two
+    genuinely different slots.
+    """
+    return len(one) == len(other) and all(
+        abs(a - b) <= tolerance for a, b in zip(one, other)
+    )
 
 
 def _restore(slide: Any, photographs: dict, keep_frame_from_layout: bool) -> None:

@@ -134,9 +134,59 @@ def test_only_picture_placeholders_are_read_off_the_layout() -> None:
         _Shape(3, "Picture Placeholder 2", geometry=5),
     ])
 
-    assert _designed_geometry(_Container([], layout)) == {
-        "Picture Placeholder 2": 5
-    }
+    assert _designed_geometry(_Container([], layout)) == [
+        (FRAME, "Picture Placeholder 2", 5)
+    ]
+
+
+def test_a_renamed_photograph_still_finds_its_slot() -> None:
+    """The bug that survived the first fix. PowerPoint renames the shape when
+    a photo goes into a picture placeholder, so the slot has to be found by
+    the frame it is handing down, not by the name it no longer shares."""
+    portrait = _Shape(3, "Picture 5")
+    layout_ph = _Shape(9, "Picture Placeholder 3", geometry=_MSO_OVAL)
+
+    snapshot = _photographs(_slide([portrait], [layout_ph]))
+
+    assert snapshot[3][4] == _MSO_OVAL
+
+
+def test_a_renamed_photograph_that_moved_falls_back_to_the_only_slot() -> None:
+    """Neither the name nor the frame matches, which is what a slide overriding
+    its inherited position looks like. One picture slot on the layout leaves
+    nothing else it could have been cropped by."""
+    portrait = _Shape(3, "Picture 5", frame=(10.0, 20.0, 30.0, 40.0))
+    layout_ph = _Shape(9, "Picture Placeholder 3", geometry=_MSO_OVAL)
+
+    snapshot = _photographs(_slide([portrait], [layout_ph]))
+
+    assert snapshot[3][4] == _MSO_OVAL
+
+
+def test_two_slots_and_no_way_to_tell_records_nothing() -> None:
+    """Guessing between them would crop a photo to the wrong shape, which is a
+    worse outcome than leaving it as PowerPoint made it."""
+    portrait = _Shape(3, "Picture 5", frame=(10.0, 20.0, 30.0, 40.0))
+    layout = [
+        _Shape(9, "Picture Placeholder 3", geometry=_MSO_OVAL),
+        _Shape(10, "Picture Placeholder 4", geometry=5, frame=(1.0, 2.0, 3.0, 4.0)),
+    ]
+
+    snapshot = _photographs(_slide([portrait], layout))
+
+    assert snapshot[3][4] == _MSO_NOT_PRIMITIVE
+
+
+def test_the_right_slot_wins_when_two_are_on_offer() -> None:
+    portrait = _Shape(3, "Picture 5", frame=(1.0, 2.0, 3.0, 4.0))
+    layout = [
+        _Shape(9, "Picture Placeholder 3", geometry=_MSO_OVAL),
+        _Shape(10, "Picture Placeholder 4", geometry=5, frame=(1.0, 2.0, 3.0, 4.0)),
+    ]
+
+    snapshot = _photographs(_slide([portrait], layout))
+
+    assert snapshot[3][4] == 5
 
 
 def test_a_slide_whose_layout_cannot_be_read_still_snapshots_the_frame() -> None:

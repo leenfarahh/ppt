@@ -25,12 +25,13 @@ from lxml import etree
 from pptx import Presentation
 from pptx.oxml.ns import qn
 
-from formatting_tool.rebuild.builder import (
+from formatting_tool.rebuild.builder import rebuild
+from formatting_tool.rebuild.pictures import (
     _bake_frame,
     _bake_look,
     _carries_picture,
     _strip_ph,
-    rebuild,
+    freeze_file,
 )
 
 A = "http://schemas.openxmlformats.org/drawingml/2006/main"
@@ -364,3 +365,77 @@ def test_the_title_still_moves_into_the_new_layout(tmp_path: Path) -> None:
     ]
     assert "Team & References" in titles
     assert not result.dropped
+
+
+# --------------------------------------------------------------------------- #
+# The whole file, which is how the PowerPoint route gets it
+# --------------------------------------------------------------------------- #
+
+def test_freezing_the_file_rewrites_it_in_place(tmp_path: Path) -> None:
+    """The PowerPoint route freezes the staging copy before PowerPoint opens
+    it, so the photo arrives carrying everything and there is nothing left for
+    the layout swap to take away."""
+    _master, deck = _fixture(tmp_path)
+
+    assert freeze_file(deck) == 1
+
+    pic = _pictures(deck)[0]
+    assert pic.spPr.prstGeom.get("prst") == "ellipse"
+    assert pic.spPr.xfrm is not None
+    assert pic.has_ph_elm is False
+
+
+def test_a_deck_with_nothing_to_freeze_is_not_rewritten(tmp_path: Path) -> None:
+    """Not an optimisation. A deck that does not need this reaches PowerPoint
+    byte for byte as the designer saved it, which is the property the
+    PowerPoint route is built around."""
+    deck = tmp_path / "plain.pptx"
+    plain = Presentation()
+    plain.slides.add_slide(plain.slide_masters[0].slide_layouts[1])
+    plain.save(str(deck))
+    before = deck.read_bytes()
+
+    assert freeze_file(deck) == 0
+
+    assert deck.read_bytes() == before
+
+
+def test_a_file_that_cannot_be_read_is_left_alone(tmp_path: Path) -> None:
+    """Best effort, because every fallback left is the old behaviour and a
+    photograph in the wrong place beats a deck nobody can open."""
+    broken = tmp_path / "broken.pptx"
+    broken.write_bytes(b"not a pptx at all")
+
+    assert freeze_file(broken) == 0
+
+    assert broken.read_bytes() == b"not a pptx at all"
+
+
+def test_a_custom_mask_survives_too(tmp_path: Path) -> None:
+    """The case that moved this onto the file. COM reports
+    `msoShapeNotPrimitive` for a drawn mask and for an inherited one alike, so
+    automation cannot tell them apart and loses the mask silently."""
+    image = tmp_path / "portrait.png"
+    image.write_bytes(_png())
+
+    source = Presentation()
+    layout = source.slide_masters[0].slide_layouts[8]
+    layout.placeholders[1]._element.spPr._insert_custGeom(
+        etree.fromstring(
+            f'<a:custGeom xmlns:a="{A}"><a:avLst/><a:pathLst>'
+            f'<a:path w="100" h="100"><a:moveTo><a:pt x="50" y="0"/></a:moveTo>'
+            f'<a:lnTo><a:pt x="100" y="100"/></a:lnTo><a:close/></a:path>'
+            f'</a:pathLst></a:custGeom>'
+        )
+    )
+    slide = source.slides.add_slide(layout)
+    slide.placeholders[1].insert_picture(str(image))
+    deck = tmp_path / "custgeom.pptx"
+    source.save(str(deck))
+
+    master = tmp_path / "master.pptx"
+    Presentation().save(str(master))
+    out = tmp_path / "out.pptx"
+    rebuild(master, deck, out, route="xml")
+
+    assert _pictures(out)[0].spPr.custGeom is not None

@@ -273,7 +273,10 @@ def _restyle(presentation: Any, layouts: dict[str, Any], plans: dict[int, str]):
         try:
             index = number                      # COM is 1-based
             copy = _retry(lambda: presentation.Slides(index).Duplicate()(1))
+            # Read before the swap, put back after. See `_photographs`.
+            photographs = _photographs(copy)
             _retry(lambda: setattr(copy, "CustomLayout", target))
+            _restore(copy, photographs, _has_picture_slot(target))
             _retry(lambda: presentation.Slides(index).Delete())
             outcomes.append(SlideOutcome(number, wanted, True))
         except Exception as exc:
@@ -288,6 +291,181 @@ def _restyle(presentation: Any, layouts: dict[str, Any], plans: dict[int, str]):
             except Exception:
                 log.debug("could not remove a stranded duplicate", exc_info=True)
     return outcomes
+
+
+# --------------------------------------------------------------------------- #
+# Photographs across the swap
+# --------------------------------------------------------------------------- #
+#
+# What PowerPoint gets wrong here, from a real deck: a portrait cropped to a
+# circle came out square and hard against the left margin, while the
+# decorative arcs drawn around it stayed put. The arcs are ordinary
+# autoshapes, so they carry their own position. The portrait was a picture
+# PLACEHOLDER, and its circle and its position were never on the slide at all
+# -- they were on the old layout. Assigning `CustomLayout` re-runs
+# inheritance against the new layout, which has nothing to say about that
+# shape, so the frame collapses to the origin and the geometry to a plain
+# rectangle.
+#
+# The two halves are not restored on the same terms, because they are not the
+# same kind of thing:
+#
+#   the cropped-to shape    always put back. A circular portrait is the
+#                           writer's intent about the content, not a property
+#                           of the template it happened to be built in.
+#   the frame               put back only where the new layout offers no
+#                           picture placeholder of its own. Where it does,
+#                           PowerPoint has just placed the photo in the
+#                           approved spot and overriding that would throw
+#                           away the point of applying a master.
+
+# msoShapeType, MsoAutoShapeType and ppPlaceholderType values, spelled out
+# rather than imported so this module keeps working without the PowerPoint
+# type library generated.
+_MSO_PLACEHOLDER = 14
+_MSO_PICTURE = 13
+_MSO_SHAPE_MIXED = -2
+_MSO_NOT_PRIMITIVE = 138        # what COM answers for geometry it is inheriting
+_PICTURE_SLOTS = frozenset({18, 9})     # ppPlaceholderPicture, ppPlaceholderBitmap
+
+
+def _photographs(slide: Any) -> dict[int, tuple[float, float, float, float, int]]:
+    """Every placeholder on the slide that currently holds a picture.
+
+    Keyed by `Shape.Id`, which is per-slide and survives the `CustomLayout`
+    assignment because that repositions shapes rather than recreating them. A
+    shape whose Id does not survive is simply not restored, which leaves the
+    old behaviour rather than moving the wrong shape.
+
+    `Left` and friends need no special handling: COM already answers with the
+    effective value, so a placeholder inheriting its frame reports the
+    layout's numbers. Geometry does not work that way -- see
+    `_designed_geometry`.
+    """
+    designed = _designed_geometry(slide)
+    found: dict[int, tuple[float, float, float, float, int]] = {}
+    for shape in _shapes(slide):
+        try:
+            if int(shape.Type) != _MSO_PLACEHOLDER:
+                continue
+            if int(shape.PlaceholderFormat.ContainedType) != _MSO_PICTURE:
+                continue
+            geometry = int(shape.AutoShapeType)
+            if geometry in (_MSO_NOT_PRIMITIVE, _MSO_SHAPE_MIXED):
+                geometry = designed.get(str(shape.Name), _MSO_NOT_PRIMITIVE)
+            found[int(shape.Id)] = (
+                float(shape.Left), float(shape.Top),
+                float(shape.Width), float(shape.Height),
+                geometry,
+            )
+        except Exception:
+            # An empty picture placeholder has no ContainedType and raises.
+            # There is no photograph in it to preserve.
+            continue
+    return found
+
+
+def _designed_geometry(slide: Any) -> dict[str, int]:
+    """The preset each picture placeholder on the OLD layout is cropped to.
+
+    Measured, because it is not where you would look for it. Asked about the
+    slide's own shape COM answers `msoShapeNotPrimitive`, which is correct and
+    useless: that shape has no geometry of its own, and having none is the
+    whole bug. Asked about the layout placeholder it inherits from, COM
+    answers `msoShapeOval`. So the circle has to be read off the layout, while
+    the slide is still pointing at it.
+
+    Keyed by shape name, which PowerPoint carries from the layout placeholder
+    onto the slide's copy of it.
+    """
+    geometry: dict[str, int] = {}
+    try:
+        layout = slide.CustomLayout
+    except Exception:
+        return geometry
+    for shape in _shapes(layout):
+        try:
+            if int(shape.PlaceholderFormat.Type) not in _PICTURE_SLOTS:
+                continue
+            preset = int(shape.AutoShapeType)
+        except Exception:
+            continue
+        if preset not in (_MSO_NOT_PRIMITIVE, _MSO_SHAPE_MIXED):
+            geometry[str(shape.Name)] = preset
+    return geometry
+
+
+def _restore(slide: Any, photographs: dict, keep_frame_from_layout: bool) -> None:
+    """Put the cropped-to shape back, and the frame where the layout has none.
+
+    Order matters and cost a wrong result once: setting `AutoShapeType`
+    re-fits the shape and moves it, so the geometry goes back first and the
+    frame after it, never the other way round.
+    """
+    if not photographs:
+        return
+    for shape in _shapes(slide):
+        try:
+            before = photographs.get(int(shape.Id))
+        except Exception:
+            continue
+        if before is None:
+            continue
+        left, top, width, height, geometry = before
+        # Every write retried and none of them fatal. Retried because a
+        # transient rejection here would leave one photograph square while its
+        # neighbours came out round, which is worse to chase than a consistent
+        # fault. Not fatal because the restyle itself has already succeeded,
+        # and reporting the slide as failed over a photograph would discard it.
+        try:
+            if geometry != _MSO_NOT_PRIMITIVE:
+                if geometry != int(_retry(lambda: shape.AutoShapeType)):
+                    _retry(lambda: setattr(shape, "AutoShapeType", geometry))
+            if not keep_frame_from_layout:
+                _retry(lambda: setattr(shape, "Left", left))
+                _retry(lambda: setattr(shape, "Top", top))
+                _retry(lambda: setattr(shape, "Width", width))
+                _retry(lambda: setattr(shape, "Height", height))
+        except Exception:
+            log.debug(
+                "could not restore a photograph's frame or shape", exc_info=True
+            )
+
+
+def _has_picture_slot(layout: Any) -> bool:
+    """Whether the target layout has a picture placeholder of its own.
+
+    False when it cannot be read: the fallback that keeps the source's frame
+    is the one that loses nothing, because a photo left where the designer put
+    it is wrong only cosmetically, and a photo at the origin is wrong visibly.
+    """
+    for shape in _shapes(layout):
+        try:
+            kind = int(shape.PlaceholderFormat.Type)
+        except Exception:
+            continue
+        if kind in _PICTURE_SLOTS:
+            return True
+    return False
+
+
+def _shapes(container: Any):
+    """A 1-based COM shape collection as an iterator.
+
+    Every read here is against a live PowerPoint that can refuse any single
+    call, so a shape that will not come back is skipped rather than taking the
+    slide down with it.
+    """
+    try:
+        count = int(_retry(lambda: container.Shapes.Count))
+    except Exception:
+        log.debug("could not count the shapes on a slide", exc_info=True)
+        return
+    for i in range(1, count + 1):
+        try:
+            yield _retry(lambda: container.Shapes(i))
+        except Exception:
+            continue
 
 
 def _stragglers(presentation: Any, design: Any) -> list[int]:

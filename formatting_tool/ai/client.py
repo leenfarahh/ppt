@@ -35,7 +35,9 @@ __all__ = [
 
 log = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "gemini-2.5-pro"
+# gemini-2.5-pro was retired for new keys and answers 404, which made every AI
+# run on a fresh key fail outright.
+DEFAULT_MODEL = "gemini-3.1-pro-preview"
 DEFAULT_EFFORT = "high"
 DEFAULT_MAX_TOKENS = 16000
 

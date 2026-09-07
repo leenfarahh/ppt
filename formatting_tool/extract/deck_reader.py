@@ -59,6 +59,12 @@ def read_deck(path: str | Path) -> DeckProfile:
 
     try:
         from pptx import Presentation  # noqa: PLC0415 - lazy heavy dependency
+
+        from .pptx_speedup import apply as _speed_up  # noqa: PLC0415
+
+        # Once python-pptx is loaded, and not before: the library is imported
+        # lazily so that `--help` does not pay for it, and this would undo that.
+        _speed_up()
     except ImportError as exc:  # pragma: no cover
         raise DeckReadError(
             "python-pptx is required to read decks (pip install python-pptx)"

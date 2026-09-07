@@ -31,11 +31,12 @@ structural decision this was meant to improve on.
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
 from ..models import LayoutChoice, MasterSpec
-from .gemini import AIValidationError, build_client, file_part, generate_json
+from .gemini import Exhausted, build_client, file_part, generate_json
 from .schema import LAYOUT_CHOICE_SCHEMA
 
 log = logging.getLogger(__name__)
@@ -72,6 +73,7 @@ def choose_layouts(
     model: str,
     thinking_budget: int,
     api_key_env: str = "GEMINI_API_KEY",
+    concurrency: int = 6,
 ) -> list[LayoutChoice]:
     """One pick per rendered slide. Never raises; an empty list means the
     structural matcher decides on its own, which is what it did before."""
@@ -86,14 +88,42 @@ def choose_layouts(
         log.warning("no layout pass: %s", exc)
         return []
 
-    picks: list[LayoutChoice] = []
-    for number, path in images:
+    # One call per slide, several at a time. They are independent and spend
+    # their time waiting, and a pick for slide 4 tells you nothing about slide
+    # 5, so there is nothing to serialise them for.
+    # Set when the account turns out to be spent, so the remaining slides do
+    # not each ask and each be refused. One message, not one per slide.
+    spent: list[Exception] = []
+
+    def one(number, path):
+        if spent:
+            return []
         try:
-            picks.extend(
-                _ask(client, number, path, inventory, allowed, model, thinking_budget)
-            )
-        except (AIValidationError, Exception) as exc:  # noqa: B014 - never fatal
+            return _ask(client, number, path, inventory, allowed, model,
+                        thinking_budget)
+        except Exhausted as exc:
+            if not spent:
+                spent.append(exc)
+                log.error("no layout pass: %s", exc)
+            return []
+        except Exception as exc:      # never fatal: the matcher decides alone
             log.warning("no layout pick for slide %d: %s", number, exc)
+            return []
+
+    picks: list[LayoutChoice] = []
+    workers = max(1, min(concurrency, len(images)))
+    if workers == 1:
+        for number, path in images:
+            picks.extend(one(number, path))
+    else:
+        with ThreadPoolExecutor(max_workers=workers,
+                                thread_name_prefix="layout") as pool:
+            for got in pool.map(lambda pair: one(*pair), list(images)):
+                picks.extend(got)
+    # Back into slide order: the picks are keyed by slide downstream, but a
+    # report reading them in the order they happened to finish is a report
+    # that reads differently on every run.
+    picks.sort(key=lambda choice: choice.slide)
     log.info("the model chose a layout for %d of %d rendered slide(s)",
              len(picks), len(images))
     return picks

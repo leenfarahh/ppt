@@ -492,7 +492,7 @@ def test_snapping_that_would_break_an_alignment_is_refused(tmp_path: Path) -> No
         slide=1,
         shape="Section label",
         shape_id=label.shape_id,
-        expected="2.85in",
+        expected="left 2.85in",
         found="3.00in",
     )
     out = tmp_path / "fixed.pptx"
@@ -524,7 +524,7 @@ def test_a_shape_with_nothing_to_break_is_snapped(tmp_path: Path) -> None:
         slide=1,
         shape="Stray",
         shape_id=stray.shape_id,
-        expected="2.85in",
+        expected="left 2.85in",
         found="3.00in",
     )
     out = tmp_path / "fixed.pptx"
@@ -622,7 +622,7 @@ def test_a_deck_level_finding_says_so_rather_than_blaming_the_deck(
     deck = tmp_path / "messy.pptx"
     prs.save(str(deck))
 
-    issue = _issue("space.alignment_grid", expected="0.92in", found="0.48in")
+    issue = _issue("space.alignment_grid", expected="left 0.92in", found="0.48in")
     out = tmp_path / "fixed.pptx"
 
     result = apply_fixes(deck, [issue], out)

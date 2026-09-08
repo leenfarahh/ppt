@@ -53,6 +53,7 @@ from ..models import (
     SlideProfile,
 )
 from . import master_apply
+from . import rtl
 from .matcher import FAMILIES, LATENT, LayoutMatch, choose_layout
 from .pictures import freeze_slide
 
@@ -110,6 +111,9 @@ class RebuildResult:
     # masters the output carries as a result.
     stragglers: list[int] = field(default_factory=list)
     masters: int = 1
+    # Shapes turned round so a right-to-left deck reads that way. Zero on an
+    # English deck, where turning it round would be the defect.
+    mirrored: int = 0
 
     @property
     def unmatched(self) -> list[SlideRecord]:
@@ -137,6 +141,7 @@ def rebuild(
     seen: Optional[Sequence[LayoutChoice]] = None,
     master_profile: Optional[DeckProfile] = None,
     deck_profile: Optional[DeckProfile] = None,
+    mirror: Optional[bool] = None,
 ) -> RebuildResult:
     """Rebuild `deck` onto `master` and write the result to `out`.
 
@@ -171,6 +176,18 @@ def rebuild(
 
     plans = _plans(deck_profile, master_profile, tuning, seen)
 
+    # Decided from the deck rather than asked for, unless the caller says
+    # otherwise. A master is drawn for one reading direction and applying it
+    # to a deck that reads the other way gets the type right and the layout
+    # backwards, which is not a thing anybody wants by default.
+    if mirror is None:
+        mirror = deck_profile.rtl
+    if mirror:
+        log.info(
+            "%s reads right to left; the rebuilt slides will be mirrored so "
+            "the content does too", deck.name,
+        )
+
     # PowerPoint first where it can run. Assigning CustomLayout runs its own
     # placeholder matching, which is what actually moves a slide's content into
     # the new layout's placeholders, and nothing is re-serialised by us, so the
@@ -178,7 +195,8 @@ def rebuild(
     if route in ("auto", "powerpoint"):
         if master_apply.available():
             applied = master_apply.apply_master(
-                deck, master, out, {n: m.name for n, m in plans.items()}
+                deck, master, out, {n: m.name for n, m in plans.items()},
+                mirror=mirror,
             )
             if applied.fatal is None:
                 return _result_from_powerpoint(master, deck, out, plans, applied)
@@ -208,6 +226,9 @@ def rebuild(
                 profile, src_slide, base, plans[profile.number],
             )
         )
+
+    if mirror:
+        result.mirrored = rtl.mirror_presentation(base)
 
     out.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -266,6 +287,7 @@ def _result_from_powerpoint(
         applied_by="powerpoint",
         stragglers=applied.stragglers,
         masters=applied.masters,
+        mirrored=applied.mirrored,
     )
     for outcome in applied.outcomes:
         match = plans.get(outcome.number)

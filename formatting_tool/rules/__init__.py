@@ -19,7 +19,13 @@ from .colors import (
     ThemeMismatchRule,
     OffPaletteTextRule,
 )
-from .fonts import MixedFontsInShapeRule, ThemeFontDriftRule, UnapprovedFontRule
+from .fonts import (
+    ArabicFontRule,
+    MixedFontsInShapeRule,
+    RightToLeftRule,
+    ThemeFontDriftRule,
+    UnapprovedFontRule,
+)
 from .layouts import LayoutBandRule, LayoutHeaderFooterRule, LayoutMissingRule
 from .logo import LogoGeometryRule, LogoPresenceRule, UnapprovedLogoAssetRule
 from .repeats import (
@@ -113,6 +119,8 @@ def build_default_rules(
         UnapprovedLogoAssetRule(),
         # Brand
         UnapprovedFontRule(),
+        ArabicFontRule(),
+        RightToLeftRule(),
         MixedFontsInShapeRule(),
         ThemeFontDriftRule(),
         ThemeMismatchRule(),

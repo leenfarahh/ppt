@@ -44,10 +44,14 @@ def derive_master_spec(
         observed_sizes_pt={k: sorted(v) for k, v in observed_sizes.items()},
         logo_geometry=_logo_geometry(master, guidelines),
         layouts=list(master.layouts),
+        arabic_fonts=list(guidelines.arabic_fonts),
         theme_fonts=dict(master.theme_fonts),
         theme_colors=dict(master.theme_colors),
         safe_margins=_safe_margins(master, guidelines),
         grid_edges_in=_grid_edges(master, guidelines.tolerances.position_in),
+        grid_right_edges_in=_grid_edges(
+            master, guidelines.tolerances.position_in, side="right"
+        ),
     )
     return spec
 
@@ -69,6 +73,9 @@ def _palette(master: DeckProfile, guidelines: BrandGuidelines) -> dict[str, str]
 
 
 def _allowed_fonts(master: DeckProfile, guidelines: BrandGuidelines) -> list[str]:
+    # Merged only as the fallback below. Kept apart everywhere it matters:
+    # a Latin typeface has no Arabic glyphs, so checking Arabic copy against
+    # the Latin list passes text that renders as boxes.
     fonts = list(guidelines.allowed_fonts) + list(guidelines.arabic_fonts)
     if not fonts:
         # No authored list: fall back to whatever the master theme declares, so
@@ -199,8 +206,10 @@ def _layout_frame(master: DeckProfile) -> Margins:
     )
 
 
-def _grid_edges(master: DeckProfile, tolerance: float) -> list[float]:
-    """The left edges the master declares, across all its layouts.
+def _grid_edges(
+    master: DeckProfile, tolerance: float, side: str = "left"
+) -> list[float]:
+    """The edges the master declares, across all its layouts.
 
     Only once some layout marks its presentation space. Every master has
     placeholders and could therefore supply edges this way, but reading them
@@ -215,7 +224,10 @@ def _grid_edges(master: DeckProfile, tolerance: float) -> list[float]:
         return []
     edges: list[float] = []
     for layout in master.layouts:
-        edges.extend(layout.declared_left_edges)
+        edges.extend(
+            layout.declared_right_edges if side == "right"
+            else layout.declared_left_edges
+        )
     return _collapse(edges, tolerance)
 
 

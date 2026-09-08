@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -50,6 +51,11 @@ THINKING_BUDGETS = {
 }
 MAX_OUTPUT_CEILING = 65536
 
+# How long the system prefix stays cached. Long enough for a long deck, short
+# enough that a run which dies without tidying up does not leave it lying
+# around being charged for.
+_CACHE_TTL = "3600s"
+
 REVIEWER_INSTRUCTIONS = """\
 You are reviewing a PowerPoint deck for formatting consistency against a brand
 system. You work for a presentation design consultancy; the reader of your
@@ -87,6 +93,8 @@ Your job is the judgement the deterministic layer cannot make:
   Name the shape the rule finding names. If a rule finding is about a shape
   inside a group and you are describing the group, use the shape's name and
   say "in <group>" in the message, not the group's name in `shape`.
+- Take out what was never meant to ship: a message to whoever is making the
+  deck rather than to whoever reads it. See "Production notes" below.
 - Report inconsistencies the rules missed: visual hierarchy that inverts
   between slides, a section divider styled like a content slide, spacing that
   is technically legal and visibly uneven, mixed capitalisation or tone across
@@ -116,9 +124,30 @@ Rules of engagement:
 - Anchor each finding in the evidence you were given. If you cannot point at a
   value in the payload, do not report it.
 - You are not judging the writing, the argument, or the design concept. Only
-  formatting consistency against the brand system.
+  formatting consistency against the brand system -- and production notes,
+  which are the one thing you judge by what the words say rather than by how
+  they are set. See "Production notes" below.
 - Set confidence honestly. Below 0.5 means a judgement call worth a designer's
   glance, not a defect.
+
+Production notes:
+
+- A deck being worked on collects messages addressed to whoever is making it
+  rather than to whoever will read it: "Design - can you redo the map and make
+  the colour contrast stronger", "TBC with legal", "@Sara update these
+  numbers", a coloured comment box parked in a corner. They are for the
+  production process and they must not go to a client.
+- Report each one with category "production_note" and `fix.op` "remove_note",
+  naming the shape by its id. Quote the text verbatim in `found`, because
+  removing something is the one act nobody can check by looking at the result.
+- Ask one question: is this addressed to the people making the deck, or to the
+  people reading it? Only the first is a note. A caption that happens to be
+  worded as an instruction is content: "Select a plot size to continue" on a
+  slide about plot sizes is the deck talking to its audience. So is a
+  disclaimer, a source line, a footnote, a legend and a page number.
+- When it could be either, it is content. Leaving a note in costs a designer
+  ten seconds; taking a caption out of a client deck is a defect nobody sees
+  until the client does. Say so with a low confidence rather than removing it.
 
 Proposing a correction, in `fix`:
 
@@ -229,12 +258,70 @@ class AIValidator:
         self._reference_block = build_reference_block(spec)
         self._response_schema = to_gemini_schema(AI_RESPONSE_SCHEMA)
         self._client: Any = None
+        # Name of the explicit cache holding the system prefix, once one has
+        # been made. See `_cached_prefix`.
+        self._cache: Optional[str] = None
+        self._cache_tried = False
+        self._cache_lock = threading.Lock()
 
     # -- system prompt ------------------------------------------------------ #
 
     def system_instruction(self) -> str:
 
         return REVIEWER_INSTRUCTIONS + "\n\nBRAND REFERENCE\n" + self._reference_block
+
+    def _cached_prefix(self, client: Any) -> Optional[str]:
+        """An explicit cache holding the system prefix, or None to send it.
+
+        The prefix is byte-identical on every call -- the reference block is
+        built once in `__init__` for exactly that reason -- and yet every
+        batch of a 105-slide run reported `cache_read=0`. Implicit caching has
+        a minimum length the prefix does not reach, so it never engaged, and
+        about 2,100 tokens went over the wire 105 times.
+
+        Made once per run, under a lock, because the batches run several at a
+        time and two threads racing to create it would make two caches and use
+        neither twice. Tried once: a model that will not cache says so on the
+        first attempt and there is nothing to learn from asking again.
+
+        Failure is not an error. Explicit caching has its own minimum, and not
+        every model offers it at all; when it is unavailable the prefix is
+        sent inline exactly as before, which is the behaviour this replaced.
+        """
+        with self._cache_lock:
+            if self._cache_tried:
+                return self._cache
+            self._cache_tried = True
+            try:
+                from google.genai import types  # noqa: PLC0415
+
+                cache = client.caches.create(
+                    model=self.config.model,
+                    config=types.CreateCachedContentConfig(
+                        system_instruction=self.system_instruction(),
+                        ttl=_CACHE_TTL,
+                    ),
+                )
+                self._cache = str(cache.name)
+                log.info(
+                    "cached the brand reference and instructions as %s; the "
+                    "system prefix is sent once instead of once per batch",
+                    self._cache,
+                )
+            except Exception as exc:
+                log.debug("no explicit cache for the system prefix: %s", exc)
+                self._cache = None
+            return self._cache
+
+    def release(self) -> None:
+        """Delete the run's cache. Safe to call when there never was one."""
+        name, self._cache = self._cache, None
+        if not name or self._client is None:
+            return
+        try:
+            self._client.caches.delete(name=name)
+        except Exception:
+            log.debug("could not delete the cached prefix %s", name, exc_info=True)
 
     # -- the call ----------------------------------------------------------- #
 
@@ -246,11 +333,16 @@ class AIValidator:
     ) -> AIResult:
         client = self._ensure_client()
 
+        cached = self._cached_prefix(client)
         data, response = generate_json(
             client,
             model=self.config.model,
             contents=self._contents(payload, client, images),
-            system_instruction=self.system_instruction(),
+            # One or the other, never both: a request naming a cache carries
+            # its system prefix already, and sending it again is the thing
+            # this exists to stop.
+            system_instruction=None if cached else self.system_instruction(),
+            cached_content=cached,
             schema=self._response_schema,
             translate_schema=False,      # translated once in __init__
             thinking_budget=self.config.thinking_budget,

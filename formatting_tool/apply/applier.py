@@ -157,6 +157,20 @@ class ApplyResult:
         return len(self.applied)
 
     @property
+    def removed(self) -> list[FixOutcome]:
+        """Shapes taken off the deck, which is the one change with no evidence.
+
+        Everything else this does leaves something on the slide to look at. A
+        removal leaves a gap, so it is listed on its own rather than being one
+        line among forty, and each outcome quotes what the shape said.
+        """
+        return [
+            outcome for outcome in self.applied
+            if outcome.issue.fix is not None
+            and outcome.issue.fix.op == "remove_note"
+        ]
+
+    @property
     def introduced(self) -> list[Issue]:
         """Findings on the output that the input did not have.
 
@@ -345,6 +359,10 @@ def _recheck(result: ApplyResult, spec: Optional[Any]) -> None:
         result.recheck = run_rules(
             RuleContext(deck=deck, spec=spec), build_default_rules()
         )
+        # Findings arrive from the rules without one, and the second round
+        # reports them by id the way every other outcome does.
+        for issue in result.recheck:
+            issue.id = issue.fingerprint()
         result.rechecked = True
     except Exception:
         log.warning(

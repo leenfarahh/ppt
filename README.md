@@ -323,12 +323,103 @@ satisfy one is the failure that got `space.alignment_grid` disabled once
 already. Every shape that moves is checked against its own neighbours, and the
 whole set goes back if any of them lands on something.
 
-**Applying is followed by a second pass.** The report a designer ticks
+**Arabic decks are measured as Arabic decks.** The scaffolding was there and
+connected to nothing: `arabic_fonts` was merged into the Latin list before any
+rule saw it, `rtl` was never read off the file, and the alignment grid
+measured left edges only. So an Arabic deck came back clean -- not because it
+was, but because the rules could not see it.
+
+- `font.family.arabic` reports Arabic copy set in a face with no Arabic
+  glyphs. Coverage, not direction: ONE Arabic word in an English run is enough,
+  because a Latin face renders it as boxes however much Latin sits beside it.
+  Fixed when the brand declares a single Arabic face; a design call otherwise.
+- `typography.rtl_not_set` reports Arabic paragraphs with no direction set.
+  The letters still shape and join, so the slide looks almost right -- what
+  lands wrong is the punctuation, the numbers and any Latin inside the line.
+  The fix is one attribute and changes no words.
+- The alignment grid measures the LEADING edge, which is the right one in a
+  deck that reads right to left. A column of Arabic shapes of different widths
+  shares a right edge and nothing else, and the snap moves that edge rather
+  than the left one -- moving the left edge of a right-aligned shape shifts it
+  by its own width off the column.
+
+Direction is read off the copy, not declared: a deck is right-to-left when
+most of its text-bearing shapes are. Safe margins are unchanged, being
+physical rather than directional.
+
+**And the master is turned round rather than applied as drawn.** A master is
+drawn for one reading direction: it puts its title 0.92in from the left
+because that is where an English reader starts. Applied unchanged to an Arabic
+deck it gets the type and the colour right and the layout backwards, which
+reads as a deck somebody forgot to finish. So the rebuild mirrors the frame
+about the slide's vertical centre when the deck reads right to left, and
+`rebuild(mirror=...)` overrides the decision either way.
+
+What turns is the FRAME, not the content -- layouts, the master, and any
+placeholder stating its own position. A shape the author placed themselves
+stays where they put it: an Arabic deck's copy is already flush right, and
+turning that too moves it to the wrong side. Nothing inside a shape turns
+either; a mirrored photograph is a different photograph and a mirrored chart
+is a wrong chart.
+
+The rule is "turn what states its own position, and let the rest follow",
+which is what stops the frame turning twice -- a layout placeholder that
+inherits from the master has already moved with it, and moving it again puts
+it back. See `rebuild/rtl.py`.
+
+**What the AI layer costs, and what it stopped costing.** A 105-slide deck
+was 105 calls at concurrency three. Measured on the real payloads, one dense
+slide sent an 8,418-character system prefix that never cached, 88 rule
+findings of which 28 were the same rule on the same shape, and 158 shape
+digests of which only 2,920 characters was text. Four changes, none of them
+touching what the model is asked to do:
+
+- Concurrency 3 -> 8. The layer is latency-bound, so this divides the wall
+  clock; rate limits are waited out rather than raised, so setting it high
+  costs a pause, not a slide.
+- Slides packed into calls by size rather than one per call. On a real deck
+  they ran 1,590 to 10,610 tokens, so a cover was costing a whole call's
+  latency; now a call is filled to `--batch-tokens` and a dense slide still
+  travels nearly alone, which is where one-per-call was actually protecting
+  anything. The estimate is calibrated against the API, not assumed: a call
+  the four-chars-a-token rule called 19,840 measured 44,732, and at that size
+  the model returned nothing at all.
+- Rule findings collapse to one entry per rule and shape, carrying a count.
+  The surviving entry keeps the first ref, which is the one a restatement
+  names and the merge absorbs into.
+- A shape with no text, fill, outline, image or placeholder role is not sent.
+  The model can say nothing about it that the geometry rules do not prove.
+- The system prefix is put in an explicit cache once per run. It was
+  byte-identical on every call and still reported `cache_read=0`, because
+  implicit caching has a minimum it did not reach.
+
+Measured on a five-slide deck: payload 258,524 -> 157,087 characters, and
+`cache_read=2359` on every call instead of nothing.
+
+**An overlap moves the shape on top.** Two boxes collide and the geometry
+cannot say which is in the wrong place -- but z-order says which landed on the
+other, so `space.overlap` reports the finding on the shape in front and that
+is the one that moves. It is pushed the shortest way clear, but never along an
+axis the two fully share: boxes side by side at one height share their whole
+height, so "shortest" is downward, and moving down clears the collision by
+taking the shape out of the row it belongs to.
+
+**A collapsed row is spread, not nudged.** Five tabs each overlapping the next
+is four overlaps and none is fixable one pair at a time -- push the second
+clear of the first and it lands on the third. `space.series_crowded` reports
+the set once and the fix distributes all of them across the space they occupy,
+falling back to the master's content width when the row has outgrown its own
+span. `space.overlap` stands down for those shapes.
+
+**Applying is followed by a second pass**, and the second pass applies. The report a designer ticks
 describes the deck as it arrived; once the fixes and the master have been
 applied it is a different file, and nothing had measured that file. So the
 deterministic rules run again on the output, and the result carries both what
 they found and `introduced` -- the findings this run caused rather than the
-ones it inherited. On a real deck that came back with eleven, among them a
+ones it inherited. Those are then corrected on the written deck and it is
+measured once more. ONLY what this run introduced: a finding the deck already
+had and the designer did not tick is one they chose to leave, and picking it
+up here would apply something nobody asked for. One round, never a loop. On a real deck that came back with eleven, among them a
 title overlapping the subtitle by 4 square inches. Only the rule layer runs:
 the AI layer costs money, and a second opinion on a file nobody has looked at
 yet is not worth it.
@@ -355,9 +446,17 @@ nothing to report, because no shape was lost -- there was never a shape.
 Every non-placeholder shape travels, not only pictures; a placeholder does not,
 because it is a slot and taking the new layout's position for those is the
 point of a rebuild. What also does not travel is the old brand's furniture,
-told apart by repetition rather than size: a logo or a header band is on many
-layouts because it is on every slide, a section's own artwork is on the one
-layout drawn for it. See `rebuild/pictures.py`.
+told apart by how much of the deck inherits it. Chrome reaches nearly every
+slide because that is what chrome is for; a section's own artwork reaches the
+handful of slides in that section. Anything on a slide master is the brand's
+by construction, and so is anything on more than one layout.
+
+Counting LAYOUTS instead of slides was the first reading and it is wrong for
+the commonest deck there is -- one where every slide sits on the same layout.
+On a real 12-slide deck its background, its logo and two footer boxes were
+each on exactly one layout, read as content, and stamped onto all twelve
+slides: 72 shapes. The master applied underneath them and the output looked
+like the deck that came in. See `rebuild/pictures.py`.
 
 **Icon colour is not shape colour.** An icon from PowerPoint's library is a
 `p:pic`, and what the ribbon calls a *Graphics Fill* is not `a:solidFill` on
@@ -384,6 +483,25 @@ which is what a typesetter does: one character, no words changed, undone by
 deleting it. Widening the box was the other candidate and is worse -- it
 changes the composition and re-wraps the paragraph, so it can strand a
 different word instead of no word.
+
+**Production notes are taken off before the deck goes out.** A deck being
+worked on collects messages addressed to whoever is making it -- "Design - can
+you redo the map and make the colour contrast stronger", "TBC with legal", a
+coloured comment box parked in a corner -- and they must not reach a client.
+Only the AI layer can tell one from a caption, because the question is who the
+text is talking to, so it reports them as `production_note` and proposes
+`remove_note`.
+
+This is the only op that takes something off a slide, and removal is the one
+change a designer cannot check by looking at the result: everything else
+leaves evidence, this leaves a gap. So it is the most guarded. A placeholder
+is never removed -- it is the layout's structure, and a title box holding a
+note is a title box with a note typed into it. Nothing is removed below 0.8
+confidence, which is a higher bar than the 0.5 that separates a judgement call
+from a defect, because leaving a note in costs a designer ten seconds and
+taking a caption out of a client deck is a defect nobody sees until the client
+does. What was removed is quoted verbatim and listed apart from every other
+outcome.
 
 **An AI finding is fixable when it carries one.** The model is asked for a
 `fix`: an `op` from a closed set (recolour a fill, line or text; set an

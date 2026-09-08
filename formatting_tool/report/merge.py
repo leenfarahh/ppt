@@ -68,7 +68,7 @@ def merge_issues(
             continue
         # The AI names what it is restating. Trust that first; fall back to
         # where the finding sits only when it named nothing.
-        existing = by_ref.get(issue.confirms or "")
+        existing = _same_defect(issue, by_ref.get(issue.confirms or ""))
         if existing is None and not issue.confirms:
             existing = (
                 seen_ai.get(issue.dedupe_key())
@@ -82,6 +82,26 @@ def merge_issues(
         seen_ai[issue.dedupe_key()] = issue
 
     return sort_issues(kept)
+
+
+def _same_defect(issue: Issue, rule_issue: Optional[Issue]) -> Optional[Issue]:
+    """The rule finding this restates, if it really is the same defect.
+
+    A ref alone is not enough. The model is pressed hard to label its
+    restatements, and pressed hard enough it labels findings that are not
+    restatements at all: a production note on a shape that also breaches a
+    margin came back naming the margin finding's ref, and absorbing it threw
+    away both the note and the removal it proposed. The report kept the margin
+    finding, which was already there, and lost the only thing on the slide
+    that should not ship.
+
+    Categories have to agree. A colour observation about a shape can restate a
+    colour finding about it; a note about what the text SAYS cannot restate
+    anything about where the shape sits.
+    """
+    if rule_issue is None:
+        return None
+    return rule_issue if rule_issue.category is issue.category else None
 
 
 def _place(issue: Issue) -> tuple:

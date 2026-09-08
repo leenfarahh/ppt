@@ -45,7 +45,14 @@ from typing import Optional
 
 from .ai.client import AIConfig, AIResult, AIValidationError, AIValidator
 from .ai.gemini import Exhausted
-from .ai.payload import DEFAULT_BATCH_SIZE, build_batches, estimate_tokens, payload_to_text, ref_for
+from .ai.payload import (
+    DEFAULT_BATCH_SIZE,
+    DEFAULT_BATCH_TOKENS,
+    build_batches,
+    estimate_tokens,
+    payload_to_text,
+    ref_for,
+)
 from .extract import derive_master_spec, read_deck
 from .guidelines import load_guidelines
 from .linemetrics import (
@@ -112,7 +119,19 @@ class RunConfig:
     # out of five; those are waited out rather than dropped now, but waiting
     # sixty seconds to get a slide back is slower than not having asked for it
     # yet. Three keeps most of the speed-up and stays inside the quota.
-    ai_concurrency: int = 3
+    # Calls in flight at once. The AI layer is latency-bound -- each call
+    # spends most of its time thinking, not moving bytes -- so this divides
+    # the wall clock almost exactly. A 105-slide deck at three was 35
+    # sequential rounds and the best part of half an hour; at eight it is
+    # fourteen. Rate limits are waited out rather than raised (see
+    # `ai.gemini.generate_json`), so the cost of setting it too high is a
+    # pause, not a lost slide.
+    ai_concurrency: int = 8
+    # How much payload one AI call may carry, in tokens. Slides are packed up
+    # to it rather than sent one per call: a cover costs a fraction of a
+    # diagram, and spending a whole call's latency on the cover is what made a
+    # 105-slide deck take half an hour.
+    batch_tokens: int = DEFAULT_BATCH_TOKENS
     apply_master: bool = False
     # Where the restyled deck goes. None keeps it in a temporary directory,
     # which is right for a validate-only run: the report is the output.
@@ -374,7 +393,10 @@ def _run_ai_layer(
     # Two different files, so two different sets of pictures.
     images = _render(deck, config)
 
-    payloads = list(build_batches(deck, rule_issues, config.batch_size, spec=spec))
+    payloads = list(build_batches(
+        deck, rule_issues, config.batch_size, spec=spec,
+        budget_tokens=config.batch_tokens,
+    ))
     try:
         if config.ai_dry_run:
             for payload in payloads:
@@ -385,6 +407,10 @@ def _run_ai_layer(
             result.merge(part)
     finally:
         images.cleanup()
+        # The run's cached system prefix, which is billed while it lives. Its
+        # TTL would collect it anyway; deleting it now means a machine running
+        # deck after deck is not paying for a queue of them.
+        validator.release()
 
     _check_evidence(result, images)
     return result

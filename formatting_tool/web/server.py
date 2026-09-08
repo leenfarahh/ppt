@@ -304,6 +304,12 @@ class _Handler(BaseHTTPRequestHandler):
 
         return {
             "session": session.id,
+            # Listed apart from the rest: a removal is the one change with
+            # nothing left on the slide to check it against.
+            "removed": [
+                {"id": o.issue.id, "slide": o.issue.slide, "detail": o.detail}
+                for o in result.removed
+            ],
             # The second pass. The report the page ticked describes the deck
             # as it arrived; this describes the one it is about to download.
             "recheck": {

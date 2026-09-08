@@ -350,7 +350,16 @@ def _is_a_row(ordered: list, tolerance: float) -> bool:
 
 
 class AlignmentGridRule(Rule):
-    """Shapes that miss the alignment the rest of the deck follows."""
+    """Shapes that miss the alignment the rest of the deck follows.
+
+    Measured on the LEADING edge, which is the left one in an English deck and
+    the right one in an Arabic deck. That is not a nicety: right-to-left copy
+    is set flush right, so a column of Arabic shapes of different widths
+    shares a right edge and nothing else. Read on left edges it is not a
+    column at all, and every shape in it looks correctly placed -- the rule
+    had nothing to say about an Arabic deck, which is worse than saying the
+    wrong thing because it reads as a clean bill of health.
+    """
 
     id = "space.alignment_grid"
     category = Category.SPACE
@@ -359,8 +368,9 @@ class AlignmentGridRule(Rule):
 
     def check(self, ctx: RuleContext) -> Iterable[Issue]:
         tolerance = ctx.spec.tolerances.position_in
+        trailing = ctx.deck.rtl
 
-        grid, source = self._grid(ctx)
+        grid, source = self._grid(ctx, trailing)
         if not grid:
             return
 
@@ -368,7 +378,7 @@ class AlignmentGridRule(Rule):
         for slide, shape in ctx.shapes():
             if not shape.text.strip():
                 continue
-            left = shape.geometry.left_in
+            left = _leading_edge(shape, trailing)
             nearest = min(grid, key=lambda edge: abs(edge - left))
             drift = abs(nearest - left)
             # Only near-misses: a shape deliberately placed elsewhere is not a
@@ -409,20 +419,22 @@ class AlignmentGridRule(Rule):
                     found=f"{left:.2f}in on slides {_runs(slides)}",
                 )
                 continue
+            side = "Right" if trailing else "Left"
             for slide, shape, left, drift in members:
                 yield self.issue(
-                    f"Left edge is {drift:.2f}in off the {nearest:.2f}in "
+                    f"{side} edge is {drift:.2f}in off the {nearest:.2f}in "
                     f"grid line {source}.",
                     slide=slide,
                     shape=shape,
-                    # Bare inches, because the (unregistered) grid fixer parses
-                    # this back as its target.
-                    expected=f"{nearest:.2f}in",
+                    # The edge is named as well as the number, because which
+                    # edge a deck aligns on depends on which way it reads and
+                    # the fixer has to move the right one.
+                    expected=f"{side.lower()} {nearest:.2f}in",
                     found=f"{left:.2f}in",
                 )
 
     @staticmethod
-    def _grid(ctx: RuleContext) -> tuple[list[float], str]:
+    def _grid(ctx: RuleContext, trailing: bool) -> tuple[list[float], str]:
         """The edges to measure against, and where they came from.
 
         The master's own declarations when it has any. Inference is what this
@@ -436,14 +448,16 @@ class AlignmentGridRule(Rule):
         Which source is in play changes what a finding means, so it is said in
         the message rather than left for the reader to assume.
         """
-        declared = ctx.spec.grid_edges_in
+        declared = (
+            ctx.spec.grid_right_edges_in if trailing else ctx.spec.grid_edges_in
+        )
         if declared:
             return list(declared), DECLARED_GRID
 
-        # A left edge shared by this many shapes is an intended grid line.
+        # A leading edge shared by this many shapes is an intended grid line.
         support = ctx.tuning.grid_support
         lefts = Counter(
-            round(shape.geometry.left_in, 2)
+            round(_leading_edge(shape, trailing), 2)
             for _slide, shape in ctx.shapes()
             if shape.text.strip()
         )
@@ -622,6 +636,17 @@ def _paragraph_size_pt(paragraph) -> float:
     """The largest size stated in a paragraph, which sets its line box."""
     sizes = [run.size_pt for run in paragraph.runs if run.size_pt]
     return max(sizes) if sizes else _DEFAULT_PT
+
+
+def _leading_edge(shape, trailing: bool) -> float:
+    """The edge a deck aligns its content on.
+
+    The right edge for right-to-left copy, the left edge otherwise. Named for
+    what it is rather than for which side it happens to be, because which side
+    it is depends on the deck.
+    """
+    box = shape.geometry
+    return box.left_in + box.width_in if trailing else box.left_in
 
 
 def _outside_the_band(box: Geometry, margins, width: float, height: float) -> bool:

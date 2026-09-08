@@ -335,20 +335,73 @@ _Z_FRONT = 2
 
 
 def _repeated_shapes(presentation: Any) -> set[str]:
-    """Shapes that appear on more than one layout, which makes them furniture.
+    """The old brand's furniture, which does not travel.
 
-    By content, not by relationship or by name: one logo related from nine
-    layouts is one image nine times, and a band redrawn on each layout is
-    still the same band.
+    Counted over SLIDES, not over layouts, and that is the whole correction. A
+    layout count says furniture is what several layouts share -- true of a
+    deck with many layouts, and useless for the common one where every slide
+    sits on the same layout. On a real 12-slide deck that meant its
+    background picture, its logo, its slide-number box and two footer text
+    boxes were each on exactly one layout, counted as content, and carried
+    onto all twelve slides. The master applied underneath them and the output
+    looked like the deck that came in.
+
+    What a slide inherits is what a slide inherits: chrome reaches nearly
+    every slide because that is what chrome is for, and a section's own
+    artwork reaches the handful of slides in that section. So a shape most of
+    the deck inherits is the brand's, and one a few slides inherit is theirs.
+
+    The layout count is kept as well. A logo on nine layouts is furniture even
+    when the slides using them are spread unevenly, and that reading costs
+    nothing to keep. So is anything on a slide master, which is drawn once for
+    the whole deck and is therefore the brand's by construction.
+
+    The limit worth knowing: chrome sitting on a layout only one slide uses
+    reaches one slide, and nothing here can tell that from that slide's own
+    artwork. It errs toward carrying, which is the safer way round -- one
+    stray shape on one slide is a smaller wrong than a section image
+    stripped out of every slide that needed it.
     """
-    seen: dict[str, set[int]] = {}
+    by_layout: dict[str, set[int]] = {}
+    on_master: set[str] = set()
     for master in _safe(lambda: list(presentation.slide_masters)) or []:
+        # Whatever sits on a slide master is the brand's by construction: it
+        # is drawn once for the whole deck. No counting needed.
+        for shape in _loose_shapes(master):
+            key = _content_key(shape)
+            if key:
+                on_master.add(key)
         for layout in _safe(lambda: list(master.slide_layouts)) or []:
             for shape in _loose_shapes(layout):
                 key = _content_key(shape)
                 if key:
-                    seen.setdefault(key, set()).add(id(layout))
-    return {key for key, layouts in seen.items() if len(layouts) > 1}
+                    by_layout.setdefault(key, set()).add(id(layout))
+
+    slides = _safe(lambda: list(presentation.slides)) or []
+    reach: dict[str, int] = {}
+    for slide in slides:
+        layout = _safe(lambda s=slide: s.slide_layout)
+        if layout is None:
+            continue
+        for shape in _loose_shapes(layout):
+            key = _content_key(shape)
+            if key:
+                reach[key] = reach.get(key, 0) + 1
+
+    ceiling = max(1, int(len(slides) * _CHROME_SHARE))
+    return {
+        key
+        for key, layouts in by_layout.items()
+        if key in on_master
+        or len(layouts) > 1
+        or reach.get(key, 0) > ceiling
+    } | on_master
+
+
+# The share of a deck a shape has to reach before it is the brand's furniture
+# rather than a section's artwork. Above half: a divider image belongs to the
+# handful of slides in its section, and a logo belongs to all of them.
+_CHROME_SHARE = 0.5
 
 
 def _artwork_of(layout: Any, furniture: set[str]) -> list[Any]:

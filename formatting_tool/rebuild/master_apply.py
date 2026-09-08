@@ -56,7 +56,7 @@ from typing import Any, Optional
 
 from .. import powerpoint
 from ..models import normalize_layout_name
-from . import pictures
+from . import pictures, rtl
 
 log = logging.getLogger(__name__)
 
@@ -131,6 +131,8 @@ class MasterApplyResult:
     # master was not applied" when it was, onto the other one.
     stragglers: list[int] = field(default_factory=list)
     masters: int = 1
+    # Shapes turned round for right-to-left copy, when that was asked for.
+    mirrored: int = 0
 
     @property
     def applied(self) -> int:
@@ -156,6 +158,7 @@ def apply_master(
     master: str | Path,
     out: str | Path,
     plans: dict[int, str],
+    mirror: bool = False,
 ) -> MasterApplyResult:
     """Restyle `deck` onto `master`'s layouts and write the result to `out`.
 
@@ -176,7 +179,9 @@ def apply_master(
             )
         )
     try:
-        return powerpoint.run(lambda app: _drive(app, deck, master, out, plans))
+        return powerpoint.run(
+            lambda app: _drive(app, deck, master, out, plans, mirror)
+        )
     except Exception as exc:
         return MasterApplyResult(fatal=advice(exc))
 
@@ -212,7 +217,14 @@ def _retry(call):
     raise last          # type: ignore[misc]
 
 
-def _drive(app: Any, deck: Path, master: Path, out: Path, plans: dict[int, str]):
+def _drive(
+    app: Any,
+    deck: Path,
+    master: Path,
+    out: Path,
+    plans: dict[int, str],
+    mirror: bool = False,
+):
     """The whole conversation with PowerPoint, on the thread that owns it."""
     result = MasterApplyResult()
 
@@ -252,6 +264,18 @@ def _drive(app: Any, deck: Path, master: Path, out: Path, plans: dict[int, str])
         result.stragglers = _stragglers(presentation, designs)
         _drop_unused_designs(presentation)
         result.masters = _design_count(presentation)
+
+        # After the layouts are on, before anything is written. An English
+        # master puts its title 0.92in from the left because that is where an
+        # English reader starts; an Arabic reader starts at the other side.
+        # Through automation rather than through the file, because this route
+        # re-serialises nothing and that is the point of it.
+        if mirror:
+            result.mirrored = rtl.mirror_com(presentation)
+            log.info(
+                "mirrored %d shape(s) so the content reads right to left",
+                result.mirrored,
+            )
 
         out.parent.mkdir(parents=True, exist_ok=True)
         if out.exists():

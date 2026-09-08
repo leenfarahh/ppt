@@ -173,7 +173,7 @@ def test_a_shape_measures_against_the_nearest_declared_column() -> None:
     issues = list(AlignmentGridRule().check(_ctx(shapes, [_two_column_layout()])))
 
     assert len(issues) == 1
-    assert issues[0].expected == "6.75in"
+    assert issues[0].expected == "left 6.75in"
 
 
 # --------------------------------------------------------------------------- #

@@ -49,6 +49,10 @@ class Category(str, Enum):
     TYPOGRAPHY = "typography"   # orphans, widows, rag, hyphenation
     SPACE = "space"             # safe margins, overflow, overlap, alignment
     LAYOUT = "layout"           # slide-to-layout binding, layout completeness
+    # A message to whoever is making the deck rather than to whoever reads it:
+    # "Design - can you redo the map", "TBC with legal", a comment box parked
+    # in the margin. Content for the production process, not for the client.
+    PRODUCTION_NOTE = "production_note"
     OTHER = "other"
 
 
@@ -164,6 +168,7 @@ FIX_OPS = frozenset({
     "delete_empty_paragraphs",
     "move",
     "resize",
+    "remove_note",
 })
 
 # The ops that change where a shape sits. They go through the same overlap and
@@ -325,6 +330,11 @@ class ParagraphProfile:
     text: str
     level: int = 0
     alignment: Optional[str] = None
+    # `a:pPr/@rtl`. None means the paragraph says nothing, which is not the
+    # same as saying left-to-right: an Arabic paragraph that says nothing is
+    # the defect, because the renderer then places its punctuation and its
+    # numbers as though the copy were English.
+    rtl: Optional[bool] = None
     space_before_pt: Optional[float] = None
     space_after_pt: Optional[float] = None
     line_spacing: Optional[float] = None
@@ -444,13 +454,30 @@ class LayoutProfile:
         Chrome is excluded for the same reason it is excluded from the frame:
         a page number's left edge is furniture, not a column.
         """
+        return sorted({round(b.left_in, 3) for b in self._content_boxes()})
+
+    @property
+    def declared_right_edges(self) -> list[float]:
+        """Every right edge this layout offers content to end at.
+
+        The same shapes, measured from the other side. A right-to-left deck
+        sets its copy flush right, so its columns ARE right edges; read on
+        left edges an Arabic layout is not a column at all and every shape in
+        it looks correctly placed.
+        """
+        return sorted({
+            round(b.left_in + b.width_in, 3) for b in self._content_boxes()
+        })
+
+    def _content_boxes(self) -> list["Geometry"]:
+        """The boxes both edge readings are taken from."""
         boxes = [s.geometry for s in self.presentation_space]
         boxes += [
             s.geometry
             for s in self.placeholders
             if s.placeholder_token not in MARGIN_CHROME
         ]
-        return sorted({round(b.left_in, 3) for b in boxes})
+        return boxes
 
     def content_frame(self) -> Optional[Geometry]:
         """The area this layout offers, as one box, or None if it says nothing.
@@ -495,6 +522,33 @@ class DeckProfile:
     layouts: list[LayoutProfile] = field(default_factory=list)
     theme_fonts: dict[str, str] = field(default_factory=dict)   # major / minor
     theme_colors: dict[str, str] = field(default_factory=dict)  # accent1 -> hex
+
+    @property
+    def rtl(self) -> bool:
+        """Whether this deck reads right to left.
+
+        Measured off the copy rather than declared. A bilingual deck is not
+        marked anywhere as being one or the other, and what decides how it
+        should be measured is which script most of its words are in: a
+        right-to-left deck aligns its columns on their right edges, and a grid
+        read off left edges cannot see one of those at all.
+
+        The threshold is a majority of the text-bearing shapes, so an English
+        deck with an Arabic quotation on one slide stays an English deck.
+        """
+        from .script import is_rtl      # noqa: PLC0415 - avoids a cycle
+
+        rtl = latin = 0
+        for slide in self.slides:
+            for shape in walk_shapes(slide.shapes):
+                text = shape.text.strip()
+                if not text:
+                    continue
+                if is_rtl(text):
+                    rtl += 1
+                else:
+                    latin += 1
+        return rtl > latin
 
     @property
     def name(self) -> str:
@@ -696,6 +750,10 @@ class MasterSpec:
     guidelines: BrandGuidelines
     palette: dict[str, str] = field(default_factory=dict)
     allowed_fonts: list[str] = field(default_factory=list)
+    # The Arabic faces, kept apart from the Latin ones. A Latin typeface has
+    # no Arabic glyphs, so a bilingual deck checked against one merged list
+    # passes Arabic set in a font that cannot draw it.
+    arabic_fonts: list[str] = field(default_factory=list)
     roles: dict[str, RoleSpec] = field(default_factory=dict)
     observed_sizes_pt: dict[str, list[float]] = field(default_factory=dict)
     logo_geometry: Optional[Geometry] = None
@@ -721,6 +779,10 @@ class MasterSpec:
     # side. "Is this on the grid" needs all of them: a two-column layout has
     # three legitimate left edges and a frame can only report the outermost.
     grid_edges_in: list[float] = field(default_factory=list)
+    # The same declarations read from the right, for a deck that aligns that
+    # way. Both are carried because a bilingual estate has decks of each kind
+    # and the master serves both.
+    grid_right_edges_in: list[float] = field(default_factory=list)
 
     @property
     def tolerances(self) -> Tolerances:

@@ -248,3 +248,106 @@ def test_the_layouts_own_order_is_kept(tmp_path: Path) -> None:
     assert "AUTO_SHAPE" in kinds[0]            # the panel, drawn first
     assert "LINE" in kinds[1]                  # then the line, over it
     assert "PLACEHOLDER" in kinds[2]           # the slide's own copy, on top
+
+
+# --------------------------------------------------------------------------- #
+# Furniture is what most of the deck inherits
+# --------------------------------------------------------------------------- #
+#
+# The layout count was the first reading of this and it is wrong for the
+# commonest deck there is: one where every slide sits on the same layout. On a
+# real 12-slide deck its background picture, its logo and two footer text
+# boxes were each on exactly one layout, counted as content, and stamped onto
+# all twelve slides -- 72 shapes. The master applied underneath them and the
+# output looked like the deck that came in, which is what "the master was not
+# applied" looks like from the outside.
+
+def _one_layout_deck(tmp_path: Path, chrome_slides: int, section_slides: int):
+    """A deck shaped like a real one: chrome on the layout everything uses."""
+    pytest.importorskip("pptx")
+    from pptx import Presentation
+    from pptx.util import Inches
+
+    prs = Presentation()
+    prs.slide_width, prs.slide_height = Inches(13.333), Inches(7.5)
+    chrome = prs.slide_layouts[5]           # Title Only
+    section = prs.slide_layouts[1]          # Title and Content
+    scratch = prs.slides.add_slide(prs.slide_layouts[6])
+
+    background = scratch.shapes.add_picture(
+        str(_png(tmp_path / "bg.png", (180, 170, 150))),
+        Inches(0), Inches(0), Inches(13.33), Inches(7.5),
+    )
+    logo = scratch.shapes.add_picture(
+        str(_png(tmp_path / "logo.png", (10, 10, 10))),
+        Inches(11.8), Inches(0.2), Inches(1.2), Inches(0.5),
+    )
+    divider = scratch.shapes.add_picture(
+        str(_png(tmp_path / "divider.png", (20, 90, 140))),
+        Inches(7), Inches(1), Inches(5), Inches(5),
+    )
+    _put_on_layout(chrome, background)
+    _put_on_layout(chrome, logo)
+    _put_on_layout(section, divider)
+    for shape in (background, logo, divider):
+        shape._element.getparent().remove(shape._element)
+
+    for index in range(chrome_slides + section_slides):
+        layout = section if index < section_slides else chrome
+        prs.slides.add_slide(layout).shapes.title.text = f"Slide {index}"
+
+    path = tmp_path / "chrome.pptx"
+    prs.save(str(path))
+    return Presentation(str(path))
+
+
+def test_chrome_on_the_one_layout_everything_uses_stays_behind(
+    tmp_path: Path,
+) -> None:
+    """The case the layout count could not see: one layout, so one layout
+    carries the logo, so the logo read as a section's own artwork."""
+    from formatting_tool.rebuild.pictures import inherit_artwork
+
+    prs = _one_layout_deck(tmp_path, chrome_slides=10, section_slides=2)
+
+    carried = inherit_artwork(prs)
+
+    # Two slides get the divider image; nobody gets the background or the logo.
+    assert len(carried) == 2
+
+
+def test_a_section_image_still_travels(tmp_path: Path) -> None:
+    """The other half: a divider photograph belongs to the handful of slides
+    in its section, and each of them needs it."""
+    from formatting_tool.rebuild.pictures import inherit_artwork
+
+    prs = _one_layout_deck(tmp_path, chrome_slides=10, section_slides=2)
+    inherit_artwork(prs)
+
+    section_slides = [
+        s for s in prs.slides if s.slide_layout.name == "Title and Content"
+    ]
+    assert len(section_slides) == 2
+    for slide in section_slides:
+        assert [s for s in slide.shapes if s.shape_type == 13]
+
+
+def test_an_image_reaching_most_of_the_deck_is_the_brands(tmp_path: Path) -> None:
+    """Whatever layout it sits on. Here the divider reaches eleven slides of
+    thirteen, so it stops being a section's own artwork and stays behind."""
+    from formatting_tool.rebuild.pictures import inherit_artwork
+
+    prs = _one_layout_deck(tmp_path, chrome_slides=1, section_slides=11)
+
+    carried = inherit_artwork(prs)
+
+    section_slides = [
+        s for s in prs.slides if s.slide_layout.name == "Title and Content"
+    ]
+    assert len(section_slides) == 11
+    for slide in section_slides:
+        assert not [s for s in slide.shapes if s.shape_type == 13]
+    # The chrome layout is now the minority one, and reach cannot tell chrome
+    # on a one-slide layout from that slide's own artwork. It errs toward
+    # carrying, which is the safer way round.
+    assert len(carried) == 2

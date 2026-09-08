@@ -86,8 +86,9 @@ AI_ISSUE_SCHEMA: dict[str, Any] = {
                         "`hex`; set_font needs `font`; set_font_size needs "
                         "`size_pt`; move needs `left_in` and `top_in`; "
                         "resize needs `width_in` and `height_in`; "
-                        "disable_autofit and delete_empty_paragraphs need "
-                        "nothing else."
+                        "remove_note deletes the shape and needs nothing "
+                        "else; disable_autofit and delete_empty_paragraphs "
+                        "need nothing else."
                     ),
                 },
                 "shape_id": {

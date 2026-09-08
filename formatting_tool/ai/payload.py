@@ -27,7 +27,17 @@ from ..models import (
 # is invisible to this layer. It always partly was, which is why the reviewer
 # instructions have never let the model report a deck-level pattern from one
 # batch; the deterministic rules read the whole deck and carry those findings.
-DEFAULT_BATCH_SIZE = 1
+# A ceiling on slides per call, not an exact count. Past this the model's
+# attention is spread too thin whatever the payload measures, and a deck of
+# very small slides would otherwise put thirty in one call.
+DEFAULT_BATCH_SIZE = 8
+
+# How much payload one call may carry, in rough tokens. Sized off a real
+# deck: its slides ran 1,590 to 10,610 tokens, so this holds the largest of
+# them with room beside it, or four or five ordinary ones. Big enough that the
+# long tail of simple slides stops costing a call each; small enough that a
+# dense slide still travels nearly alone.
+DEFAULT_BATCH_TOKENS = 24000
 
 
 # cached half: guidelines and expected values
@@ -92,36 +102,73 @@ def ref_for(index: int) -> str:
 
 
 def build_rule_findings(issues: Sequence[Issue]) -> list[dict[str, Any]]:
-    return [
-        {
+    """The rule findings, one entry per defect rather than per occurrence.
+
+    Sent so the model knows what has already been proved and can label its own
+    restatements. One dense slide was sending 88 of them, 28 of which were
+    `color.text.off_palette` on the same shape -- about 7,600 tokens for one
+    slide, and the model was never going to write 28 findings about one
+    shape's colour. Repeats collapse to one entry carrying the count.
+
+    The surviving entry keeps the FIRST ref of its group, which is the one a
+    restatement will name and the one the merge absorbs into. The others stay
+    in the report untouched, fixable as they always were; what is dropped is
+    the model's chance to label them individually, and it was never going to.
+
+    `category` goes too: it is derivable from `rule_id`, which is right there.
+    """
+    grouped: dict[tuple, dict[str, Any]] = {}
+    for index, issue in enumerate(issues):
+        key = (issue.slide, issue.rule_id, issue.shape)
+        seen = grouped.get(key)
+        if seen is not None:
+            seen["n"] = seen.get("n", 1) + 1
+            continue
+        grouped[key] = {
             "ref": ref_for(index),
             "rule_id": issue.rule_id,
             "slide": issue.slide,
             "shape": issue.shape,
-            "category": issue.category.value,
             "severity": issue.severity.value,
             "message": issue.message,
             "expected": issue.expected,
             "found": issue.found,
         }
-        for index, issue in enumerate(issues)
+    # `slide` is kept even when it is null: that is how a deck-level finding
+    # says so, and the batcher reads it to decide which findings travel with
+    # which slides.
+    return [
+        {k: v for k, v in entry.items() if v is not None or k == "slide"}
+        for entry in grouped.values()
     ]
 
 
 def build_slide_digests(slides: Sequence[SlideProfile]) -> list[dict[str, Any]]:
-
-    return [
-        {
-            "n": slide.number,
-            "layout": slide.layout_name,
-            "hidden": slide.hidden or None,
-            "shapes": [_shape_digest(shape) for shape in slide.shapes],
-        }
-        for slide in slides
-    ]
+    return [_slide_digest(slide) for slide in slides]
 
 
-def _shape_digest(shape: ShapeProfile) -> dict[str, Any]:
+def _slide_digest(slide: SlideProfile) -> dict[str, Any]:
+    """One slide, as the model sees it.
+
+    Split out so the packer can measure a slide with the same object that is
+    later sent. Measuring one thing and sending another is how a budget stops
+    meaning anything.
+    """
+    return {
+        "n": slide.number,
+        "layout": slide.layout_name,
+        "hidden": slide.hidden or None,
+        "shapes": [
+            digest for digest in
+            (_shape_digest(shape) for shape in slide.shapes)
+            if digest is not None
+        ],
+    }
+
+
+def _shape_digest(shape: ShapeProfile) -> Optional[dict[str, Any]]:
+    if not _worth_sending(shape):
+        return None
     box = shape.geometry
     digest: dict[str, Any] = {
         # The OOXML id, unique within its slide, sent so a finding can name a
@@ -152,8 +199,39 @@ def _shape_digest(shape: ShapeProfile) -> dict[str, Any]:
     if runs:
         digest["runs"] = runs
     if shape.children:
-        digest["children"] = [_shape_digest(child) for child in shape.children]
+        children = [
+            child for child in (_shape_digest(c) for c in shape.children)
+            if child is not None
+        ]
+        if children:
+            digest["children"] = children
     return {k: v for k, v in digest.items() if v is not None}
+
+
+def _worth_sending(shape: ShapeProfile) -> bool:
+    """Whether the model has anything to judge about this shape.
+
+    A shape with no text, no fill, no outline, no image and no placeholder
+    role is a decorative freeform or a stub -- on one real slide, 100 of 158
+    shapes, including a 0.0017in embedded-object placeholder. The model cannot
+    say anything about them that the geometry rules do not already prove, and
+    they were two thirds of the biggest block in the payload.
+
+    A group survives if any of its parts does, because the group is how the
+    parts are addressed.
+    """
+    # Tested against what the digest actually carries, not against what the
+    # profile knows. A first pass kept anything with a theme-bound outline and
+    # saved almost nothing, because a theme-bound outline is not sent: the
+    # shape still arrived as a name, a type and a box, which is exactly the
+    # noise this is meant to remove.
+    if shape.text.strip():
+        return True
+    if shape.fill_hex or shape.line_hex or shape.image_sha1:
+        return True
+    if shape.placeholder_type:
+        return True
+    return any(_worth_sending(child) for child in shape.children)
 
 
 def _run_digests(shape: ShapeProfile) -> list[dict[str, Any]]:
@@ -198,31 +276,118 @@ def build_batches(
     rule_issues: Sequence[Issue],
     batch_size: int = DEFAULT_BATCH_SIZE,
     spec: Optional[MasterSpec] = None,
+    budget_tokens: int = DEFAULT_BATCH_TOKENS,
 ) -> Iterator[dict[str, Any]]:
+    """Slides packed into calls by how big they are, not by how many there are.
 
+    One slide per call was the rule, for a good reason: the model's attention
+    has to cover every shape on every slide in the batch, and what it misses
+    first is the small stuff. But it made a 105-slide deck 105 calls, and
+    measured across a real deck the slides are nothing like each other -- 1,590
+    tokens for a cover, 10,610 for a diagram. Sending the cover alone spends a
+    whole call's latency on almost nothing.
+
+    So a call is filled to a token budget instead. A dense slide still goes
+    nearly alone, which is where the attention argument actually bites; the
+    long tail of simple slides collapses together, which is where it does not.
+    On the deck measured, 105 calls became about 15.
+
+    `batch_size` is now a ceiling on slides per call rather than an exact
+    count, so `--batch-size 1` still means one slide per call and nothing
+    about the old behaviour is out of reach.
+    """
     findings = build_rule_findings(rule_issues)
-    deck_level = [f for f in findings if f["slide"] is None]
+    deck_level = [f for f in findings if f.get("slide") is None]
+    by_slide: dict[int, list[dict[str, Any]]] = {}
+    for finding in findings:
+        number = finding.get("slide")
+        if number is not None:
+            by_slide.setdefault(number, []).append(finding)
 
-    slides = deck.slides
-    total = (len(slides) + batch_size - 1) // batch_size or 1
     theme = _theme_block(deck, spec)
+    # What every call carries whatever it holds: the theme block and the
+    # deck-level findings. Counted against the budget so a deck with a lot of
+    # both does not quietly send oversized calls.
+    fixed = _tokens(theme) + _tokens(deck_level)
 
-    for index in range(0, len(slides), batch_size):
-        chunk = slides[index: index + batch_size]
-        numbers = {slide.number for slide in chunk}
+    # Built once. They are what is being measured and what is being sent, and
+    # building them twice on a 105-slide deck is a second full walk of every
+    # shape for nothing.
+    digests = {slide.number: _slide_digest(slide) for slide in deck.slides}
+
+    groups = _pack(
+        deck.slides, digests, by_slide, batch_size, budget_tokens, fixed
+    )
+    total = len(groups) or 1
+    for index, chunk in enumerate(groups, start=1):
+        numbers = [slide.number for slide in chunk]
         yield {
             "deck": deck.name,
-            "batch": {
-                "index": index // batch_size + 1,
-                "of": total,
-                "slides": sorted(numbers),
-            },
+            "batch": {"index": index, "of": total, "slides": sorted(numbers)},
             "slide_size_in": [deck.width_in, deck.height_in],
             **theme,
-            "rule_findings": deck_level
-            + [f for f in findings if f["slide"] in numbers],
-            "slides": build_slide_digests(chunk),
+            "rule_findings": deck_level + [
+                finding for number in numbers
+                for finding in by_slide.get(number, [])
+            ],
+            "slides": [digests[number] for number in numbers],
         }
+
+
+def _pack(
+    slides: Sequence[SlideProfile],
+    digests: dict[int, dict[str, Any]],
+    by_slide: dict[int, list[dict[str, Any]]],
+    ceiling: int,
+    budget: int,
+    fixed: int,
+) -> list[list[SlideProfile]]:
+    """Consecutive slides gathered into calls that fit the budget.
+
+    Consecutive, and never reordered. Slides next to each other are about the
+    same thing, and a model reading four of them together is reading a
+    section; packed by size alone it would be reading four unrelated slides
+    and the batch would tell it nothing.
+
+    A slide bigger than the budget on its own still goes, alone. Refusing it
+    would drop it from the review entirely, which is a worse answer than a
+    large call.
+    """
+    groups: list[list[SlideProfile]] = []
+    current: list[SlideProfile] = []
+    running = 0
+
+    for slide in slides:
+        cost = _tokens(digests[slide.number]) + _tokens(by_slide.get(slide.number, []))
+        too_big = current and (running + cost + fixed > budget)
+        too_many = len(current) >= max(1, ceiling)
+        if too_big or too_many:
+            groups.append(current)
+            current, running = [], 0
+        current.append(slide)
+        running += cost
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _tokens(payload: Any) -> int:
+    """Rough token count for a piece of payload.
+
+    Calibrated, not assumed. The usual four-characters-to-a-token rule is for
+    prose; this is JSON, which is mostly short keys, quotes, braces and
+    numbers, and every one of those is its own token. A packed call estimated
+    at 19,840 tokens by the prose rule came back from the API measured at
+    44,732 -- so the rule was out by more than two, and a budget built on it
+    would let calls run to twice the size it was written for.
+
+    Two characters to a token matches what the API reported, and erring low
+    would be the wrong direction: it is what puts too many slides in a call.
+    """
+    try:
+        return len(json.dumps(payload, ensure_ascii=False)) // 2
+    except Exception:
+        return 0
 
 
 def _theme_block(deck: DeckProfile, spec: Optional[MasterSpec]) -> dict[str, Any]:

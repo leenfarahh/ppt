@@ -29,7 +29,7 @@ from typing import Optional, Sequence, TextIO
 from . import __version__
 from .ai.client import AIConfig, DEFAULT_EFFORT, DEFAULT_MODEL
 from .ai.gemini import AIValidationError
-from .ai.payload import DEFAULT_BATCH_SIZE
+from .ai.payload import DEFAULT_BATCH_SIZE, DEFAULT_BATCH_TOKENS
 from .apply import ApplyError, apply_fixes, fixable, fixer_for, why_not_fixable
 from .classify import fit_slide, layout_coverage, missing_kinds
 from .brandbook import (
@@ -137,6 +137,7 @@ def _cmd_validate(args: argparse.Namespace) -> int:
         ai_dry_run=args.ai_dry_run,
         payload_dir=args.payload_dir,
         batch_size=args.batch_size,
+        batch_tokens=getattr(args, "batch_tokens", DEFAULT_BATCH_TOKENS),
         min_confidence=args.min_confidence,
         render=args.render,
         line_metrics=not getattr(args, "no_line_metrics", False),
@@ -337,6 +338,15 @@ def _report_apply(result) -> None:
         print("\n  Skipped:", file=out)
         for outcome in result.skipped:
             print(f"    {outcome}", file=out)
+    if result.removed:
+        print(
+            f"\n  {len(result.removed)} production note(s) taken off the deck. "
+            "Nothing else was removed:",
+            file=out,
+        )
+        for outcome in result.removed:
+            where = f"slide {outcome.issue.slide}" if outcome.issue.slide else "deck"
+            print(f"    {where}: {outcome.detail}", file=out)
     if result.rebuilt is not None:
         print("", file=out)
         _report_rebuild(result.rebuilt)
@@ -707,7 +717,21 @@ def _build_parser() -> argparse.ArgumentParser:
         "--batch-size",
         type=int,
         default=DEFAULT_BATCH_SIZE,
-        help="slides per AI call",
+        help=(
+            "most slides in one AI call. A ceiling, not a count: calls are "
+            "filled to --batch-tokens first, so a dense slide still travels "
+            "nearly alone. Pass 1 for one slide per call"
+        ),
+    )
+    validate.add_argument(
+        "--batch-tokens",
+        type=int,
+        default=DEFAULT_BATCH_TOKENS,
+        help=(
+            "how much payload one AI call may carry. Lower it if the model "
+            "starts missing small things on busy slides; raise it for fewer, "
+            "larger calls on a long deck"
+        ),
     )
     validate.add_argument(
         "--min-severity",

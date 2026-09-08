@@ -28,6 +28,7 @@ from ..models import (
     placeholder_token,
 )
 
+_A_NS = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
 _DRAWINGML_NS = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
 _P_NS = "{http://schemas.openxmlformats.org/presentationml/2006/main}"
 
@@ -277,11 +278,32 @@ def _read_paragraph(paragraph: Any) -> ParagraphProfile:
         text=_safe(lambda: paragraph.text) or "",
         level=int(_safe(lambda: paragraph.level) or 0),
         alignment=_stringify(_safe(lambda: paragraph.alignment)),
+        rtl=_paragraph_rtl(paragraph),
         space_before_pt=_points(_safe(lambda: paragraph.space_before)),
         space_after_pt=_points(_safe(lambda: paragraph.space_after)),
         line_spacing=_line_spacing(_safe(lambda: paragraph.line_spacing)),
         runs=[_read_run(run) for run in _safe(lambda: paragraph.runs) or []],
     )
+
+
+def _paragraph_rtl(paragraph: Any) -> Optional[bool]:
+    """`a:pPr/@rtl`, or None when the paragraph does not say.
+
+    python-pptx has no accessor for it, so it is read off the element. None is
+    a real answer and not a failure: a paragraph that says nothing inherits,
+    and an Arabic paragraph that inherits left-to-right is the defect
+    `typography.rtl_not_set` reports.
+    """
+    try:
+        properties = paragraph._p.find(f"{_A_NS}pPr")
+        if properties is None:
+            return None
+        value = properties.get("rtl")
+        if value is None:
+            return None
+        return value in ("1", "true")
+    except Exception:
+        return None
 
 
 def _read_run(run: Any) -> RunProfile:

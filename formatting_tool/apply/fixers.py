@@ -92,7 +92,7 @@ COHORT = frozenset({"space.safe_margin", "space.off_canvas"})
 _TRAILING = " \t   "
 
 _INCHES = re.compile(r"(-?\d+(?:\.\d+)?)\s*in")
-_EDGE = re.compile(r"\b(left|top)\s+(-?\d+(?:\.\d+)?)\s*in")
+_EDGE = re.compile(r"\b(left|right|top)\s+(-?\d+(?:\.\d+)?)\s*in")
 _MARGIN = re.compile(r"\b(top|right|bottom|left)\s+(-?\d+(?:\.\d+)?)\s*in")
 _QUOTED_FONT = re.compile(r"explicit\s+(.+?)\s*$")
 # "0.42, 1.19in", and the signed form "offset +3.04, +0.00in". Both numbers and
@@ -201,15 +201,20 @@ def fix_alignment_grid(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[
             "declared by the master, and which column a shape belongs to is "
             "a design call. Mark the master's presentation space to enable this"
         )
-    target = _inches(issue.expected)
+    side, target = _edge(issue.expected)
     if target is None or shape.left is None:
         return None
-    new_left = int(round(target * EMU_PER_INCH))
+
+    # The edge the deck aligns on, which is the right one in a deck that reads
+    # right to left. Snapping the left edge of a right-aligned shape moves it
+    # by its own width off the column it belongs to.
+    width = shape.width or 0
+    new_left = int(round(target * EMU_PER_INCH)) - (width if side == "right" else 0)
     if new_left == shape.left:
         return None
     moved = (new_left - shape.left) / EMU_PER_INCH
     shape.left = new_left
-    return f"snapped the left edge {moved:+.2f}in to {target:.2f}in"
+    return f"snapped the {side or 'left'} edge {moved:+.2f}in to {target:.2f}in"
 
 
 def fix_repeat_out_of_line(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[str]:
@@ -379,12 +384,22 @@ def fix_overlap(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[str]:
         return None
 
     clear = _emu(_CLEARANCE_IN)
-    ways = (
-        (other_right - left + clear, 0),                 # push right
-        (other_left - (left + width) - clear, 0),        # push left
-        (0, other_bottom - top + clear),                 # push down
-        (0, other_top - (top + height) - clear),         # push up
-    )
+    across = ((other_right - left + clear, 0), (other_left - (left + width) - clear, 0))
+    down = ((0, other_bottom - top + clear), (0, other_top - (top + height) - clear))
+
+    # The shortest way out, but not along an axis the two shapes fully share.
+    # Two boxes side by side at the same height overlap their whole height, so
+    # "shortest" is downward -- and moving down clears the collision by taking
+    # the shape out of the row it belongs to. Full overlap on an axis is not a
+    # collision on that axis, it is an alignment, and the move guard would
+    # refuse the result anyway.
+    ways = []
+    if not _fully_overlapped(left, width, other_left, other_right - other_left):
+        ways.extend(across)
+    if not _fully_overlapped(top, height, other_top, other_bottom - other_top):
+        ways.extend(down)
+    if not ways:
+        ways = list(across) + list(down)
     dx, dy = min(ways, key=lambda way: abs(way[0]) + abs(way[1]))
 
     new_left, new_top = left + dx, top + dy
@@ -407,6 +422,17 @@ def fix_overlap(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[str]:
 # A hair of daylight, so a shape pushed clear does not come back next run as
 # touching to the nearest EMU.
 _CLEARANCE_IN = 0.02
+
+
+def _fully_overlapped(a: int, a_size: int, b: int, b_size: int) -> bool:
+    """Whether one shape's extent on this axis covers the other's entirely.
+
+    Two boxes in a row share their whole height; a caption and the chart above
+    it share their whole width. Separating along that axis is not clearing a
+    collision, it is leaving the arrangement.
+    """
+    span = min(a + a_size, b + b_size) - max(a, b)
+    return span >= min(a_size, b_size) - _emu(0.01)
 
 
 def fix_series_crowded(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[str]:
@@ -890,6 +916,79 @@ def _bind_last_two_words(paragraph: Any) -> bool:
     return False
 
 
+def fix_rtl_not_set(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[str]:
+    """Mark the Arabic paragraphs right-to-left.
+
+    One attribute, `a:pPr/@rtl`, and it changes no words, no typeface and no
+    size. What it changes is where everything that is not a letter goes: the
+    full stop at the end of the sentence, a bracketed aside, a number, a Latin
+    product name inside an Arabic line. Without it the letters still shape and
+    join -- that is the font's job -- so the slide looks almost right, which
+    is exactly why this ships.
+
+    Only the paragraphs that are actually Arabic. A bilingual shape holding an
+    English heading over an Arabic body has one of each, and turning the
+    heading round would be the same defect pointed the other way.
+    """
+    from ..script import is_rtl  # noqa: PLC0415 - keeps the import off the hot path
+
+    if not _has_text(shape):
+        return None
+
+    from pptx.oxml.ns import qn  # noqa: PLC0415 - lazy, python-pptx is optional
+
+    changed = 0
+    for paragraph in shape.text_frame.paragraphs:
+        if not is_rtl(paragraph.text or ""):
+            continue
+        properties = paragraph._p.get_or_add_pPr()
+        if properties.get("rtl") in ("1", "true"):
+            continue
+        properties.set("rtl", "1")
+        changed += 1
+    if not changed:
+        return None
+    return (
+        f"marked {changed} Arabic paragraph(s) right-to-left, so their "
+        "punctuation and numbers land where they belong"
+    )
+
+
+def fix_arabic_font(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[str]:
+    """Set the Arabic runs in the brand's Arabic face.
+
+    Applied only when the brand declares ONE Arabic face, which is the common
+    case and the only one where the answer is not a choice. With two or more
+    it is the same design call `font.family.unapproved` leaves to a person:
+    which of the approved faces this copy should be in.
+
+    Every run holding Arabic, not every run in the shape. A shape carrying an
+    English label and an Arabic caption needs one of them changed, and
+    rewriting the English into an Arabic face would be a defect this rule
+    would then report from the other side.
+    """
+    from ..script import has_arabic  # noqa: PLC0415
+
+    approved = [name.strip() for name in (issue.expected or "").split(",")]
+    approved = [name for name in approved if name]
+    if len(approved) != 1:
+        raise LeaveAlone(
+            "the brand declares more than one Arabic face, and which of them "
+            "this copy should be in is a design call"
+        )
+    if not _has_text(shape):
+        return None
+
+    wanted = approved[0]
+    changed = 0
+    for paragraph in shape.text_frame.paragraphs:
+        for run in paragraph.runs:
+            if has_arabic(run.text) and run.font.name != wanted:
+                run.font.name = wanted
+                changed += 1
+    return f"set {changed} Arabic run(s) in {wanted!r}" if changed else None
+
+
 def fix_theme_font_drift(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[str]:
     """Clear a run-level typeface so the run inherits from the layout again.
 
@@ -941,10 +1040,27 @@ def fix_ai_action(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[str]:
             "there is no brand reference to check this proposal against, so "
             "it cannot be applied; re-run with the master or a guidelines file"
         )
+    if action.op in _REMOVES and (issue.confidence or 0.0) < _SURE_ENOUGH:
+        raise LeaveAlone(
+            f"removing something needs more certainty than "
+            f"{issue.confidence or 0.0:.2f}; the finding stays on the report "
+            "and the shape stays on the slide"
+        )
     handler = _AI_OPS.get(action.op)
     if handler is None:                     # pragma: no cover - FIX_OPS guards it
         raise LeaveAlone(f"no handler is written for {action.op!r}")
     return handler(shape, action, ctx)
+
+
+# Ops that take something off the slide. Removal is the one act a designer
+# cannot check by looking at the result -- everything else leaves evidence and
+# this leaves a gap -- so it is the one that asks the model how sure it was.
+_REMOVES = frozenset({"remove_note"})
+
+# Not the 0.5 that separates a judgement call from a defect. Leaving a note in
+# costs a designer ten seconds; taking a caption out of a client deck is a
+# defect nobody sees until the client does, and the two are not worth the same.
+_SURE_ENOUGH = 0.8
 
 
 def _ai_recolor_fill(shape: Any, action: Any, ctx: "FixContext") -> Optional[str]:
@@ -1183,6 +1299,69 @@ def _within_the_frame(
 _EDGE_SLACK_IN = 0.01
 
 
+def _ai_remove_note(shape: Any, action: Any, ctx: "FixContext") -> Optional[str]:
+    """Take a production note off the slide.
+
+    The only op here that removes something, and removal is the one act a
+    designer cannot check by looking at the result: everything else leaves
+    evidence on the slide, and this leaves a gap. So it is the most guarded.
+
+    A placeholder is never removed. It is part of the layout's structure, it
+    comes back empty on the next rebuild, and a title box holding a note is a
+    title box with a note typed into it -- the copy is the problem, not the
+    shape.
+
+    Nothing else is removed either unless the model was sure. Below
+    `_SURE_ENOUGH` the finding stays on the report for a designer to read and
+    the shape stays on the slide, because leaving a note in costs ten seconds
+    and taking a caption out of a client deck is a defect nobody sees until
+    the client does.
+
+    What was removed is put back into the outcome verbatim. A report that says
+    "removed a shape" is not enough to check; one that quotes what it said is.
+    """
+    try:
+        if shape.is_placeholder:
+            raise LeaveAlone(
+                "this is a layout placeholder, so the note is copy typed into "
+                "the deck's structure rather than a shape somebody added; "
+                "clear the text instead of deleting the box"
+            )
+    except LeaveAlone:
+        raise
+    except Exception:
+        pass
+
+    text = _text_of(shape)
+    if not text.strip():
+        raise LeaveAlone(
+            "there is no text here to have been a note; a shape this names "
+            "and cannot read is not one to delete"
+        )
+
+    element = getattr(shape, "_element", None)
+    parent = element.getparent() if element is not None else None
+    if parent is None:
+        return None
+    parent.remove(element)
+    return f"removed the production note {_shorten(text)}"
+
+
+def _text_of(shape: Any) -> str:
+    try:
+        return shape.text_frame.text if shape.has_text_frame else ""
+    except Exception:
+        return ""
+
+
+def _shorten(text: str, limit: int = 90) -> str:
+    """The note as it read, quoted, and cut only when it is very long."""
+    flat = " ".join(text.split())
+    if len(flat) <= limit:
+        return repr(flat)
+    return repr(flat[:limit] + "...")
+
+
 _AI_OPS: dict[str, Callable[[Any, Any, "FixContext"], Optional[str]]] = {
     "recolor_fill": _ai_recolor_fill,
     "recolor_line": _ai_recolor_line,
@@ -1193,6 +1372,7 @@ _AI_OPS: dict[str, Callable[[Any, Any, "FixContext"], Optional[str]]] = {
     "delete_empty_paragraphs": _ai_delete_empty_paragraphs,
     "move": _ai_move,
     "resize": _ai_resize,
+    "remove_note": _ai_remove_note,
 }
 
 
@@ -1258,6 +1438,8 @@ FIXERS: dict[str, Fixer] = {
     "typography.terminal_punctuation": fix_terminal_punctuation,
     "typography.orphan_widow": fix_orphan_widow,
     "font.family.theme_drift": fix_theme_font_drift,
+    "font.family.arabic": fix_arabic_font,
+    "typography.rtl_not_set": fix_rtl_not_set,
 }
 
 # The order fixes run in, low first. Two fixes can touch one shape, and then
@@ -1272,6 +1454,8 @@ FIX_ORDER: dict[str, int] = {
     "typography.terminal_punctuation": 10,
     "typography.orphan_widow": 10,
     "font.family.theme_drift": 10,
+    "font.family.arabic": 10,
+    "typography.rtl_not_set": 10,
     # The series fixes, together: each one puts a shape back where the rest of
     # its set already is, so they cannot fight each other, and both want to
     # run before the clamps below decide anything about the same shape.

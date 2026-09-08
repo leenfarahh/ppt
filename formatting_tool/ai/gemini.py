@@ -71,8 +71,9 @@ def generate_json(
     *,
     model: str,
     contents: Any,
-    system_instruction: str,
+    system_instruction: Optional[str],
     schema: dict[str, Any],
+    cached_content: Optional[str] = None,
     thinking_budget: int,
     max_output_tokens: int,
     api_key_env: str = "GEMINI_API_KEY",
@@ -104,6 +105,7 @@ def generate_json(
                 contents=contents,
                 config=types.GenerateContentConfig(
                     system_instruction=system_instruction,
+                    cached_content=cached_content,
                     max_output_tokens=max_output_tokens,
                     thinking_config=types.ThinkingConfig(
                         thinking_budget=thinking_budget

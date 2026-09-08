@@ -218,6 +218,14 @@ def run(config: RunConfig) -> ValidationReport:
     # between what was checked and what is printed is the skipped rules.
     report.stats = summarize_report(report)
     report.ai_summary = " ".join(summaries) or None
+    # The values the findings were measured against, carried so that applying
+    # a fix later does not have to read the master a second time. That second
+    # read happens minutes after the run, by which time the file may be gone
+    # -- an uploaded master lives in a temp directory that outlives nothing in
+    # particular -- and even where it survives it could have changed
+    # underneath, which would check a proposal against a master the report
+    # never saw.
+    report.spec = spec
     return report
 
 

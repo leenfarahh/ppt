@@ -49,8 +49,26 @@ GEOMETRIC = frozenset(
         "space.safe_margin",
         "space.alignment_grid",
         "space.repeat_out_of_line",
+        "space.satellite_offset",
+        "title.position_inconsistent",
+        "logo.geometry",
     }
 )
+
+# Geometric fixes measured as a delta from where the shape was when the report
+# was written, rather than as a position to move to. Every other fix names an
+# absolute target and is therefore idempotent -- run it twice and the second
+# run finds the shape already correct. These cannot be: the delta is only true
+# of the position it was measured against, so a second fix that has already
+# moved the shape makes this one wrong by exactly the amount of the first.
+#
+# On a real deck `space.repeat_out_of_line` and `space.satellite_offset` both
+# fired on one shape, describing the same 0.15in drift. The edge fix ran first
+# and corrected it; this one then subtracted the same 0.15in again from the
+# corrected position. The alignment guard caught the result, but it caught it
+# as "would break an alignment", which tells the designer nothing about what
+# actually went wrong.
+RELATIVE = frozenset({"space.satellite_offset"})
 
 # Whitespace that is safe to strip from the end of a paragraph. A vertical tab
 # is a soft line break, which is `typography.manual_line_break`'s business and
@@ -61,10 +79,20 @@ _INCHES = re.compile(r"(-?\d+(?:\.\d+)?)\s*in")
 _EDGE = re.compile(r"\b(left|top)\s+(-?\d+(?:\.\d+)?)\s*in")
 _MARGIN = re.compile(r"\b(top|right|bottom|left)\s+(-?\d+(?:\.\d+)?)\s*in")
 _QUOTED_FONT = re.compile(r"explicit\s+(.+?)\s*$")
+# "0.42, 1.19in", and the signed form "offset +3.04, +0.00in". Both numbers and
+# the unit together, so a lone measurement elsewhere in the same sentence
+# cannot be read as half a point.
+_POINT = re.compile(r"([-+]?\d+(?:\.\d+)?)\s*,\s*([-+]?\d+(?:\.\d+)?)\s*in")
 # "theme:accent1 #C00000" -> C00000, and "#DADADA" -> DADADA. Six hex digits
 # anchored on the hash, so a delta-E or a shape name in the same sentence
 # cannot be mistaken for a colour.
 _HEX = re.compile(r"#([0-9A-Fa-f]{6})(?![0-9A-Fa-f])")
+# "theme:accent1 #A32020" on a finding's `found` -- the colour is read from a
+# slot rather than set on the shape, which changes who can fix it.
+_THEME_BOUND = re.compile(r"^theme:\w+\s+#", re.IGNORECASE)
+# "graphic #A32020" -- a colour inside an icon's SVG rather than a fill on the
+# shape, which changes how it is written and not just what it is set to.
+_GRAPHIC = re.compile(r"^graphic\s+#", re.IGNORECASE)
 
 
 # --------------------------------------------------------------------------- #
@@ -182,6 +210,114 @@ def fix_repeat_out_of_line(shape: Any, issue: Issue, ctx: "FixContext") -> Optio
     return f"aligned the {side} edge {moved:+.2f}in onto the set at {target:.2f}in"
 
 
+def fix_satellite_offset(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[str]:
+    """Put one copy of a repeated pairing back on the offset its cohort shares.
+
+    The finding carries both numbers -- the offset the majority sits at and
+    the offset this one sits at -- so the move is their difference and nothing
+    here has to decide anything. Applied to the shape's own left and top
+    rather than to its centre: the offsets are centre to centre, but the
+    satellite is not being resized and its partner is not moving, so the two
+    deltas are the same number.
+
+    The partner could itself be moved later in the run, which would reopen the
+    gap. It cannot be moved *earlier*: this shares its rank with the other
+    series fix, and both run before the canvas and margin clamps, which are
+    the only fixes that touch a shape no finding named.
+    """
+    expected = _point(issue.expected)
+    found = _point(issue.found)
+    if expected is None or found is None:
+        return None
+    if shape.left is None or shape.top is None:
+        return None
+
+    dx = _emu(found[0] - expected[0])
+    dy = _emu(found[1] - expected[1])
+    if not dx and not dy:
+        return None
+
+    shape.left -= dx
+    shape.top -= dy
+    return (
+        f"moved {-dx / EMU_PER_INCH:+.2f}, {-dy / EMU_PER_INCH:+.2f}in back "
+        "onto the offset the rest of the set shares"
+    )
+
+
+def fix_title_position(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[str]:
+    """Move a drifting title onto the position the rest of the deck's titles hold.
+
+    The rule only reports per slide once a real majority agrees on a position,
+    so "which one is right" was settled before this ran; what is left is the
+    move, which is the same act as typing the modal left and top into the
+    position box.
+
+    Bounded, though. A title several inches from the modal position is not
+    drift, it is a different arrangement -- a section divider, a cover -- that
+    happens to use a title placeholder, and dragging it up to join the content
+    slides would wreck the slide to satisfy a warning.
+    """
+    return _move_onto(shape, issue, ctx, "the title", "the rest of the deck")
+
+
+def fix_logo_geometry(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[str]:
+    """Move a logo back onto the master's position.
+
+    Only the position half of this rule. The other two things it reports are
+    not mechanical: a logo below the minimum width has to be scaled, and
+    growing it pushes into whatever the designer left around it, which the
+    move guard cannot see because the guard compares positions; and which
+    corner a logo belongs in is the composition's business, not arithmetic's.
+    Both say so rather than failing silently.
+    """
+    if _point(issue.expected) is None:
+        if "wide" in (issue.expected or ""):
+            raise LeaveAlone(
+                "scaling the logo up to the minimum width changes the space "
+                "the designer left around it, which is a composition change "
+                "rather than a correction"
+            )
+        raise LeaveAlone("which corner the logo belongs in is a design call")
+    return _move_onto(shape, issue, ctx, "the logo", "the master")
+
+
+def _move_onto(
+    shape: Any,
+    issue: Issue,
+    ctx: "FixContext",
+    what: str,
+    whose: str,
+) -> Optional[str]:
+    """Move a shape onto the "left, topin" position a finding names.
+
+    Shared by the two fixes that have an exact destination rather than a
+    delta. The drift ceiling is the one the repeat rules use, and for the same
+    reason: past it the shape was put there, not left there.
+    """
+    target = _point(issue.expected)
+    if target is None or shape.left is None or shape.top is None:
+        return None
+
+    wanted_left, wanted_top = _emu(target[0]), _emu(target[1])
+    if (wanted_left, wanted_top) == (shape.left, shape.top):
+        return None
+
+    dx = (wanted_left - shape.left) / EMU_PER_INCH
+    dy = (wanted_top - shape.top) / EMU_PER_INCH
+    if max(abs(dx), abs(dy)) > ctx.max_drift_in:
+        raise LeaveAlone(
+            f"it sits {max(abs(dx), abs(dy)):.2f}in away, too far to be drift; "
+            "a slide that places its content this differently is doing so on "
+            "purpose"
+        )
+
+    shape.left, shape.top = wanted_left, wanted_top
+    return (
+        f"moved {what} {dx:+.2f}, {dy:+.2f}in onto the position {whose} holds"
+    )
+
+
 def fix_safe_margin(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[str]:
     """Move a shape back inside the safe margin, the shortest distance.
 
@@ -241,6 +377,45 @@ def fix_safe_margin(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[str
 # designer sees which colours were moved and where to.
 
 
+def _refuse_theme_bound(issue: Issue) -> None:
+    """Stand down on a colour the shape does not own.
+
+    A theme-bound colour carries no RGB: the shape reads a slot, and the slot
+    is right. What is wrong is the theme the deck brought with it from the
+    file it was built in, and writing a literal colour onto the shape would
+    hide that while leaving every other shape reading the same slot untouched
+    -- and would survive a later rebuild as a hardcoded exception to a palette
+    that had since been corrected.
+    """
+    if _THEME_BOUND.search(issue.found or ""):
+        raise LeaveAlone(
+            "this colour is bound to the theme, so the shape is not what is "
+            "wrong: the deck carries its own theme. Rebuild onto the master, "
+            "which replaces it and corrects every colour bound to it at once"
+        )
+
+
+def _refuse_untargeted(issue: Issue) -> None:
+    """Stand down on a finding that names no colour to move to.
+
+    The rule sets `expected` to a palette entry only when one is close enough,
+    the same hue family, and neutral or chromatic to match. When nothing
+    qualifies it says "brand palette" and means it: the palette holds no
+    version of this colour, and which entry replaces it is a design decision.
+
+    Before this, `expected` always named the nearest entry however far away it
+    was, and this fixer applied it. That recoloured a red to an orange 33
+    delta-E away and a page of blue headings to a neutral -- targets the rule
+    itself had already declined to recommend.
+    """
+    if _hex_of(issue.expected) is None:
+        raise LeaveAlone(
+            "no palette entry is this colour, so which one replaces it is a "
+            "design call; the finding says which is nearest and how far off "
+            "it is"
+        )
+
+
 def fix_off_palette_text(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[str]:
     """Recolour the runs that carry the off-palette colour, and only those.
 
@@ -248,6 +423,8 @@ def fix_off_palette_text(shape: Any, issue: Issue, ctx: "FixContext") -> Optiona
     a shape routinely holds one run in the brand navy and one somebody typed
     over in black, and the finding is about the second.
     """
+    _refuse_theme_bound(issue)
+    _refuse_untargeted(issue)
     target = _hex_of(issue.expected)
     current = _hex_of(issue.found)
     if not target or not current or not _has_text(shape):
@@ -271,10 +448,14 @@ def fix_off_palette_text(shape: Any, issue: Issue, ctx: "FixContext") -> Optiona
 
 
 def fix_off_palette_shape(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[str]:
-    """Recolour a shape's fill or its outline, whichever the finding named."""
+    """Recolour a shape's fill, its outline, or the SVG an icon draws from."""
+    _refuse_theme_bound(issue)
+    _refuse_untargeted(issue)
     target = _hex_of(issue.expected)
     if not target:
         return None
+    if _GRAPHIC.search(issue.found or ""):
+        return _recolor_icon(shape, issue, target)
     wants_outline = "outline" in (issue.message or "").lower()
 
     from pptx.dml.color import RGBColor  # noqa: PLC0415 - lazy heavy dependency
@@ -288,6 +469,46 @@ def fix_off_palette_shape(shape: Any, issue: Issue, ctx: "FixContext") -> Option
     shape.fill.solid()
     shape.fill.fore_color.rgb = colour
     return f"recoloured the fill to the nearest palette entry #{target}"
+
+
+def _recolor_icon(shape: Any, issue: Issue, target: str) -> Optional[str]:
+    """Rewrite the colour inside an icon's SVG.
+
+    An icon is a `p:pic`, so it has no fill to set: PowerPoint calls this a
+    Graphics Fill and the colour lives inside the SVG part the picture points
+    at. Setting `shape.fill` on one does nothing at all -- verified against
+    desktop PowerPoint, which writes byte-identical XML for it -- which is why
+    icons stayed the wrong colour however the finding was worded.
+
+    The SVG part is shared by every copy of the same icon, so recolouring one
+    recolours all of them. That is almost always what a designer wants from a
+    row of identical icons and is said in the outcome either way, because
+    "changed 1 shape" would be a lie about a file where six moved.
+    """
+    from .. import svgicon  # noqa: PLC0415 - keeps the import off the hot path
+
+    part = svgicon.svg_part(shape)
+    if part is None:
+        raise LeaveAlone(
+            "this icon is not an SVG, so its colour is baked into the image; "
+            "replacing it is a designer's call"
+        )
+    current = _hex_of(issue.found)
+    if not current:
+        return None
+    try:
+        markup = part.blob.decode("utf-8", "ignore")
+        rewritten, changed = svgicon.recolor(markup, current, target)
+        if not changed:
+            return None
+        part._blob = rewritten.encode("utf-8")
+    except Exception as exc:
+        raise LeaveAlone(f"the icon's drawing could not be rewritten: {exc}") from exc
+    return (
+        f"recoloured the icon from #{current} to #{target} "
+        f"({changed} statement(s) in its drawing, which every copy of this "
+        "icon shares)"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -352,6 +573,44 @@ def fix_manual_line_break(shape: Any, issue: Issue, ctx: "FixContext") -> Option
     return f"removed {removed} soft return(s)" if removed else None
 
 
+def fix_terminal_punctuation(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[str]:
+    """Take the full stop off the end of a title.
+
+    Registered where the rest of `typography` is not, because this is not a
+    copy edit. A title is a label, not a sentence, and the full stop on the
+    end of one is a typing artefact rather than something a writer chose --
+    which is why the rule only fires on the title role in the first place.
+    Nothing about the wording changes, and putting it back is one keystroke.
+
+    An ellipsis is the exception and is left alone: three dots at the end of a
+    title are always deliberate, and stripping one of them would turn a chosen
+    mark into a typo.
+    """
+    if not _has_text(shape):
+        return None
+
+    paragraphs = [p for p in shape.text_frame.paragraphs if p.text.strip()]
+    if not paragraphs:
+        return None
+
+    # The last run with text in it, which is where the stop sits. Whitespace-
+    # only runs after it are skipped rather than trusted, because a title
+    # ending "Title. " keeps its stop in the run before the space.
+    for run in reversed(list(paragraphs[-1].runs)):
+        text = run.text.rstrip(_TRAILING)
+        if not text:
+            continue
+        if text.endswith("...") or text.endswith("…"):
+            raise LeaveAlone(
+                "the title ends in an ellipsis, which is a mark somebody chose"
+            )
+        if not text.endswith("."):
+            return None
+        run.text = text[:-1]
+        return "removed the full stop from the end of the title"
+    return None
+
+
 def fix_theme_font_drift(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[str]:
     """Clear a run-level typeface so the run inherits from the layout again.
 
@@ -378,6 +637,213 @@ def fix_theme_font_drift(shape: Any, issue: Issue, ctx: "FixContext") -> Optiona
 
 
 # --------------------------------------------------------------------------- #
+# The AI layer's proposed corrections
+# --------------------------------------------------------------------------- #
+#
+# A rule finding carries a measured target and its fixer reads the number back
+# out. An AI finding carries prose, which is why none of them were ever
+# fixable: "the caption should sit closer to the chart" has nothing to parse.
+#
+# `Issue.fix` is where the model puts a target a machine can act on, and this
+# is what acts on it. The whole safety of it is that a proposal is not an
+# instruction. Every value is checked against the master before the file is
+# touched -- a colour has to be a palette entry, a typeface has to be
+# approved, a size has to sit in the role's range -- so the worst a bad
+# proposal can do is cost itself. Without a master to check against, nothing
+# here runs at all, which is the honest answer rather than a hopeful one.
+
+def fix_ai_action(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[str]:
+    """Carry out the action the AI layer proposed, once it checks out."""
+    action = issue.fix
+    if action is None or not action.valid:
+        return None
+    if ctx.brand is None:
+        raise LeaveAlone(
+            "there is no brand reference to check this proposal against, so "
+            "it cannot be applied; re-run with the master or a guidelines file"
+        )
+    handler = _AI_OPS.get(action.op)
+    if handler is None:                     # pragma: no cover - FIX_OPS guards it
+        raise LeaveAlone(f"no handler is written for {action.op!r}")
+    return handler(shape, action, ctx)
+
+
+def _ai_recolor_fill(shape: Any, action: Any, ctx: "FixContext") -> Optional[str]:
+    return _ai_recolor(shape, action, ctx, "fill")
+
+
+def _ai_recolor_line(shape: Any, action: Any, ctx: "FixContext") -> Optional[str]:
+    return _ai_recolor(shape, action, ctx, "outline")
+
+
+def _ai_recolor(shape: Any, action: Any, ctx: "FixContext", kind: str):
+    label = _palette_entry(action.hex, ctx)
+    from pptx.dml.color import RGBColor  # noqa: PLC0415 - lazy heavy dependency
+
+    colour = RGBColor.from_string(action.hex)
+    if kind == "outline":
+        shape.line.color.rgb = colour
+        return f"recoloured the outline to {label} #{action.hex}"
+    shape.fill.solid()
+    shape.fill.fore_color.rgb = colour
+    return f"recoloured the fill to {label} #{action.hex}"
+
+
+def _ai_recolor_text(shape: Any, action: Any, ctx: "FixContext") -> Optional[str]:
+    label = _palette_entry(action.hex, ctx)
+    if not _has_text(shape):
+        return None
+    from pptx.dml.color import RGBColor  # noqa: PLC0415 - lazy heavy dependency
+
+    colour = RGBColor.from_string(action.hex)
+    changed = 0
+    for paragraph in shape.text_frame.paragraphs:
+        for run in paragraph.runs:
+            if not run.text.strip():
+                continue
+            run.font.color.rgb = colour
+            changed += 1
+    if not changed:
+        return None
+    return f"recoloured {changed} run(s) to {label} #{action.hex}"
+
+
+def _ai_set_font(shape: Any, action: Any, ctx: "FixContext") -> Optional[str]:
+    wanted = (action.font or "").strip()
+    approved = {name.casefold(): name for name in ctx.brand.allowed_fonts}
+    if wanted.casefold() not in approved:
+        raise LeaveAlone(
+            f"{wanted!r} is not one of the approved typefaces "
+            f"({', '.join(sorted(ctx.brand.allowed_fonts)) or 'none declared'})"
+        )
+    if not _has_text(shape):
+        return None
+    name = approved[wanted.casefold()]
+    changed = 0
+    for paragraph in shape.text_frame.paragraphs:
+        for run in paragraph.runs:
+            if run.text.strip() and run.font.name != name:
+                run.font.name = name
+                changed += 1
+    return f"set {changed} run(s) in {name}" if changed else None
+
+
+def _ai_set_font_size(shape: Any, action: Any, ctx: "FixContext") -> Optional[str]:
+    size = action.size_pt
+    if not size or size <= 0:
+        return None
+    low, high = ctx.brand.size_range(_role_of(shape))
+    if (low is not None and size < low) or (high is not None and size > high):
+        raise LeaveAlone(
+            f"{size:g}pt is outside the {low if low is not None else '?'}-"
+            f"{high if high is not None else '?'}pt range the brand system "
+            "sets for this role"
+        )
+    if not _has_text(shape):
+        return None
+    from pptx.util import Pt  # noqa: PLC0415 - lazy heavy dependency
+
+    changed = 0
+    for paragraph in shape.text_frame.paragraphs:
+        for run in paragraph.runs:
+            if run.text.strip():
+                run.font.size = Pt(size)
+                changed += 1
+    return f"set {changed} run(s) to {size:g}pt" if changed else None
+
+
+def _ai_disable_autofit(shape: Any, action: Any, ctx: "FixContext") -> Optional[str]:
+    """Stop a box shrinking its own type to hide that the copy is too long.
+
+    The shrink is not a size somebody chose, it is PowerPoint papering over an
+    overflow, and it is why a deck can read at six different sizes while every
+    box claims the same one. Turning it off makes the overflow visible, which
+    is the point: how much copy fits is a decision, and it goes back to a
+    person rather than being hidden by the software.
+    """
+    if not _has_text(shape):
+        return None
+    from pptx.enum.text import MSO_AUTO_SIZE  # noqa: PLC0415 - lazy
+
+    frame = shape.text_frame
+    if frame.auto_size == MSO_AUTO_SIZE.NONE:
+        return None
+    frame.auto_size = MSO_AUTO_SIZE.NONE
+    return "turned off shrink-to-fit, so the type keeps the size it is set at"
+
+
+def _ai_delete_empty_paragraphs(
+    shape: Any, action: Any, ctx: "FixContext"
+) -> Optional[str]:
+    """Drop empty paragraphs from the end of a text frame.
+
+    Distinct from `typography.whitespace`, which works inside a paragraph and
+    cannot see these: a trailing empty paragraph carries no runs to strip. It
+    is what stops a vertically centred box from looking centred, and the AI
+    layer is where it turns up, because the rendered slide is where it shows.
+    """
+    if not _has_text(shape):
+        return None
+    paragraphs = list(shape.text_frame.paragraphs)
+    removed = 0
+    for paragraph in reversed(paragraphs[1:]):      # never the last one left
+        if paragraph.text.strip():
+            break
+        paragraph._p.getparent().remove(paragraph._p)
+        removed += 1
+    return f"removed {removed} empty paragraph(s) from the end" if removed else None
+
+
+_AI_OPS: dict[str, Callable[[Any, Any, "FixContext"], Optional[str]]] = {
+    "recolor_fill": _ai_recolor_fill,
+    "recolor_line": _ai_recolor_line,
+    "recolor_text": _ai_recolor_text,
+    "set_font": _ai_set_font,
+    "set_font_size": _ai_set_font_size,
+    "disable_autofit": _ai_disable_autofit,
+    "delete_empty_paragraphs": _ai_delete_empty_paragraphs,
+}
+
+
+def _palette_entry(value: Optional[str], ctx: "FixContext") -> str:
+    """The palette label for a proposed colour, or a refusal.
+
+    Exact membership, not nearest. "Nearest" is how a colour the model liked
+    the look of gets written into a client deck wearing a brand label.
+    """
+    wanted = (value or "").strip().lstrip("#").upper()
+    if len(wanted) != 6:
+        raise LeaveAlone(f"{value!r} is not a six-digit colour")
+    for label, entry in ctx.brand.palette.items():
+        if str(entry).strip().lstrip("#").upper() == wanted:
+            return label
+    raise LeaveAlone(
+        f"#{wanted} is not in the brand palette, so it is a colour the model "
+        "chose rather than one the master declares"
+    )
+
+
+def _role_of(shape: Any) -> str:
+    """Best guess at a shape's type role, from its placeholder or its name."""
+    try:
+        if shape.is_placeholder:
+            token = str(shape.placeholder_format.type or "")
+            if "TITLE" in token and "SUB" not in token:
+                return "title"
+            if "SUBTITLE" in token:
+                return "subtitle"
+            if "BODY" in token or "OBJECT" in token:
+                return "body"
+    except Exception:
+        pass
+    name = str(getattr(shape, "name", "") or "").casefold()
+    for role in ("subtitle", "title", "footer", "body"):
+        if name.startswith(role):
+            return role
+    return "body"
+
+
+# --------------------------------------------------------------------------- #
 # Registry
 # --------------------------------------------------------------------------- #
 
@@ -390,8 +856,12 @@ FIXERS: dict[str, Fixer] = {
     "space.off_canvas": fix_off_canvas,
     "space.safe_margin": fix_safe_margin,
     "space.repeat_out_of_line": fix_repeat_out_of_line,
+    "space.satellite_offset": fix_satellite_offset,
+    "title.position_inconsistent": fix_title_position,
+    "logo.geometry": fix_logo_geometry,
     "typography.whitespace": fix_whitespace,
     "typography.manual_line_break": fix_manual_line_break,
+    "typography.terminal_punctuation": fix_terminal_punctuation,
     "font.family.theme_drift": fix_theme_font_drift,
 }
 
@@ -404,8 +874,15 @@ FIXERS: dict[str, Fixer] = {
 FIX_ORDER: dict[str, int] = {
     "typography.whitespace": 10,
     "typography.manual_line_break": 10,
+    "typography.terminal_punctuation": 10,
     "font.family.theme_drift": 10,
+    # The series fixes, together: each one puts a shape back where the rest of
+    # its set already is, so they cannot fight each other, and both want to
+    # run before the clamps below decide anything about the same shape.
     "space.repeat_out_of_line": 20,
+    "space.satellite_offset": 20,
+    "title.position_inconsistent": 20,
+    "logo.geometry": 20,
     "space.off_canvas": 90,
     # Last of all, and strictly stronger: the safe margin sits inside the
     # canvas, so a shape moved within it satisfies the canvas too.
@@ -426,37 +903,49 @@ NEEDS_A_PERSON: dict[str, str] = {
     "logo.unapproved_asset": "needs the approved logo file to swap in",
     "title.missing": "needs copy that has to be written",
     "title.detached_textbox": "moving copy between shapes changes the design",
-    "title.position_inconsistent": "which position is the right one is a design call",
     "subtitle.structure": "needs copy that has to be written",
     "size.autofit_shrink": "the fix is to edit the copy, not to resize the box",
     "layout.not_in_master": "use `rebuild`, which recreates the slide on the layout",
     "layout.header_footer_missing": "the master has to be edited, not the deck",
     "layout.band_missing": "the master has to be edited, not the deck",
-    "color.inconsistent_use": "which of the colours in play is correct is a design call",
+    "color.theme_mismatch": (
+        "the deck carries its own theme, so no shape can be corrected into "
+        "the right colour; use `rebuild`, which replaces the theme"
+    ),
+    "color.inconsistent_variants": (
+        "which of the near-identical colours in play is the intended one is a "
+        "design call"
+    ),
     "font.family.unapproved": "which approved face replaces it is a design call",
     "font.family.mixed_in_shape": "which of the faces in play is correct is a design call",
     "size.role.out_of_range": "resizing type changes how much copy fits",
     "size.role.inconsistent": "resizing type changes how much copy fits",
     "space.text_overflow": "the fix is to edit the copy or resize the box",
     "typography.orphan_widow": "the fix is to edit the copy",
-    "typography.terminal_punctuation": "editing the copy is the writer's call",
 }
 
 
 def fixer_for(issue: Issue) -> Optional[Fixer]:
     """The fixer for a finding, or None when it needs a person.
 
-    AI findings never have one. They are judgements about a slide, phrased for
-    a reader, and there is no target to move to.
+    An AI finding has one only when it carries a `fix`: the model named an
+    action from a closed set and a target that can be checked against the
+    master. Most do not, and most should not -- what the AI layer is for is
+    the judgement the rules cannot make, and a judgement has no op.
     """
-    if issue.source.value != "rule" or not issue.rule_id:
+    if issue.source.value != "rule":
+        return fix_ai_action if (issue.fix and issue.fix.valid) else None
+    if not issue.rule_id:
         return None
     return FIXERS.get(issue.rule_id)
 
 
 def why_not_fixable(issue: Issue) -> str:
     if issue.source.value != "rule":
-        return "an AI observation, not a measured target"
+        return (
+            "an AI observation with no mechanical action behind it, which is "
+            "what most of them are"
+        )
     return NEEDS_A_PERSON.get(
         issue.rule_id or "", "no fixer is written for this rule"
     )
@@ -490,6 +979,19 @@ def _edge(expected: Optional[str]) -> tuple[Optional[str], Optional[float]]:
         return None, None
     match = _EDGE.search(expected)
     return (match.group(1), float(match.group(2))) if match else (None, None)
+
+
+def _point(text: Optional[str]) -> Optional[tuple[float, float]]:
+    """"0.42, 1.19in" -> (0.42, 1.19), and the signed offset form with it.
+
+    None when the text names no point at all, which is how the logo fixer
+    tells a position finding from the width and corner findings the same rule
+    also reports.
+    """
+    if not text:
+        return None
+    match = _POINT.search(text)
+    return (float(match.group(1)), float(match.group(2))) if match else None
 
 
 def _margins(expected: Optional[str]) -> dict[str, float]:

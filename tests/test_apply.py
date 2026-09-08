@@ -619,3 +619,286 @@ def test_a_deck_level_finding_says_so_rather_than_blaming_the_deck(
 
     assert result.applied == []
     assert "the deck as a whole" in result.skipped[0].detail
+
+
+
+# --------------------------------------------------------------------------- #
+# The fixers added after the "187 need a designer" count was looked into
+# --------------------------------------------------------------------------- #
+
+def test_a_satellite_is_nudged_back_onto_the_offset_its_cohort_shares(
+    tmp_path: Path,
+) -> None:
+    pytest.importorskip("pptx")
+    from pptx import Presentation
+    from pptx.util import Inches
+
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    box = slide.shapes.add_textbox(
+        Inches(6.63), Inches(2.42), Inches(0.53), Inches(0.63)
+    )
+    box.name = "Text Placeholder 30"
+    deck = tmp_path / "messy.pptx"
+    prs.save(str(deck))
+
+    issue = _issue(
+        "space.satellite_offset", slide=1, shape=box.name, shape_id=box.shape_id,
+        expected=(
+            "offset +3.04, +0.00in from the 4.72 x 0.63in shape it pairs with, "
+            "as the other 5 have"
+        ),
+        found="offset +3.19, +0.01in",
+    )
+    out = tmp_path / "fixed.pptx"
+
+    result = apply_fixes(deck, [issue], out, selected=[issue.id])
+
+    assert len(result.applied) == 1
+    fixed = Presentation(str(out)).slides[0].shapes[0]
+    assert fixed.left == Inches(6.48)
+    assert fixed.top == Inches(2.41)
+
+
+def test_a_satellite_fix_stands_down_once_another_fix_has_moved_the_shape(
+    tmp_path: Path,
+) -> None:
+    """The whole hazard of a delta: it is only true of the position it was
+    measured against. On a real deck both repeat rules fired on one shape and
+    described the same 0.15in drift, and applying both subtracted it twice.
+    """
+    pytest.importorskip("pptx")
+    from pptx import Presentation
+    from pptx.util import Inches
+
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    box = slide.shapes.add_textbox(
+        Inches(6.63), Inches(2.42), Inches(0.53), Inches(0.63)
+    )
+    box.name = "Text Placeholder 30"
+    deck = tmp_path / "messy.pptx"
+    prs.save(str(deck))
+
+    edge = _issue(
+        "space.repeat_out_of_line", slide=1, shape=box.name, shape_id=box.shape_id,
+        expected="left 6.48in, as the rest of the set",
+    )
+    offset = _issue(
+        "space.satellite_offset", slide=1, shape=box.name, shape_id=box.shape_id,
+        expected="offset +3.04, +0.00in from the 4.72 x 0.63in shape it pairs with",
+        found="offset +3.19, +0.01in",
+    )
+    out = tmp_path / "fixed.pptx"
+
+    result = apply_fixes(deck, [edge, offset], out, selected=[edge.id, offset.id])
+
+    assert [o.issue.rule_id for o in result.applied] == ["space.repeat_out_of_line"]
+    assert "already moved this shape" in result.skipped[0].detail
+    # 6.33in is where the doubled subtraction would have put it.
+    assert Presentation(str(out)).slides[0].shapes[0].left == Inches(6.48)
+
+
+def test_a_drifting_title_is_moved_onto_the_decks_title_position(
+    tmp_path: Path,
+) -> None:
+    pytest.importorskip("pptx")
+    from pptx import Presentation
+    from pptx.util import Inches
+
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    box = slide.shapes.add_textbox(
+        Inches(0.71), Inches(0.63), Inches(12.36), Inches(0.92)
+    )
+    box.name = "Title 1"
+    deck = tmp_path / "messy.pptx"
+    prs.save(str(deck))
+
+    issue = _issue(
+        "title.position_inconsistent", category=Category.TITLE,
+        slide=1, shape=box.name, shape_id=box.shape_id,
+        expected="0.48, 0.42in", found="0.71, 0.63in",
+    )
+    out = tmp_path / "fixed.pptx"
+
+    result = apply_fixes(deck, [issue], out, selected=[issue.id])
+
+    assert len(result.applied) == 1
+    fixed = Presentation(str(out)).slides[0].shapes[0]
+    assert (fixed.left, fixed.top) == (Inches(0.48), Inches(0.42))
+
+
+def test_a_title_placed_somewhere_else_entirely_is_left_alone(tmp_path: Path) -> None:
+    """A divider or a cover is not a content slide with a drifting title."""
+    pytest.importorskip("pptx")
+    from pptx import Presentation
+    from pptx.util import Inches
+
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    box = slide.shapes.add_textbox(
+        Inches(0.48), Inches(3.10), Inches(12.36), Inches(0.92)
+    )
+    box.name = "Title 1"
+    deck = tmp_path / "messy.pptx"
+    prs.save(str(deck))
+
+    issue = _issue(
+        "title.position_inconsistent", category=Category.TITLE,
+        slide=1, shape=box.name, shape_id=box.shape_id,
+        expected="0.48, 0.42in", found="0.48, 3.10in",
+    )
+
+    result = apply_fixes(deck, [issue], tmp_path / "fixed.pptx", selected=[issue.id])
+
+    assert not result.applied
+    assert "too far to be drift" in result.skipped[0].detail
+
+
+def test_only_the_position_half_of_the_logo_rule_is_mechanical(
+    tmp_path: Path,
+) -> None:
+    """One rule id, three findings. Two of them are composition decisions and
+    say so rather than failing silently.
+    """
+    pytest.importorskip("pptx")
+    from pptx import Presentation
+    from pptx.util import Inches
+
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    box = slide.shapes.add_textbox(Inches(0.90), Inches(0.55), Inches(1.2), Inches(0.4))
+    box.name = "Logo"
+    deck = tmp_path / "messy.pptx"
+    prs.save(str(deck))
+
+    def _logo(**kwargs):
+        return _issue(
+            "logo.geometry", category=Category.LOGO, slide=1,
+            shape=box.name, shape_id=box.shape_id, **kwargs,
+        )
+
+    position = _logo(expected="0.48, 0.42in", found="0.90, 0.55in")
+    width = _logo(expected=">= 2.00in wide", found="1.20in")
+    corner = _logo(expected="top-left or top-right", found="bottom-right")
+
+    result = apply_fixes(
+        deck, [position], tmp_path / "moved.pptx", selected=[position.id]
+    )
+    assert len(result.applied) == 1
+    moved = Presentation(str(tmp_path / "moved.pptx")).slides[0].shapes[0]
+    assert (moved.left, moved.top) == (Inches(0.48), Inches(0.42))
+
+    for issue, reason in ((width, "minimum width"), (corner, "which corner")):
+        skipped = apply_fixes(
+            deck, [issue], tmp_path / "same.pptx", selected=[issue.id]
+        )
+        assert not skipped.applied
+        assert reason in skipped.skipped[0].detail
+
+
+def test_the_full_stop_comes_off_a_title(tmp_path: Path) -> None:
+    pytest.importorskip("pptx")
+    from pptx import Presentation
+    from pptx.util import Inches
+
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    box = slide.shapes.add_textbox(Inches(1), Inches(1), Inches(6), Inches(1))
+    box.name = "Title 1"
+    box.text_frame.text = "Where the value comes from. "
+    deck = tmp_path / "messy.pptx"
+    prs.save(str(deck))
+
+    issue = _issue(
+        "typography.terminal_punctuation", category=Category.TYPOGRAPHY,
+        severity=Severity.INFO, slide=1, shape=box.name, shape_id=box.shape_id,
+        expected="no terminal punctuation on titles",
+        found="Where the value comes from.",
+    )
+    out = tmp_path / "fixed.pptx"
+
+    result = apply_fixes(deck, [issue], out, selected=[issue.id])
+
+    assert len(result.applied) == 1
+    text = Presentation(str(out)).slides[0].shapes[0].text_frame.text
+    assert text == "Where the value comes from"
+
+
+def test_an_ellipsis_on_a_title_is_left_alone(tmp_path: Path) -> None:
+    """Three dots are a mark somebody chose; taking one off makes it a typo."""
+    pytest.importorskip("pptx")
+    from pptx import Presentation
+    from pptx.util import Inches
+
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    box = slide.shapes.add_textbox(Inches(1), Inches(1), Inches(6), Inches(1))
+    box.name = "Title 1"
+    box.text_frame.text = "And then..."
+    deck = tmp_path / "messy.pptx"
+    prs.save(str(deck))
+
+    issue = _issue(
+        "typography.terminal_punctuation", category=Category.TYPOGRAPHY,
+        severity=Severity.INFO, slide=1, shape=box.name, shape_id=box.shape_id,
+        expected="no terminal punctuation on titles", found="And then...",
+    )
+
+    result = apply_fixes(deck, [issue], tmp_path / "fixed.pptx", selected=[issue.id])
+
+    assert not result.applied
+    assert "ellipsis" in result.skipped[0].detail
+
+
+# --------------------------------------------------------------------------- #
+# The classification itself
+# --------------------------------------------------------------------------- #
+#
+# Every one of these was a real gap. `space.satellite_offset` and
+# `logo.geometry` had neither a fixer nor an explanation, so the UI told the
+# designer "no fixer is written for this rule", which reads as an oversight
+# rather than an answer. And `NEEDS_A_PERSON` carried a key for
+# `color.inconsistent_use`, a rule id that does not exist -- the rule is
+# `color.inconsistent_variants` -- so its explanation could never fire.
+#
+# Neither is visible from a fixer's own tests: the fixers all passed. Only
+# comparing the two tables against the rule registry finds them.
+
+def _all_rule_ids() -> set[str]:
+    from formatting_tool.rules import build_default_rules, build_master_rules
+
+    return {
+        rule.id for rule in list(build_default_rules()) + list(build_master_rules())
+    }
+
+
+def test_every_rule_is_fixable_or_says_why_not() -> None:
+    """No finding may reach a designer without an answer to "why me?"."""
+    from formatting_tool.apply.fixers import FIXERS, NEEDS_A_PERSON
+
+    unanswered = sorted(
+        rule_id
+        for rule_id in _all_rule_ids()
+        if rule_id not in FIXERS and rule_id not in NEEDS_A_PERSON
+    )
+    assert unanswered == [], (
+        "these rules would be reported as 'no fixer is written for this rule': "
+        + ", ".join(unanswered)
+    )
+
+
+def test_the_tables_name_no_rule_that_does_not_exist() -> None:
+    """A stale key is an explanation that never appears, and looks fine."""
+    from formatting_tool.apply.fixers import FIXERS, NEEDS_A_PERSON
+
+    known = _all_rule_ids()
+    assert sorted(set(FIXERS) - known) == []
+    assert sorted(set(NEEDS_A_PERSON) - known) == []
+
+
+def test_a_rule_is_never_both_fixable_and_a_designers_job() -> None:
+    from formatting_tool.apply.fixers import FIXERS, NEEDS_A_PERSON
+
+    assert sorted(set(FIXERS) & set(NEEDS_A_PERSON)) == []

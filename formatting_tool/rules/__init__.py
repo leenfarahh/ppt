@@ -16,6 +16,7 @@ from .base import Rule, RuleContext
 from .colors import (
     InconsistentColorUseRule,
     OffPaletteShapeRule,
+    ThemeMismatchRule,
     OffPaletteTextRule,
 )
 from .fonts import MixedFontsInShapeRule, ThemeFontDriftRule, UnapprovedFontRule
@@ -108,6 +109,7 @@ def build_default_rules(
         UnapprovedFontRule(),
         MixedFontsInShapeRule(),
         ThemeFontDriftRule(),
+        ThemeMismatchRule(),
         OffPaletteTextRule(),
         OffPaletteShapeRule(),
         RoleFontSizeRule(),

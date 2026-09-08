@@ -4,7 +4,15 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from ..models import Category, Issue, LayoutChoice, Severity, Source
+from ..models import (
+    FIX_OPS,
+    Category,
+    FixAction,
+    Issue,
+    LayoutChoice,
+    Severity,
+    Source,
+)
 
 _CATEGORIES = [c.value for c in Category]
 _SEVERITIES = [s.value for s in Severity]
@@ -50,9 +58,52 @@ AI_ISSUE_SCHEMA: dict[str, Any] = {
             "type": "array",
             "items": {"type": "string"},
             "description": (
-                "Refs of the rule findings this restates or explains. "
-                "Empty when the finding is new."
+                "Refs of the rule findings this restates, explains or argues "
+                "with. Fill it whenever a rule finding names the same defect "
+                "on the same shape, however differently you word it; list "
+                "several when your sentence covers several. Empty ONLY when "
+                "no rule finding is about this defect at all. A labelled "
+                "restatement merges into the rule finding and inherits its "
+                "correction; an unlabelled one is reported twice."
             ),
+        },
+        "fix": {
+            "type": ["object", "null"],
+            "description": (
+                "The single mechanical action that would correct this "
+                "finding, or null when there is not one. Null is the common "
+                "case. The target is validated against the brand system "
+                "before it is applied and refused if it does not match, so "
+                "name the palette entry or approved typeface, never a value "
+                "you chose yourself."
+            ),
+            "properties": {
+                "op": {
+                    "type": "string",
+                    "enum": sorted(FIX_OPS),
+                    "description": (
+                        "recolor_fill / recolor_line / recolor_text need "
+                        "`hex`; set_font needs `font`; set_font_size needs "
+                        "`size_pt`; disable_autofit and "
+                        "delete_empty_paragraphs need nothing else."
+                    ),
+                },
+                "shape": {
+                    "type": ["string", "null"],
+                    "description": (
+                        "The exact shape name from the payload that this "
+                        "action applies to."
+                    ),
+                },
+                "hex": {
+                    "type": ["string", "null"],
+                    "description": "Six hex digits, no leading hash.",
+                },
+                "font": {"type": ["string", "null"]},
+                "size_pt": {"type": ["number", "null"]},
+            },
+            "required": ["op", "shape", "hex", "font", "size_pt"],
+            "additionalProperties": False,
         },
     },
     "required": [
@@ -67,6 +118,7 @@ AI_ISSUE_SCHEMA: dict[str, Any] = {
         "confidence",
         "basis",
         "confirms_refs",
+        "fix",
     ],
     "additionalProperties": False,
 }
@@ -230,10 +282,34 @@ def issues_from_response(
                 suggestion=raw.get("suggestion"),
                 confidence=_confidence(raw.get("confidence")),
                 evidence=_basis(raw.get("basis")),
+                fix=_fix(raw.get("fix")),
             )
         )
 
     return issues, str(payload.get("summary", "")).strip()
+
+
+def _fix(raw: Any) -> Optional[FixAction]:
+    """A proposed action, or None for anything that is not one.
+
+    An unknown `op` is dropped here rather than carried and refused later. It
+    would reach a designer as a fix that exists, which is a promise, and the
+    honest reading of a name nothing implements is that no fix was proposed.
+    """
+    if not isinstance(raw, dict):
+        return None
+    op = str(raw.get("op") or "").strip()
+    if op not in FIX_OPS:
+        return None
+    size = raw.get("size_pt")
+    return FixAction(
+        op=op,
+        shape=(str(raw["shape"]).strip() or None) if raw.get("shape") else None,
+        hex=(str(raw["hex"]).strip().lstrip("#").upper() or None)
+        if raw.get("hex") else None,
+        font=(str(raw["font"]).strip() or None) if raw.get("font") else None,
+        size_pt=float(size) if isinstance(size, (int, float)) else None,
+    )
 
 
 def _category(value: Any) -> Category:

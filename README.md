@@ -281,6 +281,63 @@ there is one way to reach the target:
 | `font.family.theme_drift` | clears the hardcoded typeface so the run inherits |
 | `space.safe_margin` | moves the shape inside the frame, only on the edges the finding names |
 | `space.repeat_out_of_line` | puts the shape back on the edge the rest of its set shares |
+| `space.satellite_offset` | nudges one copy of a repeated pairing back onto the offset its cohort shares |
+| `title.position_inconsistent` | moves a drifting title onto the position the rest of the deck's titles hold |
+| `logo.geometry` | moves the logo onto the master's position |
+| `color.text.off_palette` | recolours the runs carrying the off-palette colour to the nearest palette entry |
+| `color.shape.off_palette` | recolours the fill, the outline, or the SVG an icon draws from |
+| `typography.terminal_punctuation` | takes the full stop off the end of a title |
+
+**Which palette entry a colour becomes** is a different question from which is
+nearest, and treating them as one recoloured a red to an orange 33 delta-E
+away and a page of blue headings to a neutral. "Nearest" decides whether a
+colour is off-palette and always has an answer. "Intended" is allowed to have
+none: an entry is disqualified if it is a neutral and the colour is not (or
+the reverse), if it is a different hue family, or if it is further away than
+the distance at which the rule already stops recommending anything. No
+qualifying entry means a designer picks, which is a better answer than one
+chosen by arithmetic that had nothing suitable to choose from. Distance is
+CIEDE2000, checked against the Sharma reference pairs; CIE76 overstated the
+blues, which is what pushed them onto neutrals.
+
+**Artwork a slide inherits from its layout is carried onto the slide** before
+the rebuild swaps layouts. A photograph on a designed slide is often not on
+the slide -- it is on the layout, and pointing the slide elsewhere loses it
+with nothing to report, because no shape was lost. What does not travel is the
+old brand's furniture, told apart by repetition rather than size: a logo is on
+many layouts because it is on every slide, a section image is on the one
+layout drawn for it. See `rebuild/pictures.py`.
+
+**Icon colour is not shape colour.** An icon from PowerPoint's library is a
+`p:pic`, and what the ribbon calls a *Graphics Fill* is not `a:solidFill` on
+the shape -- the colour lives inside the SVG the picture draws from. Setting
+`Shape.Fill` on one through automation writes byte-identical XML, verified
+against desktop PowerPoint. So every icon in every deck was invisible to the
+colour rules and unfixable however the finding was worded.
+
+Microsoft's icons state their intent in the markup, which is what makes this
+tractable: `class="MsftOfcThm_Accent1_Stroke_v2" stroke="#A32020"` says the
+icon reads theme accent1, and the literal beside it is what that slot resolved
+to. A theme-bound icon is not itself wrong -- the deck's theme is, and
+`rebuild` corrects every icon reading it at once. An icon with a literal
+colour and no class was recoloured by hand and gets a fixer, which rewrites
+the rule and the literals together. See `formatting_tool/svgicon.py`.
+
+**An AI finding is fixable when it carries one.** The model is asked for a
+`fix`: an `op` from a closed set (recolour a fill, line or text; set an
+approved typeface; set a size; turn off shrink-to-fit; drop trailing empty
+paragraphs) and a target. Most findings have none, which is right -- the AI
+layer exists for the judgement the rules cannot make, and a judgement has no
+op. There is deliberately no move or resize: the model is told not to measure
+off a rendered image, and geometry is what the deterministic layer proves from
+the file.
+
+Every proposal is checked against the master before the file is touched. A
+colour has to be a palette entry *exactly* -- "nearest" is how a colour the
+model liked the look of gets written into a client deck wearing a brand label
+-- a typeface has to be approved, a size has to sit in the role's range. With
+no master to check against, none of them run. So the worst a bad proposal can
+do is cost itself.
 
 **Every move is checked against the shapes around it**, because a slide is a
 composition and satisfying a rule by shoving a shape into its neighbour trades
@@ -294,9 +351,16 @@ because it was missing once and a designer sent back a screenshot:
 - A move that **covers more of a neighbour** than before is reverted. Area, not
   which neighbours are touched: a caption already overlapping the portrait
   above it gains no new neighbour by sliding further under it.
-- `space.alignment_grid` **has no fixer at all.** A real slide carries several
-  legitimate columns and the rule snaps to the busiest; which column a given
-  shape belongs to is a design call. The detection stays.
+- `space.alignment_grid` **acts only on a grid the master declares.** A real
+  slide carries several legitimate columns, and a line four shapes happen to
+  share is not one of them; against an inferred grid the fix stands down and
+  says so. Mark the master's presentation space to enable it.
+- A **delta measured from a position that has since changed** is refused.
+  `space.satellite_offset` says "0.15in right of where its copies sit", which
+  is only true of where the shape was when the report was written. On a real
+  deck the edge fix corrected that same 0.15in first, and this one subtracted
+  it a second time. Absolute targets are idempotent and re-run freely; this is
+  the one that cannot be.
 
 On the deck those screenshots came from, the guards cut the moves from 141 to
 4, took the report from 171 findings to 37, and left every other rule count

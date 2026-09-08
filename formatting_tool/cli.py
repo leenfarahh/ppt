@@ -256,17 +256,40 @@ def _cmd_apply(args: argparse.Namespace) -> int:
         )
 
     selected = None if args.all else list(args.fix or [])
+    guidelines = load_guidelines(args.guidelines)
     result = apply_fixes(
         deck=args.deck,
         issues=report.issues,
         out=args.out,
         selected=selected,
         master=args.master,
-        tuning=load_guidelines(args.guidelines).tuning,
-        tolerances=load_guidelines(args.guidelines).tolerances,
+        tuning=guidelines.tuning,
+        tolerances=guidelines.tolerances,
+        spec=_spec_for_apply(args.master, guidelines),
     )
     _report_apply(result)
     return 1 if result.skipped and args.strict else 0
+
+
+def _spec_for_apply(master, guidelines):
+    """The master's values, for checking an AI-proposed fix against.
+
+    None without a master, and then no proposed fix runs. That is the point
+    rather than a limitation: the check is what makes a proposal safe to
+    apply to a client deck, and there is nothing to check against here.
+    """
+    if master is None:
+        return None
+    try:
+        from .extract.master_spec import derive_master_spec
+
+        return derive_master_spec(read_deck(master), guidelines)
+    except Exception:
+        log.warning(
+            "could not read %s to check proposed fixes against; any fix the "
+            "AI layer proposed will be left for a designer", master,
+        )
+        return None
 
 
 def _print_fix_menu(report: ValidationReport) -> None:

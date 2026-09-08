@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Iterable
 
-from ..models import Category, Issue, Severity, TextRole
+from ..models import Category, Issue, Severity, ShapeProfile, SlideProfile, TextRole
 from .base import Rule, RuleContext
 
 
@@ -72,8 +72,16 @@ class DetachedTitleRule(Rule):
 class TitlePositionConsistencyRule(Rule):
     """Titles that do not line up slide to slide.
 
-    Reported deck-level: a single title 0.2in low is not the finding, twelve
-    titles at eleven different heights is.
+    Reported per slide when a majority of the titles agree on a position, and
+    deck-level when they do not. Those are two different findings wearing one
+    rule id. Twelve titles at eleven different heights is a fact about the
+    deck and there is no odd one out to name; twelve titles at one height and
+    a thirteenth 0.3in low is a fact about slide thirteen, and saying so is
+    what lets it be corrected -- a deck-level finding names no shape, so the
+    applier has nothing to move and it reaches a designer unfixed.
+
+    The majority gate is the same one the repeat rules use. Below it there is
+    no intended position, only a scatter.
     """
 
     id = "title.position_inconsistent"
@@ -83,41 +91,66 @@ class TitlePositionConsistencyRule(Rule):
 
     def check(self, ctx: RuleContext) -> Iterable[Issue]:
         tolerance = ctx.spec.tolerances.position_in
-        positions: dict[int, tuple[float, float]] = {}
+        titles: dict[int, tuple[SlideProfile, ShapeProfile]] = {}
         for slide in ctx.deck.slides:
             for shape in slide.shapes:
                 if shape.role is TextRole.TITLE and shape.text.strip():
-                    positions[slide.number] = (
-                        shape.geometry.left_in,
-                        shape.geometry.top_in,
-                    )
+                    titles[slide.number] = (slide, shape)
                     break
 
-        if len(positions) < 2:
+        if len(titles) < 2:
             return
 
         # Modal position is the intended one; anything beyond tolerance of it
         # is drift.
         counts: dict[tuple[float, float], int] = {}
-        for value in positions.values():
-            rounded = (round(value[0], 2), round(value[1], 2))
+        for _slide, shape in titles.values():
+            rounded = (
+                round(shape.geometry.left_in, 2),
+                round(shape.geometry.top_in, 2),
+            )
             counts[rounded] = counts.get(rounded, 0) + 1
         modal = max(counts, key=lambda k: counts[k])
 
-        off = {
-            number: value
-            for number, value in positions.items()
-            if abs(value[0] - modal[0]) > tolerance
-            or abs(value[1] - modal[1]) > tolerance
-        }
-        if off:
+        off = [
+            (number, slide, shape)
+            for number, (slide, shape) in sorted(titles.items())
+            if abs(shape.geometry.left_in - modal[0]) > tolerance
+            or abs(shape.geometry.top_in - modal[1]) > tolerance
+        ]
+        if not off:
+            return
+
+        where = f"{modal[0]:.2f}, {modal[1]:.2f}in"
+        if counts[modal] < ctx.tuning.majority_fraction * len(titles):
             yield self.issue(
-                f"Title position differs on {len(off)} of {len(positions)} slides.",
-                expected=f"{modal[0]:.2f}, {modal[1]:.2f}in",
+                f"Title position differs on {len(off)} of {len(titles)} slides, "
+                "with no position the majority agrees on.",
+                expected="one title position across the deck",
                 found=", ".join(
-                    f"slide {n} at {v[0]:.2f}, {v[1]:.2f}in"
-                    for n, v in sorted(off.items())
+                    f"slide {n} at {s.geometry.left_in:.2f}, "
+                    f"{s.geometry.top_in:.2f}in"
+                    for n, _slide, s in off
                 ),
+            )
+            return
+
+        for _number, slide, shape in off:
+            drift = max(
+                abs(shape.geometry.left_in - modal[0]),
+                abs(shape.geometry.top_in - modal[1]),
+            )
+            yield self.issue(
+                f"Title sits {drift:.2f}in from where the other "
+                f"{counts[modal]} titles sit.",
+                slide=slide,
+                shape=shape,
+                expected=where,
+                found=(
+                    f"{shape.geometry.left_in:.2f}, "
+                    f"{shape.geometry.top_in:.2f}in"
+                ),
+                suggestion=f"Move the title to {where}, as the rest of the deck has.",
             )
 
 

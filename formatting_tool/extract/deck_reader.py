@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Optional
 from xml.etree import ElementTree
 
+from .. import svgicon
 from ..models import (
     DeckProfile,
     Geometry,
@@ -195,6 +196,10 @@ def _read_shape(shape: Any, frame: Optional[_Frame] = None) -> ShapeProfile:
         placeholder_type = str(_safe(lambda: shape.placeholder_format.type) or "")
         placeholder_idx = _safe(lambda: shape.placeholder_format.idx)
 
+    fill_hex, fill_theme = _fill_hex(shape)
+    line_hex, line_theme = _line_hex(shape)
+    graphic_colors = svgicon.colors_of(shape)
+
     profile = ShapeProfile(
         shape_id=_safe(lambda: shape.shape_id) or -1,
         name=_safe(lambda: shape.name) or "",
@@ -203,8 +208,11 @@ def _read_shape(shape: Any, frame: Optional[_Frame] = None) -> ShapeProfile:
         placeholder_type=placeholder_type,
         placeholder_idx=placeholder_idx if placeholder_idx is None else int(placeholder_idx),
         role=_role_for(placeholder_type, _safe(lambda: shape.name) or ""),
-        fill_hex=_fill_hex(shape),
-        line_hex=_line_hex(shape),
+        fill_hex=fill_hex,
+        fill_theme=fill_theme,
+        line_hex=line_hex,
+        line_theme=line_theme,
+        graphic_colors=graphic_colors,
         is_picture="PICTURE" in shape_type,
         is_group="GROUP" in shape_type,
         alt_text=_alt_text(shape),
@@ -278,7 +286,7 @@ def _read_paragraph(paragraph: Any) -> ParagraphProfile:
 
 def _read_run(run: Any) -> RunProfile:
     font = _safe(lambda: run.font)
-    color_hex, is_theme = _font_color(font)
+    color_hex, is_theme, theme_slot = _font_color(font)
     return RunProfile(
         text=_safe(lambda: run.text) or "",
         font_name=_safe(lambda: font.name),
@@ -288,6 +296,7 @@ def _read_run(run: Any) -> RunProfile:
         underline=_safe(lambda: font.underline),
         color_hex=color_hex,
         color_is_theme=is_theme,
+        color_theme=theme_slot,
         language=_stringify(_safe(lambda: font.language_id)),
     )
 
@@ -342,40 +351,75 @@ def _read_layouts(prs: Any) -> list[LayoutProfile]:
 # Colour and image helpers
 # --------------------------------------------------------------------------- #
 
-def _font_color(font: Any) -> tuple[Optional[str], bool]:
-    """Return (hex, resolves_through_theme).
+def _font_color(font: Any) -> tuple[Optional[str], bool, Optional[str]]:
+    """Return (hex, resolves_through_theme, theme slot).
 
-    A theme-bound colour has no literal RGB on the run; it is correct by
-    construction, so the colour rule treats it differently from a hardcoded
-    value that merely happens to match the palette.
+    A theme-bound colour has no literal RGB on the run, so the slot it binds
+    to is the only thing there is to record. It is NOT "correct by
+    construction", which is what this used to assume: it is correct only if
+    the theme behind it is the master's. A deck built from another file
+    resolves every one of these through its own theme and renders off-brand
+    while each run looks blameless on its own.
     """
     color = _safe(lambda: font.color)
     if color is None:
-        return None, False
+        return None, False, None
     rgb = _safe(lambda: color.rgb)
     if rgb is not None:
-        return str(rgb).upper(), False
+        return str(rgb).upper(), False, None
     theme_color = _safe(lambda: color.theme_color)
     if theme_color is not None:
-        # TODO: resolve theme_color through DeckProfile.theme_colors so the
-        # colour rule can compare a theme-bound run against the palette.
-        return None, True
-    return None, False
+        return None, True, _theme_slot(theme_color)
+    return None, False, None
 
 
-def _fill_hex(shape: Any) -> Optional[str]:
+# python-pptx names the slots after the OOXML enum; the theme part names them
+# as they appear in `a:clrScheme`. Same twelve slots, two spellings, and the
+# comparison has to happen in one of them.
+_SLOTS = {
+    "DARK_1": "dk1", "LIGHT_1": "lt1", "DARK_2": "dk2", "LIGHT_2": "lt2",
+    "TEXT_1": "dk1", "BACKGROUND_1": "lt1",
+    "TEXT_2": "dk2", "BACKGROUND_2": "lt2",
+    "ACCENT_1": "accent1", "ACCENT_2": "accent2", "ACCENT_3": "accent3",
+    "ACCENT_4": "accent4", "ACCENT_5": "accent5", "ACCENT_6": "accent6",
+    "HYPERLINK": "hlink", "FOLLOWED_HYPERLINK": "folHlink",
+}
+
+
+def _theme_slot(theme_color: Any) -> Optional[str]:
+    """A python-pptx theme colour -> the name the theme part uses for it."""
+    name = _stringify(theme_color)
+    if not name:
+        return None
+    # "ACCENT_1 (5)" -> "ACCENT_1"
+    head = str(name).split(" ")[0].upper()
+    return _SLOTS.get(head)
+
+
+def _fill_hex(shape: Any) -> tuple[Optional[str], Optional[str]]:
+    """A shape's fill as (hex, theme slot). Both None when it has no fill."""
     fill = _safe(lambda: shape.fill)
     if fill is None:
-        return None
+        return None, None
     if str(_safe(lambda: fill.type) or "") in ("None", "BACKGROUND (5)"):
-        return None
-    rgb = _safe(lambda: fill.fore_color.rgb)
-    return str(rgb).upper() if rgb is not None else None
+        return None, None
+    fore = _safe(lambda: fill.fore_color)
+    if fore is None:
+        return None, None
+    rgb = _safe(lambda: fore.rgb)
+    if rgb is not None:
+        return str(rgb).upper(), None
+    return None, _theme_slot(_safe(lambda: fore.theme_color))
 
 
-def _line_hex(shape: Any) -> Optional[str]:
-    rgb = _safe(lambda: shape.line.color.rgb)
-    return str(rgb).upper() if rgb is not None else None
+def _line_hex(shape: Any) -> tuple[Optional[str], Optional[str]]:
+    color = _safe(lambda: shape.line.color)
+    if color is None:
+        return None, None
+    rgb = _safe(lambda: color.rgb)
+    if rgb is not None:
+        return str(rgb).upper(), None
+    return None, _theme_slot(_safe(lambda: color.theme_color))
 
 
 def _image_sha1(shape: Any) -> Optional[str]:

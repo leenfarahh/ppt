@@ -17,6 +17,7 @@ from .applier import (
     FixContext,
     FixOutcome,
     apply_fixes,
+    FixBrand,
     fixable,
 )
 from .fixers import (
@@ -40,6 +41,7 @@ __all__ = [
     "FixContext",
     "FixOutcome",
     "apply_fixes",
+    "FixBrand",
     "fixable",
     "fixer_for",
     "why_not_fixable",

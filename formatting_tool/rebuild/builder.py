@@ -274,8 +274,17 @@ def _result_from_powerpoint(
                 number=outcome.number,
                 source_layout=None,
                 target_layout=outcome.target_layout or "(none)",
-                basis=match.basis if match else "none",
-                confident=bool(match and match.confident and outcome.applied),
+                basis=(
+                    outcome.detail if outcome.forced
+                    else match.basis if match else "none"
+                ),
+                # A forced slide is on the master but not on the layout
+                # anybody chose for it, so it is never reported as confident
+                # however sure the matcher was of the pick that was missing.
+                confident=bool(
+                    match and match.confident and outcome.applied
+                    and not outcome.forced
+                ),
                 kind=match.kind if match else SlideKind.UNKNOWN,
                 layout_kind=match.layout_kind if match else SlideKind.UNKNOWN,
             )
@@ -288,6 +297,11 @@ def _result_from_powerpoint(
     )
     for failure in applied.failed:
         log.warning("slide %d not restyled: %s", failure.number, failure.detail)
+    for forced in applied.forced:
+        log.warning(
+            "slide %d placed on %r: %s",
+            forced.number, forced.target_layout, forced.detail,
+        )
     return result
 
 

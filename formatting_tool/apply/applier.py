@@ -31,13 +31,60 @@ from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
 from ..models import Issue, RuleTuning, Tolerances
-from .fixers import GEOMETRIC, LeaveAlone, fix_order, fixer_for, why_not_fixable
+from .fixers import (
+    GEOMETRIC,
+    RELATIVE,
+    LeaveAlone,
+    fix_order,
+    fixer_for,
+    why_not_fixable,
+)
 
 log = logging.getLogger(__name__)
 
 
 class ApplyError(RuntimeError):
     """Raised when the fixes cannot be applied or the result cannot be written."""
+
+
+@dataclass
+class FixBrand:
+    """The master's own values, for checking a proposed fix against.
+
+    Only the AI dispatcher uses these, and only to refuse. A rule finding
+    carries a target that was measured off the master in the first place; a
+    proposal from the model has to be shown to be one of the master's values
+    before it is written into a client deck.
+    """
+
+    palette: dict[str, str] = field(default_factory=dict)
+    allowed_fonts: list[str] = field(default_factory=list)
+    roles: dict[str, tuple[Optional[float], Optional[float]]] = field(
+        default_factory=dict
+    )
+
+    def size_range(self, role: str) -> tuple[Optional[float], Optional[float]]:
+        """The pt range for a role, or (None, None) when none is declared.
+
+        An undeclared role does not veto a size. The brand system is allowed
+        to be silent about body copy, and refusing every proposal for a role
+        nobody wrote a rule about would be inventing a rule.
+        """
+        return self.roles.get(role, (None, None))
+
+    @classmethod
+    def from_spec(cls, spec: Any) -> "FixBrand":
+        roles: dict[str, tuple[Optional[float], Optional[float]]] = {}
+        for name, role in (getattr(spec, "roles", None) or {}).items():
+            roles[str(name)] = (
+                getattr(role, "min_size_pt", None),
+                getattr(role, "max_size_pt", None),
+            )
+        return cls(
+            palette=dict(getattr(spec, "palette", None) or {}),
+            allowed_fonts=list(getattr(spec, "allowed_fonts", None) or []),
+            roles=roles,
+        )
 
 
 @dataclass
@@ -51,6 +98,15 @@ class FixContext:
     # rules would have called aligned, and defaulted off the model rather than
     # restated as a literal here.
     align_tolerance_in: float = Tolerances().position_in
+    # How far a shape can be from the position a finding names and still be
+    # read as having drifted there. Past it the placement was a decision, so
+    # the fix that would undo it stands down. The same ceiling the repeat
+    # rules measure with, and defaulted off the model for the same reason.
+    max_drift_in: float = RuleTuning().repeat_max_drift_in
+    # The master's palette, typefaces and role sizes. None when the caller had
+    # no master to hand, and then no AI-proposed fix runs at all: an unchecked
+    # proposal is a guess with a brand label on it.
+    brand: Optional[FixBrand] = None
 
 
 @dataclass
@@ -95,6 +151,7 @@ def apply_fixes(
     master: Optional[str | Path] = None,
     tuning: Optional[RuleTuning] = None,
     tolerances: Optional[Tolerances] = None,
+    spec: Optional[Any] = None,
 ) -> ApplyResult:
     """Apply the selected findings to `deck` and write the result to `out`.
 
@@ -120,6 +177,8 @@ def apply_fixes(
         width_emu=presentation.slide_width,
         height_emu=presentation.slide_height,
         align_tolerance_in=(tolerances or Tolerances()).position_in,
+        max_drift_in=(tuning or RuleTuning()).repeat_max_drift_in,
+        brand=FixBrand.from_spec(spec) if spec is not None else None,
     )
     result = ApplyResult(deck=deck.name, output=out)
 
@@ -132,11 +191,17 @@ def apply_fixes(
         if (issue.rule_id or "") in GEOMETRIC and issue.shape_id is not None
     }
 
+    # Shapes a fix has already moved in this run. A fix measured as a delta
+    # cannot be trusted against one of these; see RELATIVE.
+    moved: set[tuple[Optional[int], Optional[int]]] = set()
+
     # Stable sort, so findings of equal priority stay in report order and a
     # run is reproducible.
     for issue in sorted(wanted, key=fix_order):
-        result_line = _apply_one(issue, presentation, context, in_breach)
+        result_line = _apply_one(issue, presentation, context, in_breach, moved)
         (result.applied if result_line.applied else result.skipped).append(result_line)
+        if result_line.applied and (issue.rule_id or "") in GEOMETRIC:
+            moved.add((issue.slide, issue.shape_id))
 
     try:
         presentation.save(str(out))
@@ -165,6 +230,7 @@ def _apply_one(
     presentation: Any,
     context: FixContext,
     in_breach: Optional[set] = None,
+    moved: Optional[set] = None,
 ) -> FixOutcome:
     fixer = fixer_for(issue)
     if fixer is None:
@@ -188,6 +254,21 @@ def _apply_one(
             False,
             f"could not find {issue.shape!r} on slide {issue.slide}; the deck "
             "has changed since the report was made",
+        )
+
+    if (issue.rule_id or "") in RELATIVE and (issue.slide, issue.shape_id) in (
+        moved or set()
+    ):
+        # Not caution: arithmetic. This fix subtracts the drift the report
+        # measured, and the shape is no longer where it was measured, so the
+        # subtraction would land it somewhere neither the report nor the rule
+        # ever named.
+        return FixOutcome(
+            issue,
+            False,
+            "left alone: another fix has already moved this shape in this run, "
+            "and this one is measured from where it was. Re-run the check to "
+            "see whether anything is still out of line",
         )
 
     geometric = (issue.rule_id or "") in GEOMETRIC

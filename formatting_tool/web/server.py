@@ -88,6 +88,11 @@ class _Session:
     master: Path
     deck: Path
     report: dict[str, Any]
+    # The values the run measured against, taken off the report rather than
+    # re-derived. Applying happens minutes later, and re-reading the master
+    # then meant reading a file in a temp directory that may no longer be
+    # there -- and, where it is, may not be the file the report describes.
+    spec: Any = None
     created: float = field(default_factory=time.time)
 
     @property
@@ -293,6 +298,7 @@ class _Handler(BaseHTTPRequestHandler):
                 out=session.fixed,
                 selected=chosen,
                 master=session.master if rebuild_too else None,
+                spec=session.spec,
             )
             elapsed = time.perf_counter() - started
 
@@ -453,6 +459,7 @@ class _Handler(BaseHTTPRequestHandler):
                 master=config.master,
                 deck=config.decks[0],
                 report=report.to_dict(),
+                spec=report.spec,
             )
             _remember(session)
             keep = True

@@ -114,6 +114,10 @@ class Issue:
     # difference between "the text does not collide" as an observation and as
     # a guess, and a designer weighing a finding needs to know which.
     evidence: Optional[str] = None
+    # A mechanical correction the AI layer proposed, when it could name one.
+    # None on every rule finding: those carry a measured target in `expected`
+    # and their fixers read it from there.
+    fix: Optional["FixAction"] = None
     # Short stable handle, assigned once the finding is final. It is what a
     # designer ticks and what `apply --fix` takes, so it has to survive a
     # round trip through JSON and mean the same thing on the next run over an
@@ -139,6 +143,48 @@ class Issue:
 
     def to_dict(self) -> dict[str, Any]:
         return enum_safe(asdict(self))
+
+
+# Actions a machine can carry out from a finding the AI layer wrote. Closed on
+# purpose: an open set would let the model name an operation nothing
+# implements, and a fix that cannot be run is worse than a finding that says
+# it needs a designer, because it reads as an offer.
+#
+# There is no move or resize here, and that is a decision rather than an
+# omission. The model is told not to measure off a rendered image, and
+# geometry is what the deterministic layer proves from the file; a coordinate
+# from the model would be exactly the guess that instruction exists to stop.
+FIX_OPS = frozenset({
+    "recolor_fill",
+    "recolor_line",
+    "recolor_text",
+    "set_font",
+    "set_font_size",
+    "disable_autofit",
+    "delete_empty_paragraphs",
+})
+
+
+@dataclass
+class FixAction:
+    """One mechanical correction, as the AI layer proposed it.
+
+    Every value is a proposal, never an instruction. The applier validates the
+    target against the master before it touches the file -- a colour has to be
+    a palette entry, a typeface has to be approved, a size has to sit in the
+    role's range -- and refuses anything that is not, so the worst a bad
+    proposal can do is cost itself.
+    """
+
+    op: str
+    shape: Optional[str] = None         # exact name as the payload gave it
+    hex: Optional[str] = None           # six hex digits, no leading hash
+    font: Optional[str] = None
+    size_pt: Optional[float] = None
+
+    @property
+    def valid(self) -> bool:
+        return self.op in FIX_OPS
 
 
 @dataclass
@@ -196,6 +242,16 @@ class ValidationReport:
     # measured on the restyled deck, not on the file that was uploaded.
     master_applied: list[dict[str, Any]] = field(default_factory=list)
 
+    # The MasterSpec the run measured against, left here by the pipeline so a
+    # later apply can check a proposed fix against the same values the
+    # findings came from.
+    #
+    # Deliberately NOT annotated: an annotated name in a dataclass becomes a
+    # field, and a field is serialised. This is working state that lives as
+    # long as the process, not part of the report -- and asdict on a spec
+    # would copy every layout and every shape on it into the JSON.
+    spec = None
+
     def to_dict(self) -> dict[str, Any]:
         return enum_safe(asdict(self))
 
@@ -235,6 +291,11 @@ class RunProfile:
     underline: Optional[bool] = None
     color_hex: Optional[str] = None     # six hex digits, no leading hash
     color_is_theme: bool = False        # True when it resolves through the theme
+    # The theme slot it binds to ("accent1", "dk2"), when it binds to one. A
+    # theme-bound colour is only as correct as the theme behind it: a deck
+    # carrying its own theme resolves accent1 to its own accent1, which is
+    # off-brand on screen while the run itself looks blameless.
+    color_theme: Optional[str] = None
     language: Optional[str] = None      # drives Arabic vs Latin font rules
 
 
@@ -280,6 +341,16 @@ class ShapeProfile:
     paragraphs: list[ParagraphProfile] = field(default_factory=list)
     fill_hex: Optional[str] = None
     line_hex: Optional[str] = None
+    # Theme slots, on the same terms as RunProfile.color_theme. A shape fill
+    # bound to the theme carries no literal RGB, so `fill_hex` is None and the
+    # colour rules saw nothing at all until these existed.
+    fill_theme: Optional[str] = None
+    line_theme: Optional[str] = None
+    # The colours inside an SVG icon. PowerPoint calls this a Graphics Fill
+    # and gives it its own ribbon tab; it is not `a:solidFill` on the shape,
+    # so `fill_hex` is None for every icon and the colour rules saw none of
+    # them. See `formatting_tool.svgicon`.
+    graphic_colors: list = field(default_factory=list)
     is_picture: bool = False
     is_group: bool = False
     image_sha1: Optional[str] = None    # identifies a logo asset across decks

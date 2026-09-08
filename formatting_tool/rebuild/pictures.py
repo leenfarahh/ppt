@@ -34,13 +34,23 @@ that does not depend on how the circle happens to be authored.
 from __future__ import annotations
 
 import copy
+import hashlib
 import logging
 from pathlib import Path
 from typing import Any, Optional
 
+from lxml import etree
+
 log = logging.getLogger(__name__)
 
 _A_NS = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+_R_EMBED = (
+    "{http://schemas.openxmlformats.org/officeDocument/2006/"
+    "relationships}embed"
+)
+_IMAGE_REL = (
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"
+)
 
 
 def freeze_file(path: Path) -> int:
@@ -63,7 +73,11 @@ def freeze_file(path: Path) -> int:
     try:
         presentation = Presentation(str(path))
         frozen = [name for slide in presentation.slides for name in freeze_slide(slide)]
-        if not frozen:
+        # Same pass and same save. Both exist for one reason -- what a slide
+        # inherits from the layout it is about to stop pointing at -- and a
+        # deck needing neither still reaches PowerPoint byte for byte.
+        carried = inherit_artwork(presentation)
+        if not frozen and not carried:
             return 0
         presentation.save(str(path))
     except Exception:
@@ -73,9 +87,16 @@ def freeze_file(path: Path) -> int:
             path.name, exc_info=True,
         )
         return 0
-    log.info("froze the inherited frame of %d picture(s): %s", len(frozen),
-             ", ".join(frozen))
-    return len(frozen)
+    if frozen:
+        log.info("froze the inherited frame of %d picture(s): %s", len(frozen),
+                 ", ".join(frozen))
+    if carried:
+        log.info(
+            "carried %d picture(s) off the old layouts onto the slides that "
+            "inherit them, so the rebuild does not leave them behind: %s",
+            len(carried), ", ".join(carried),
+        )
+    return len(frozen) + len(carried)
 
 
 def _name_of(shape: Any) -> str:
@@ -248,3 +269,155 @@ def _strip_ph(element: Any) -> bool:
     return True
 
 
+# --------------------------------------------------------------------------- #
+# Artwork the slide inherits from its layout
+# --------------------------------------------------------------------------- #
+#
+# What a designed slide shows is often not on the slide. It is on the layout,
+# and the slide inherits it: a section divider carries a full-bleed photograph,
+# a pair of connector lines and the grey panels behind its copy while its own
+# `p:cSld` holds nothing but a title. Point that slide at another layout and
+# all of it is gone -- not dropped, never there, so nothing reports it and no
+# shape was lost.
+#
+# Measured on a deck built for it:
+#
+#     before   layout carries  Rounded Rectangle, Connector, Oval, Picture
+#     after    slide shows     nothing of them
+#
+# So the artwork is copied onto the slide while the old layout is still
+# reachable, which is the same move `freeze_slide` makes for a placeholder's
+# frame and for the same reason.
+#
+# EVERY non-placeholder shape, not only pictures. The first version of this
+# carried pictures alone and a real deck came back with its photographs intact
+# and its connector lines and panel fills missing, which is the same defect
+# wearing a different tag name. A placeholder is excluded because it is a slot
+# rather than artwork, and taking the new layout's position and type for those
+# is the entire point of a rebuild.
+#
+# WHAT IS NOT CARRIED, and why there has to be a rule at all. The old layouts
+# hold two kinds of shape and only one should travel. A section photograph and
+# the panels drawn for that slide belong to the slide; the old brand's logo and
+# its header band belong to the design being replaced, and carrying those would
+# stamp the previous client's mark on every slide of a rebranded deck -- worse
+# than the missing artwork, and harder to spot.
+#
+# They are told apart by repetition rather than by size, which is the signal
+# the file actually carries: furniture is on many layouts because it is on
+# every slide, and a section's own artwork is on the one layout drawn for it.
+
+def inherit_artwork(presentation: Any) -> list[str]:
+    """Copy each slide's inherited layout artwork onto the slide itself.
+
+    Returns a line per shape copied. Mutates the presentation.
+    """
+    furniture = _repeated_shapes(presentation)
+    carried: list[str] = []
+    for index, slide in enumerate(presentation.slides, start=1):
+        artwork = _artwork_of(slide.slide_layout, furniture)
+        # Kept in the layout's own order, and inserted at the front of the
+        # z-order where a layout draws: under the slide's own shapes, which is
+        # where these were. A panel arriving on top of the copy it used to sit
+        # behind is a different defect from the one being fixed.
+        for offset, shape in enumerate(artwork):
+            if _copy_onto(slide, shape, _Z_FRONT + offset):
+                carried.append(f"slide {index}: {_name_of(shape)}")
+    return carried
+
+
+# `p:spTree` opens with `p:nvGrpSpPr` and `p:grpSpPr`; shapes follow.
+_Z_FRONT = 2
+
+
+def _repeated_shapes(presentation: Any) -> set[str]:
+    """Shapes that appear on more than one layout, which makes them furniture.
+
+    By content, not by relationship or by name: one logo related from nine
+    layouts is one image nine times, and a band redrawn on each layout is
+    still the same band.
+    """
+    seen: dict[str, set[int]] = {}
+    for master in _safe(lambda: list(presentation.slide_masters)) or []:
+        for layout in _safe(lambda: list(master.slide_layouts)) or []:
+            for shape in _loose_shapes(layout):
+                key = _content_key(shape)
+                if key:
+                    seen.setdefault(key, set()).add(id(layout))
+    return {key for key, layouts in seen.items() if len(layouts) > 1}
+
+
+def _artwork_of(layout: Any, furniture: set[str]) -> list[Any]:
+    """The shapes on a layout that belong to the slide rather than to the brand."""
+    return [
+        shape for shape in _loose_shapes(layout)
+        if _content_key(shape) not in furniture
+    ]
+
+
+def _loose_shapes(container: Any) -> list[Any]:
+    """Non-placeholder shapes directly on a layout.
+
+    Placeholders are excluded on purpose: one is a slot, not artwork, and the
+    slide's own shape is what fills it.
+    """
+    try:
+        return [s for s in container.shapes if not _is_placeholder(s)]
+    except Exception:
+        return []
+
+
+def _content_key(shape: Any) -> Optional[str]:
+    """What a shape draws, identified by content so copies collapse together.
+
+    A picture is its image. Anything else is its markup with the identifiers
+    stripped out -- the shape id, the name and the creation GUID all differ
+    between two copies of one band and say nothing about what it looks like.
+    """
+    try:
+        sha1 = _safe(lambda: shape.image.sha1)
+        if sha1:
+            return f"image:{sha1}"
+    except Exception:
+        pass
+    try:
+        element = copy.deepcopy(shape._element)
+        for node in element.iter():
+            for attribute in ("id", "name"):
+                if attribute in node.attrib:
+                    del node.attrib[attribute]
+        for ext in element.iter(f"{_A_NS}extLst"):
+            ext.getparent().remove(ext)
+        return "xml:" + hashlib.sha1(
+            etree.tostring(element)
+        ).hexdigest()
+    except Exception:
+        return None
+
+
+def _copy_onto(slide: Any, shape: Any, position: int) -> bool:
+    """Put a copy of a layout's shape on the slide at `position` in the z-order.
+
+    Any image it draws is related to the slide rather than copied, so a
+    photograph on nine slides is still one image in the file.
+    """
+    try:
+        element = copy.deepcopy(shape._element)
+        for blip in element.iter(f"{_A_NS}blip"):
+            rid = blip.get(_R_EMBED)
+            if not rid:
+                continue
+            part = shape.part.related_part(rid)
+            blip.set(_R_EMBED, slide.part.relate_to(part, _IMAGE_REL))
+        slide.shapes._spTree.insert(position, element)
+        return True
+    except Exception:
+        log.debug("could not carry a layout shape onto a slide", exc_info=True)
+        return False
+
+
+def _safe(call):
+    try:
+        return call()
+    except Exception:
+        return None

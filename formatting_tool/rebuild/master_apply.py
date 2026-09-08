@@ -49,11 +49,13 @@ import logging
 import shutil
 import tempfile
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
 from .. import powerpoint
+from ..models import normalize_layout_name
 from . import pictures
 
 log = logging.getLogger(__name__)
@@ -108,6 +110,11 @@ class SlideOutcome:
     target_layout: Optional[str]
     applied: bool
     detail: str = ""
+    # Landed on a layout nobody picked for it, because the one that was picked
+    # is not in the file PowerPoint loaded. Applied, so the slide is on the
+    # master and the deck's own design can be dropped, but not chosen -- which
+    # is a different claim and has to be readable as one.
+    forced: bool = False
 
 
 @dataclass
@@ -132,6 +139,11 @@ class MasterApplyResult:
     @property
     def failed(self) -> list[SlideOutcome]:
         return [o for o in self.outcomes if not o.applied]
+
+    @property
+    def forced(self) -> list[SlideOutcome]:
+        """Restyled, but onto a layout that was a fallback rather than a pick."""
+        return [o for o in self.outcomes if o.applied and o.forced]
 
 
 def available() -> bool:
@@ -225,17 +237,19 @@ def _drive(app: Any, deck: Path, master: Path, out: Path, plans: dict[int, str])
             str(working.resolve()), False, False, False
         ))
         try:
-            design = _retry(
-                lambda: presentation.Designs.Load(str(master.resolve()))
-            )
+            designs = _load_every_design(app, presentation, master, staging)
         except Exception as exc:
             return MasterApplyResult(
                 fatal=f"could not load the master's design: {exc}"
             )
+        if not designs:
+            return MasterApplyResult(
+                fatal="PowerPoint loaded no design at all from the master"
+            )
 
-        layouts = _layouts_of(design)
+        layouts = _layouts_of(designs)
         result.outcomes = _restyle(presentation, layouts, plans)
-        result.stragglers = _stragglers(presentation, design)
+        result.stragglers = _stragglers(presentation, designs)
         _drop_unused_designs(presentation)
         result.masters = _design_count(presentation)
 
@@ -252,18 +266,188 @@ def _drive(app: Any, deck: Path, master: Path, out: Path, plans: dict[int, str])
         shutil.rmtree(staging, ignore_errors=True)
 
 
-def _layouts_of(design: Any) -> dict[str, Any]:
-    master = design.SlideMaster
-    return {
-        master.CustomLayouts(i).Name: master.CustomLayouts(i)
-        for i in range(1, master.CustomLayouts.Count + 1)
+def _load_every_design(
+    app: Any, presentation: Any, master: Path, staging: Path
+) -> list[Any]:
+    """Bring in every slide master the master file defines, not just one.
+
+    `Designs.Load` loads ONE design from a template: the one that template's
+    own slides sit on. Any other slide master in the file is invisible to it,
+    however many layouts it carries.
+
+    That is what left a real deck 16 of 17 slides unrestyled. The matcher
+    reads layouts across every slide master of the file, so it legitimately
+    picked 'Agenda' and 'One Column'; the apply had only the one loaded
+    design's layouts to offer and reported both as missing from a master that
+    plainly contains them. Every unrestyled slide then keeps the deck's own
+    design alive, which is why the messy layouts survived into the output --
+    `_drop_unused_designs` can only remove a design no slide is using.
+
+    Reproduced against desktop PowerPoint with a three-master template:
+
+        Designs.Load(template)   ->  1 design of 3, holding 3 layouts of 8
+
+    So each design is loaded from a copy of the master trimmed to that design
+    alone. A single-master master takes the plain path and pays nothing.
+    """
+    single = _retry(lambda: presentation.Designs.Load(str(master.resolve())))
+    names = _design_names(app, master)
+    if len(names) <= 1:
+        return [single]
+
+    loaded = [single]
+    seen = {_name_of(single)}
+    for index, name in enumerate(names, start=1):
+        if name in seen:
+            continue
+        trimmed = _only_design(app, master, index, staging)
+        if trimmed is None:
+            continue
+        try:
+            loaded.append(_retry(lambda: presentation.Designs.Load(str(trimmed))))
+            seen.add(name)
+        except Exception:
+            log.warning(
+                "could not load the master's %r design; layouts on it will "
+                "not be available to this rebuild", name,
+            )
+    return loaded
+
+
+def _design_names(app: Any, master: Path) -> list[str]:
+    """The master file's designs, in order, read without changing anything."""
+    opened = None
+    try:
+        opened = _retry(lambda: app.Presentations.Open(
+            str(master.resolve()), True, False, False      # read-only
+        ))
+        return [
+            str(opened.Designs(i).Name)
+            for i in range(1, int(opened.Designs.Count) + 1)
+        ]
+    except Exception:
+        log.debug("could not read the master's design list", exc_info=True)
+        return []
+    finally:
+        if opened is not None:
+            powerpoint.quietly(opened.Close)
+
+
+def _only_design(app: Any, master: Path, index: int, staging: Path):
+    """A copy of the master trimmed to one design, for `Designs.Load` to take.
+
+    PowerPoint refuses to delete a design its own slides are sitting on, and
+    that refusal is fine: what has to be true is that the wanted design is
+    present and reachable, not that it is alone. A design that will not delete
+    is left where it is.
+    """
+    trimmed = staging / f"design-{index}.pptx"
+    opened = None
+    try:
+        shutil.copyfile(master, trimmed)
+        opened = _retry(lambda: app.Presentations.Open(
+            str(trimmed.resolve()), False, False, False
+        ))
+        for i in range(int(opened.Designs.Count), 0, -1):
+            if i != index:
+                powerpoint.quietly(lambda i=i: opened.Designs(i).Delete())
+        _retry(opened.Save)
+        opened.Close()
+        opened = None
+        return trimmed.resolve()
+    except Exception:
+        log.debug("could not trim the master to design %d", index, exc_info=True)
+        return None
+    finally:
+        if opened is not None:
+            powerpoint.quietly(opened.Close)
+
+
+def _name_of(design: Any) -> str:
+    try:
+        return str(design.Name)
+    except Exception:
+        return ""
+
+
+def _layouts_of(designs: list[Any]) -> dict[str, Any]:
+    """Every layout on every loaded design, keyed by name.
+
+    First design wins a repeated name. Names repeat freely once several
+    designs are in the file -- three of them carrying a 'Title Only - White'
+    is normal -- and they are the same layout by the designer's own naming, so
+    which copy is used matters far less than using one at all.
+    """
+    layouts: dict[str, Any] = {}
+    for design in designs:
+        try:
+            master = design.SlideMaster
+            for i in range(1, int(master.CustomLayouts.Count) + 1):
+                layout = master.CustomLayouts(i)
+                layouts.setdefault(str(layout.Name), layout)
+        except Exception:
+            log.debug("could not read a design's layouts", exc_info=True)
+    return layouts
+
+
+def _resolve(wanted: str, layouts: dict[str, Any]) -> Optional[Any]:
+    """The layout a plan names, allowing for what PowerPoint does to names.
+
+    Exact first. Then normalised, because case, spacing and punctuation drift
+    between a designer's master and the same layout after a round trip. Then
+    with PowerPoint's duplicate prefix stripped: loading a design whose layout
+    name is already taken produces '1_One Column', and that is the same layout
+    as 'One Column' by every meaning except the string.
+    """
+    exact = layouts.get(wanted)
+    if exact is not None:
+        return exact
+
+    folded = {normalize_layout_name(name): layout for name, layout in layouts.items()}
+    match = folded.get(normalize_layout_name(wanted))
+    if match is not None:
+        return match
+
+    bare = {
+        normalize_layout_name(_undecorated(name)): layout
+        for name, layout in layouts.items()
     }
+    return bare.get(normalize_layout_name(_undecorated(wanted)))
+
+
+def _undecorated(name: str) -> str:
+    """'1_One Column' -> 'One Column'. PowerPoint's own duplicate marker."""
+    head, sep, tail = name.partition("_")
+    return tail if sep and head.isdigit() and tail else name
+
+
+def _fallback(layouts: dict[str, Any], plans: dict[int, str]) -> Optional[str]:
+    """The layout to put a slide on when the one picked for it is not there.
+
+    The layout the rest of this deck is already landing on, which is the
+    closest thing to "where this slide belongs" that is knowable here without
+    re-running the matcher against a set of layouts it never saw.
+
+    It exists so that no slide is left behind. A slide that keeps its original
+    design keeps that design alive in the output, and the whole point of
+    applying a master is that the deck comes out carrying the master's layouts
+    and nothing else. Every slide placed this way is marked `forced` and named
+    in the report, because "on the master" and "on the right layout" are two
+    different claims.
+    """
+    landed = Counter(
+        name for name in plans.values() if _resolve(name, layouts) is not None
+    )
+    if landed:
+        return landed.most_common(1)[0][0]
+    return next(iter(layouts), None)
 
 
 def _restyle(presentation: Any, layouts: dict[str, Any], plans: dict[int, str]):
     """The copy/apply/delete walk. One slide at a time, count never changes."""
     outcomes: list[SlideOutcome] = []
     total = int(presentation.Slides.Count)
+    fallback = _fallback(layouts, plans)
 
     for number in range(1, total + 1):
         wanted = plans.get(number)
@@ -272,7 +456,11 @@ def _restyle(presentation: Any, layouts: dict[str, Any], plans: dict[int, str]):
                 number, None, False, "no layout was chosen for this slide"
             ))
             continue
-        target = layouts.get(wanted)
+        target = _resolve(wanted, layouts)
+        forced = False
+        if target is None and fallback is not None:
+            target, forced = layouts.get(fallback), True
+            wanted = fallback
         if target is None:
             outcomes.append(SlideOutcome(
                 number, wanted, False,
@@ -287,7 +475,15 @@ def _restyle(presentation: Any, layouts: dict[str, Any], plans: dict[int, str]):
             _retry(lambda: setattr(copy, "CustomLayout", target))
             _restore(copy, photographs, _has_picture_slot(target))
             _retry(lambda: presentation.Slides(index).Delete())
-            outcomes.append(SlideOutcome(number, wanted, True))
+            outcomes.append(SlideOutcome(
+                number, wanted, True,
+                detail=(
+                    f"the layout picked for this slide is not in the master, "
+                    f"so it was placed on {wanted!r} with the rest of the deck"
+                    if forced else ""
+                ),
+                forced=forced,
+            ))
         except Exception as exc:
             outcomes.append(
                 SlideOutcome(number, wanted, False, f"apply failed: {exc}")
@@ -534,18 +730,22 @@ def _shapes(container: Any):
             continue
 
 
-def _stragglers(presentation: Any, design: Any) -> list[int]:
-    """Slides not on the applied design, read BEFORE any design is deleted.
+def _stragglers(presentation: Any, designs: list[Any]) -> list[int]:
+    """Slides on none of the master's designs, read BEFORE any is deleted.
 
     Deleting a design shifts the indexes, so asking afterwards compares
     against a number that has moved.
+
+    Plural because the master can define several slide masters and every one
+    of them is now loaded. A slide on the second of them is on the master, and
+    counting it as a straggler would report the fix as the failure.
     """
     try:
-        applied = design.Index
+        applied = {int(design.Index) for design in designs}
         return [
             i
             for i in range(1, int(presentation.Slides.Count) + 1)
-            if presentation.Slides(i).Design.Index != applied
+            if int(presentation.Slides(i).Design.Index) not in applied
         ]
     except Exception:
         log.debug("could not read which slides kept another design", exc_info=True)

@@ -7,6 +7,21 @@ Two things happen here, in order:
    The AI names the finding it is restating by ref, and that is what decides
    it -- matching on the wording of `found` never worked, because the two
    layers describe the same defect in different words.
+
+   The ref is not always there. On one real run the model labelled every
+   restatement and 13 of 19 rule findings absorbed one; on another it labelled
+   none, and 6 of its 11 findings reached the report as separate entries
+   restating a rule finding sitting right beside them -- "The title
+   placeholder is empty" next to `title.missing` on the same shape. Duplicated
+   in the report, and worse than duplicated: the rule finding has a fixer and
+   the restatement does not, so the same defect appeared twice, once
+   correctable and once not.
+
+   So an unlabelled AI finding is matched on WHERE it is -- slide, shape,
+   category -- and only when exactly one rule finding sits there. Ambiguity is
+   left alone: two `space` findings on one title are two different defects,
+   and folding a restatement into whichever came first would attach the
+   model's explanation to the wrong one.
 2. Ordering. Severity first, then deck, then slide, so the report reads in the
    order a designer would work through it.
 """
@@ -37,21 +52,73 @@ def merge_issues(
     ref_lookup = ref_lookup or {}
     kept: list[Issue] = list(rule_issues)
     by_ref = dict(ref_lookup)
-    by_key = {issue.dedupe_key(): issue for issue in kept}
+    by_place = _by_place(rule_issues)
+    absorbed: set[int] = set()
+    # AI findings already kept, so two batches restating one another do not
+    # both land. Rule findings are NOT in here: `dedupe_key` carries `found`,
+    # and the two layers word that differently, so against a rule finding it
+    # matched almost nothing -- and where it did match it was a plain dict,
+    # so two rule findings sharing a key silently collapsed to whichever came
+    # last. `_in_the_same_place` does that job now, and refuses the ambiguity
+    # instead of resolving it by accident.
+    seen_ai: dict[tuple, Issue] = {}
 
     for issue in ai_issues:
         if issue.confidence is not None and issue.confidence < min_confidence:
             continue
-        # The AI names what it is restating. Trust that before guessing from
-        # the text, which is what the dedupe key can only do.
-        existing = by_ref.get(issue.confirms or "") or by_key.get(issue.dedupe_key())
+        # The AI names what it is restating. Trust that first; fall back to
+        # where the finding sits only when it named nothing.
+        existing = by_ref.get(issue.confirms or "")
+        if existing is None and not issue.confirms:
+            existing = (
+                seen_ai.get(issue.dedupe_key())
+                or _in_the_same_place(issue, by_place, absorbed)
+            )
         if existing is not None:
             _absorb(existing, issue)
+            absorbed.add(id(existing))
             continue
         kept.append(issue)
-        by_key[issue.dedupe_key()] = issue
+        seen_ai[issue.dedupe_key()] = issue
 
     return sort_issues(kept)
+
+
+def _place(issue: Issue) -> tuple:
+    """Where a finding is, on terms both layers can agree on.
+
+    Not `found`: the two layers word the same defect differently and always
+    have. Not the shape id either -- the AI is given shape names, not ids, so
+    a name is the only handle it can return.
+    """
+    return (
+        issue.deck or "",
+        issue.slide,
+        (issue.shape or "").strip().casefold(),
+        issue.category.value,
+    )
+
+
+def _by_place(rule_issues: Sequence[Issue]) -> dict[tuple, list[Issue]]:
+    places: dict[tuple, list[Issue]] = {}
+    for issue in rule_issues:
+        places.setdefault(_place(issue), []).append(issue)
+    return places
+
+
+def _in_the_same_place(
+    issue: Issue, by_place: dict[tuple, list[Issue]], absorbed: set[int]
+) -> Optional[Issue]:
+    """The one rule finding this unlabelled AI finding restates, or None.
+
+    One, or nothing. Two rule findings in the same place are two defects and
+    there is no way to tell which was meant; and a rule finding that has
+    already taken a restatement does not take a second, because absorbing
+    overwrites what the first one contributed.
+    """
+    candidates = by_place.get(_place(issue), ())
+    free = [c for c in candidates if id(c) not in absorbed]
+    return free[0] if len(free) == 1 else None
 
 
 

@@ -14,10 +14,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from ..models import (
     Category,
+    FixAction,
     Issue,
     Severity,
     SkippedRule,
@@ -88,8 +89,28 @@ def _issue(entry: dict[str, Any]) -> Issue:
         suggestion=entry.get("suggestion"),
         confidence=entry.get("confidence"),
         evidence=entry.get("evidence"),
+        fix=_fix(entry.get("fix")),
         id=entry.get("id"),
     )
+
+
+def _fix(raw: Any) -> Optional[FixAction]:
+    """The proposed action off a saved report, or None.
+
+    Validated on the way back in, not trusted: a report is a file a person can
+    edit, and an `op` nothing implements would reach the tick list as a fix
+    that cannot run.
+    """
+    if not isinstance(raw, dict):
+        return None
+    action = FixAction(
+        op=str(raw.get("op") or ""),
+        shape=raw.get("shape"),
+        hex=raw.get("hex"),
+        font=raw.get("font"),
+        size_pt=raw.get("size_pt"),
+    )
+    return action if action.valid else None
 
 
 def _enum(cls, value: Any, fallback):

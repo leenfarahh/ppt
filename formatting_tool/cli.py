@@ -139,6 +139,7 @@ def _cmd_validate(args: argparse.Namespace) -> int:
         batch_size=args.batch_size,
         min_confidence=args.min_confidence,
         render=args.render,
+        line_metrics=not getattr(args, "no_line_metrics", False),
         apply_master=args.apply_master,
         master_out=Path(args.master_out) if args.master_out else None,
         ai_debug=args.ai_debug,
@@ -339,6 +340,57 @@ def _report_apply(result) -> None:
     if result.rebuilt is not None:
         print("", file=out)
         _report_rebuild(result.rebuilt)
+    _report_recheck(result, out)
+
+
+def _report_recheck(result, out) -> None:
+    """The second pass: what the rules find on the deck that was just written.
+
+    The report a designer ticked describes the deck as it arrived. Applying
+    the fixes and the master makes it a different file -- type at the master's
+    size instead of the deck's, a box that no longer shrinks its text, a shape
+    that no longer clears its neighbour -- and none of that is in the report,
+    because none of it was true when the report was written.
+
+    `introduced` is the part to read first. Those are the findings this run
+    caused rather than the ones it inherited, and they are the reason the
+    second pass exists at all.
+    """
+    if not result.rechecked:
+        return
+    introduced = result.introduced
+    print(
+        f"\n  Re-checked the result: {len(result.recheck)} finding(s) on the "
+        f"deck as written, {len(introduced)} of them new.",
+        file=out,
+    )
+    if result.second_round:
+        done = sum(1 for o in result.second_round if o.applied)
+        print(
+            f"  Second round: corrected {done} of the {len(result.second_round)} "
+            "this run had caused.",
+            file=out,
+        )
+        for outcome in result.second_round:
+            print(f"    {outcome}", file=out)
+        if result.settled:
+            print(
+                f"  The deck as written measures {len(result.settled)} "
+                "finding(s) now.",
+                file=out,
+            )
+        return
+    if not introduced:
+        return
+    print("  New since the fixes were applied:", file=out)
+    for issue in sorted(
+        introduced, key=lambda i: (i.slide or 0, i.rule_id or "")
+    )[:20]:
+        where = f"slide {issue.slide}" if issue.slide else "deck"
+        shape = f" {issue.shape!r}" if issue.shape else ""
+        print(f"    {issue.rule_id} {where}{shape}: {issue.message}", file=out)
+    if len(introduced) > 20:
+        print(f"    ... and {len(introduced) - 20} more", file=out)
 
 
 def _cmd_classify(args: argparse.Namespace) -> int:
@@ -613,6 +665,17 @@ def _build_parser() -> argparse.ArgumentParser:
             "what only exists once drawn: clipped text, real collisions, "
             "contrast over an image. Needs PowerPoint and pywin32 on Windows; "
             "without them the run continues on geometry alone"
+        ),
+    )
+    validate.add_argument(
+        "--no-line-metrics",
+        action="store_true",
+        help=(
+            "skip reading real line breaks out of PowerPoint. They are the "
+            "only way the orphan and widow checks can run -- where a line "
+            "breaks is the renderer's decision, not something the file "
+            "stores -- but they cost one deck open, a few seconds on a short "
+            "deck and more on a long one"
         ),
     )
     validate.add_argument(

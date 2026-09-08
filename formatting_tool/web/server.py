@@ -304,6 +304,31 @@ class _Handler(BaseHTTPRequestHandler):
 
         return {
             "session": session.id,
+            # The second pass. The report the page ticked describes the deck
+            # as it arrived; this describes the one it is about to download.
+            "recheck": {
+                "ran": result.rechecked,
+                "total": len(result.recheck),
+                # What the second round corrected on the written deck, and
+                # what the deck measures now that it has.
+                "second_round": [
+                    {"id": o.issue.id, "detail": o.detail,
+                     "applied": o.applied, "slide": o.issue.slide}
+                    for o in result.second_round
+                ],
+                "settled": len(result.settled),
+                "introduced": [
+                    {
+                        "id": i.id or i.fingerprint(),
+                        "rule_id": i.rule_id,
+                        "severity": i.severity.value,
+                        "slide": i.slide,
+                        "shape": i.shape,
+                        "message": i.message,
+                    }
+                    for i in result.introduced
+                ],
+            },
             "applied": [
                 {"id": o.issue.id, "detail": o.detail, "slide": o.issue.slide}
                 for o in result.applied

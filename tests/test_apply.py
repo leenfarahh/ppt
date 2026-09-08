@@ -218,12 +218,22 @@ def test_the_canvas_constraint_wins_over_the_grid_preference(tmp_path: Path) -> 
 def test_judgement_calls_have_no_fixer() -> None:
     """A finding a machine cannot correct without guessing is left alone."""
     for rule_id in (
-        "space.overlap",          # names two boxes, cannot know which moves
         "logo.missing",           # needs a logo file
         "title.missing",          # needs copy written
         "layout.not_in_master",   # that is what rebuild is for
+        # Two shapes disagreeing about a height, with nothing in the geometry
+        # to say which of them moved.
+        "space.mirror_pair_offset",
     ):
         assert fixer_for(_issue(rule_id)) is None
+
+
+def test_an_overlap_moves_the_shape_on_top() -> None:
+    """`space.overlap` was on this list, on the grounds that it names two boxes
+    and cannot know which should move. The geometry cannot -- but z-order can:
+    it records which of the two landed on the other. The rule now reports the
+    finding on the shape in front, and that is the one that moves."""
+    assert fixer_for(_issue("space.overlap")) is not None
 
 
 def test_an_ai_finding_has_no_fixer() -> None:

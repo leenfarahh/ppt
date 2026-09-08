@@ -84,17 +84,32 @@ AI_ISSUE_SCHEMA: dict[str, Any] = {
                     "description": (
                         "recolor_fill / recolor_line / recolor_text need "
                         "`hex`; set_font needs `font`; set_font_size needs "
-                        "`size_pt`; disable_autofit and "
-                        "delete_empty_paragraphs need nothing else."
+                        "`size_pt`; move needs `left_in` and `top_in`; "
+                        "resize needs `width_in` and `height_in`; "
+                        "disable_autofit and delete_empty_paragraphs need "
+                        "nothing else."
+                    ),
+                },
+                "shape_id": {
+                    "type": ["integer", "null"],
+                    "description": (
+                        "The `id` of the shape from the payload. Always give "
+                        "this: names repeat within a slide and ids do not, so "
+                        "a fix without it may land on the wrong shape and be "
+                        "refused."
                     ),
                 },
                 "shape": {
                     "type": ["string", "null"],
                     "description": (
-                        "The exact shape name from the payload that this "
-                        "action applies to."
+                        "The exact shape name from the payload, alongside the "
+                        "id."
                     ),
                 },
+                "left_in": {"type": ["number", "null"]},
+                "top_in": {"type": ["number", "null"]},
+                "width_in": {"type": ["number", "null"]},
+                "height_in": {"type": ["number", "null"]},
                 "hex": {
                     "type": ["string", "null"],
                     "description": "Six hex digits, no leading hash.",
@@ -102,7 +117,10 @@ AI_ISSUE_SCHEMA: dict[str, Any] = {
                 "font": {"type": ["string", "null"]},
                 "size_pt": {"type": ["number", "null"]},
             },
-            "required": ["op", "shape", "hex", "font", "size_pt"],
+            "required": [
+                "op", "shape_id", "shape", "hex", "font", "size_pt",
+                "left_in", "top_in", "width_in", "height_in",
+            ],
             "additionalProperties": False,
         },
     },
@@ -263,6 +281,7 @@ def issues_from_response(
 
     issues: list[Issue] = []
     for raw in payload.get("issues", []):
+        fix = _fix(raw.get("fix"))
         issues.append(
             Issue(
                 category=_category(raw.get("category")),
@@ -276,13 +295,17 @@ def issues_from_response(
                 confirms=_first_ref(raw.get("confirms_refs")),
                 slide=raw.get("slide"),
                 shape=raw.get("shape"),
+                # Lifted off the proposal onto the finding, because that is
+                # where the applier looks and where a name alone is not enough
+                # to find a shape: names repeat within a slide, ids do not.
+                shape_id=fix.shape_id if fix else None,
                 deck=deck_name,
                 expected=raw.get("expected"),
                 found=raw.get("found"),
                 suggestion=raw.get("suggestion"),
                 confidence=_confidence(raw.get("confidence")),
                 evidence=_basis(raw.get("basis")),
-                fix=_fix(raw.get("fix")),
+                fix=fix,
             )
         )
 
@@ -301,15 +324,27 @@ def _fix(raw: Any) -> Optional[FixAction]:
     op = str(raw.get("op") or "").strip()
     if op not in FIX_OPS:
         return None
-    size = raw.get("size_pt")
     return FixAction(
         op=op,
         shape=(str(raw["shape"]).strip() or None) if raw.get("shape") else None,
+        shape_id=_whole(raw.get("shape_id")),
         hex=(str(raw["hex"]).strip().lstrip("#").upper() or None)
         if raw.get("hex") else None,
         font=(str(raw["font"]).strip() or None) if raw.get("font") else None,
-        size_pt=float(size) if isinstance(size, (int, float)) else None,
+        size_pt=_number(raw.get("size_pt")),
+        left_in=_number(raw.get("left_in")),
+        top_in=_number(raw.get("top_in")),
+        width_in=_number(raw.get("width_in")),
+        height_in=_number(raw.get("height_in")),
     )
+
+
+def _number(value: Any) -> Optional[float]:
+    return float(value) if isinstance(value, (int, float)) else None
+
+
+def _whole(value: Any) -> Optional[int]:
+    return int(value) if isinstance(value, int) else None
 
 
 def _category(value: Any) -> Category:

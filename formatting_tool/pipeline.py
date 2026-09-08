@@ -48,7 +48,11 @@ from .ai.gemini import Exhausted
 from .ai.payload import DEFAULT_BATCH_SIZE, build_batches, estimate_tokens, payload_to_text, ref_for
 from .extract import derive_master_spec, read_deck
 from .guidelines import load_guidelines
-from .linemetrics import LineMetricsProvider, default_provider
+from .linemetrics import (
+    LineMetricsProvider,
+    NullLineMetrics,
+    default_provider,
+)
 from .render import SlideImages, render_deck
 from .models import (
     DeckProfile,
@@ -82,6 +86,12 @@ class RunConfig:
     batch_size: int = DEFAULT_BATCH_SIZE
     min_confidence: float = 0.0
     render: bool = False        # attach rendered slides to the AI layer
+    # Read real line breaks out of PowerPoint, which is the only way the
+    # orphan and widow checks can run at all: where a line breaks is not in
+    # the file, it is the renderer's decision. Costs one deck open, about
+    # three seconds on a 5-slide file and proportionally more on a long one,
+    # so it can be turned off for a fast pass.
+    line_metrics: bool = True
     ai_debug: bool = False      # keep the raw AI exchange on the report
     ai: AIConfig = field(default_factory=AIConfig)
     # Put every slide on the master's layouts BEFORE anything is measured, and
@@ -182,7 +192,10 @@ def run(config: RunConfig) -> ValidationReport:
             if applied is not None:
                 report.master_applied.append(applied)
 
-        rule_issues = _run_rule_layer(deck, spec)
+        rule_issues = _run_rule_layer(
+            deck, spec,
+            metrics=None if config.line_metrics else NullLineMetrics(),
+        )
         log.info("%s: %d rule finding(s)", deck.name, len(rule_issues))
 
         ai_result = _run_ai_layer(deck, spec, rule_issues, config)

@@ -44,6 +44,10 @@ from lxml import etree
 log = logging.getLogger(__name__)
 
 _A_NS = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+_R_LINK = (
+    "{http://schemas.openxmlformats.org/officeDocument/2006/"
+    "relationships}link"
+)
 _R_EMBED = (
     "{http://schemas.openxmlformats.org/officeDocument/2006/"
     "relationships}embed"
@@ -398,22 +402,47 @@ def _content_key(shape: Any) -> Optional[str]:
 def _copy_onto(slide: Any, shape: Any, position: int) -> bool:
     """Put a copy of a layout's shape on the slide at `position` in the z-order.
 
-    Any image it draws is related to the slide rather than copied, so a
+    Any part it points at is related to the slide rather than copied, so a
     photograph on nine slides is still one image in the file.
+
+    EVERY relationship in the copied subtree, not just the one on `a:blip`.
+    An icon from PowerPoint's library carries two: the `a:blip` and, inside
+    its extension list, an `asvg:svgBlip` pointing at the SVG it actually
+    draws from. Re-pointing only the first left the second holding a
+    relationship id that means something else on the slide, or nothing at all,
+    and the icon arrived as a broken-image box. The tag is not worth matching
+    on -- what matters is that the attribute is there.
     """
     try:
         element = copy.deepcopy(shape._element)
-        for blip in element.iter(f"{_A_NS}blip"):
-            rid = blip.get(_R_EMBED)
-            if not rid:
-                continue
-            part = shape.part.related_part(rid)
-            blip.set(_R_EMBED, slide.part.relate_to(part, _IMAGE_REL))
+        for node in element.iter():
+            for attribute in (_R_EMBED, _R_LINK):
+                rid = node.get(attribute)
+                if not rid:
+                    continue
+                part = shape.part.related_part(rid)
+                node.set(
+                    attribute,
+                    slide.part.relate_to(part, _rel_type_of(shape.part, rid)),
+                )
         slide.shapes._spTree.insert(position, element)
         return True
     except Exception:
         log.debug("could not carry a layout shape onto a slide", exc_info=True)
         return False
+
+
+def _rel_type_of(part: Any, rid: str) -> str:
+    """The relationship type the source used, so the copy declares the same.
+
+    An SVG and its raster fallback are both images, but reading the type back
+    rather than assuming it means a relationship this does not know about is
+    carried across intact instead of being relabelled.
+    """
+    try:
+        return str(part.rels[rid].reltype)
+    except Exception:
+        return _IMAGE_REL
 
 
 def _safe(call):

@@ -22,11 +22,17 @@ from .colors import (
 from .fonts import MixedFontsInShapeRule, ThemeFontDriftRule, UnapprovedFontRule
 from .layouts import LayoutBandRule, LayoutHeaderFooterRule, LayoutMissingRule
 from .logo import LogoGeometryRule, LogoPresenceRule, UnapprovedLogoAssetRule
-from .repeats import RepeatedElementRule, SatelliteOffsetRule
+from .repeats import (
+    MirroredPairRule,
+    RepeatedElementRule,
+    SatelliteOffsetRule,
+    SeriesRowRule,
+)
 from .sizes import AutofitShrinkRule, InconsistentRoleSizeRule, RoleFontSizeRule
 from .space import (
     AlignmentGridRule,
     OffCanvasRule,
+    CrowdedSeriesRule,
     OverlapRule,
     SafeMarginRule,
     TextOverflowRule,
@@ -121,10 +127,13 @@ def build_default_rules(
         AlignmentGridRule(),
         RepeatedElementRule(),
         SatelliteOffsetRule(),
+        SeriesRowRule(),
+        MirroredPairRule(),
         # Space
         OffCanvasRule(),
         SafeMarginRule(),
         OverlapRule(),
+        CrowdedSeriesRule(),
         TextOverflowRule(),
         AutofitShrinkRule(),
         # Typography

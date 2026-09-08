@@ -131,12 +131,20 @@ Proposing a correction, in `fix`:
   outside the role's range -- each is refused and the finding goes to a
   designer. Proposing one costs a fix rather than buying one, so give the
   palette entry, not the colour you would have picked.
-- There is no op for moving or resizing anything, deliberately. You are told
-  not to measure off the image, and geometry is what the deterministic layer
-  proves from the file; a coordinate from you would be the guess this whole
-  instruction exists to prevent.
-- `shape` must be the exact name from the payload, and the shape must be the
-  one your finding is about. A fix on the wrong shape is worse than no fix.
+- `move` and `resize` are available, and are the one place you may reason from
+  geometry to a target. Every box, the slide size and the safe margins are in
+  the payload in inches and all of them are exact, so a position worked out
+  from those is arithmetic on what you were given. It is still not licence to
+  measure off the image: a target you cannot derive from the numbers is a
+  guess, and `basis` is how you say which you did.
+- A proposed box is checked against the safe margins before it is applied and
+  refused if it falls outside them, then put through the same overlap and
+  alignment checks a measured fix gets. Propose the position the payload
+  supports, not the one that looks right.
+- `shape_id` must be the `id` of the shape from the payload, always. Names
+  repeat within a slide -- sixteen shapes called "Pentagon 7" is a real deck
+  -- so a fix carrying only a name may land on the wrong one and be refused.
+  Give the name as well, for a reader.
 - You see one batch of slides at a time. Do not report a deck-level pattern you
   can only see part of; report what this batch shows.
 

@@ -91,8 +91,22 @@ def test_an_ai_finding_with_an_action_becomes_fixable() -> None:
 def test_an_op_nothing_implements_is_not_offered() -> None:
     """A fix that cannot run is worse than a finding saying it needs a
     designer, because it reads as an offer."""
-    assert "move" not in FIX_OPS       # geometry is the rules' job, deliberately
     assert fixer_for(_ai("teleport")) is None
+    assert fixer_for(_ai("delete_slide")) is None
+
+
+def test_geometry_is_a_proposal_like_any_other() -> None:
+    """Refused outright at first, on the grounds that the model is told not to
+    measure off a rendered image. That was the wrong line: the payload carries
+    every box in inches, the slide size and the safe margins, all exact, and
+    reasoning from those is arithmetic on numbers it was given rather than an
+    impression of a picture. What makes it safe is the checking, not the
+    trusting."""
+    from formatting_tool.models import GEOMETRIC_OPS
+
+    assert GEOMETRIC_OPS <= FIX_OPS
+    assert _ai("move", left_in=1.0, top_in=1.0).fix.geometric
+    assert not _ai("recolor_text", hex=NAVY).fix.geometric
 
 
 # --------------------------------------------------------------------------- #

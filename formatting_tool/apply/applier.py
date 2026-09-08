@@ -32,7 +32,9 @@ from typing import Any, Iterable, Optional, Sequence
 
 from ..models import Issue, RuleTuning, Tolerances
 from .fixers import (
+    COHORT,
     GEOMETRIC,
+    is_geometric,
     RELATIVE,
     LeaveAlone,
     fix_order,
@@ -107,6 +109,15 @@ class FixContext:
     # no master to hand, and then no AI-proposed fix runs at all: an unchecked
     # proposal is a guess with a brand label on it.
     brand: Optional[FixBrand] = None
+    # The master's safe margins, in inches, keyed left/top/right/bottom. What a
+    # proposed position is checked against: the model is given these in its
+    # payload, so a target outside them is not a reading it could defend.
+    margins: Optional[dict[str, float]] = None
+    # The other shapes on the finding's slide, filled in per finding. Scratch
+    # rather than configuration: the two fixes that spread a row need to find
+    # the row, and going back to the file for it would re-read a deck the
+    # applier already has open.
+    neighbours: list = field(default_factory=list)
 
 
 @dataclass
@@ -132,10 +143,35 @@ class ApplyResult:
     applied: list[FixOutcome] = field(default_factory=list)
     skipped: list[FixOutcome] = field(default_factory=list)
     rebuilt: Optional[Any] = None      # RebuildResult, when --rebuild was asked for
+    # What the rules find on the deck that was just written, as opposed to the
+    # one that was measured. See `_recheck`.
+    recheck: list[Issue] = field(default_factory=list)
+    rechecked: bool = False
+    # What the second round applied to the written deck, and what it measured
+    # afterwards. See `_second_round`.
+    second_round: list[FixOutcome] = field(default_factory=list)
+    settled: list[Issue] = field(default_factory=list)
 
     @property
     def changed(self) -> int:
         return len(self.applied)
+
+    @property
+    def introduced(self) -> list[Issue]:
+        """Findings on the output that the input did not have.
+
+        Matched on rule and place rather than on id: an id carries the message,
+        and a message carrying a measurement changes when the measurement does,
+        so an overlap that grew from 2.79 to 3.10 sq in would read as a new
+        finding rather than the same one made worse.
+        """
+        before = {(i.rule_id, i.slide, i.shape) for i in self.before}
+        return [
+            issue for issue in self.recheck
+            if (issue.rule_id, issue.slide, issue.shape) not in before
+        ]
+
+    before: list[Issue] = field(default_factory=list)
 
 
 def fixable(issues: Iterable[Issue]) -> list[Issue]:
@@ -179,6 +215,7 @@ def apply_fixes(
         align_tolerance_in=(tolerances or Tolerances()).position_in,
         max_drift_in=(tuning or RuleTuning()).repeat_max_drift_in,
         brand=FixBrand.from_spec(spec) if spec is not None else None,
+        margins=_margins_of(spec),
     )
     result = ApplyResult(deck=deck.name, output=out)
 
@@ -218,7 +255,103 @@ def apply_fixes(
 
     if master is not None:
         result.rebuilt = _rebuild_in_place(master, out, tuning)
+
+    result.before = list(issues)
+    _recheck(result, spec)
+    _second_round(result, context, spec)
     return result
+
+
+def _second_round(
+    result: ApplyResult, context: FixContext, spec: Optional[Any]
+) -> None:
+    """Correct what this run caused, on the deck it wrote.
+
+    The first round applies what a designer ticked, measured against the deck
+    as it arrived. Applying it makes a different file -- type at the master's
+    size, a box that no longer shrinks its text, a shape that no longer clears
+    its neighbour -- and some of what that file measures was not true when the
+    list was ticked, so it could not have been on it.
+
+    ONLY what this run introduced, which is the line that keeps this from
+    exceeding its mandate. A finding the deck already had and the designer did
+    not tick is one they chose to leave; picking it up here would apply
+    something nobody asked for. A finding that appeared because of the fixes
+    is this run's mess, and clearing it up is finishing the job rather than
+    widening it.
+
+    One round, never a loop. A fix that provokes a finding that provokes
+    another fix is a fight between two rules, and the honest end of that is a
+    report saying so rather than a deck that keeps moving.
+    """
+    if not result.rechecked:
+        return
+    todo = fixable(result.introduced)
+    if not todo:
+        result.settled = list(result.recheck)
+        return
+
+    from pptx import Presentation  # noqa: PLC0415 - lazy heavy dependency
+
+    try:
+        presentation = Presentation(str(result.output))
+        moved: set[tuple[Optional[int], Optional[int]]] = set()
+        for issue in sorted(todo, key=fix_order):
+            outcome = _apply_one(issue, presentation, context, None, moved)
+            result.second_round.append(outcome)
+            if outcome.applied and (issue.rule_id or "") in GEOMETRIC:
+                moved.add((issue.slide, issue.shape_id))
+        presentation.save(str(result.output))
+    except Exception:
+        log.warning(
+            "could not apply the second round to %s; the first round is "
+            "applied and the file is written",
+            result.output.name, exc_info=True,
+        )
+        return
+
+    # Measure once more, so what is reported is the file as it now stands.
+    _recheck(result, spec)
+    result.settled = list(result.recheck)
+
+
+def _recheck(result: ApplyResult, spec: Optional[Any]) -> None:
+    """Measure the deck that was written, not the one that was measured.
+
+    The report a designer ticks describes the ORIGINAL. By the time it has
+    been applied and rebuilt onto the master, the deck is a different file:
+    type is the master's size rather than the deck's, a box that shrank its
+    text to fit no longer does, and a shape that cleared its neighbour by a
+    hair no longer clears it. None of that is in the report, because none of
+    it was true when the report was written.
+
+    So the rules are run again on the output. Only the deterministic layer --
+    the AI layer costs money and a second opinion on a file nobody has looked
+    at yet is not worth it. What comes back is the honest state of the deck
+    being sent, and `introduced` is the part that matters: what this run
+    caused rather than what it inherited.
+
+    Never fatal. The fixes are applied and the file is written by the time
+    this runs; a rule that cannot read the output costs the recheck, not the
+    work.
+    """
+    if spec is None:
+        return
+    from ..extract import read_deck            # noqa: PLC0415 - lazy, heavy
+    from ..rules import RuleContext, build_default_rules, run_rules
+
+    try:
+        deck = read_deck(result.output)
+        result.recheck = run_rules(
+            RuleContext(deck=deck, spec=spec), build_default_rules()
+        )
+        result.rechecked = True
+    except Exception:
+        log.warning(
+            "could not re-check %s after applying; the fixes are applied and "
+            "the file is written, but nothing has measured the result",
+            result.output.name, exc_info=True,
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -271,9 +404,13 @@ def _apply_one(
             "see whether anything is still out of line",
         )
 
-    geometric = (issue.rule_id or "") in GEOMETRIC
+    geometric = is_geometric(issue)
     before = (shape.left, shape.top) if geometric else None
-    neighbours = _neighbours(presentation, issue, shape) if geometric else []
+    neighbours = (
+        _neighbours(presentation, issue, shape)
+        if geometric or (issue.rule_id or "") in _NEEDS_NEIGHBOURS
+        else []
+    )
     covered_before = _covered(shape, neighbours) if geometric else {}
     partners = (
         [
@@ -290,6 +427,7 @@ def _apply_one(
         else set()
     )
 
+    context.neighbours = neighbours
     try:
         detail = fixer(shape, issue, context)
     except LeaveAlone as reason:
@@ -319,12 +457,42 @@ def _apply_one(
             shape, partners, context.align_tolerance_in
         )
         if broken:
+            # The set is what is out of place, so the set is what moves. A
+            # column of shapes all sitting 0.44in outside the margin is not
+            # eight findings about eight shapes; it is one column in the wrong
+            # place, and moving any one of them in breaks the column.
+            delta = (shape.left - before[0], shape.top - before[1])
             shape.left, shape.top = before
-            names = ", ".join(sorted(broken)[:3])
+            move = (
+                _cohort_move(shape, partners, neighbours, delta, context)
+                if (issue.rule_id or "") in COHORT
+                else None
+            )
+            if move is None:
+                names = ", ".join(sorted(broken)[:3])
+                return FixOutcome(
+                    issue,
+                    False,
+                    f"left alone: moving it would break its alignment with {names}",
+                )
+            worse = _cohort_worsened(move, neighbours)
+            if worse:
+                move.revert()
+                names = ", ".join(sorted(worse)[:3])
+                return FixOutcome(
+                    issue,
+                    False,
+                    "left alone: moving the set it belongs to would put it "
+                    f"further over {names}",
+                )
+            aligned = (
+                f", {move.aligned} of them onto the edge first" if move.aligned
+                else ""
+            )
             return FixOutcome(
-                issue,
-                False,
-                f"left alone: moving it would break its alignment with {names}",
+                issue, True,
+                f"{detail}, and the {move.carried} shape(s) aligned with it"
+                f"{aligned}, so the set moves as one",
             )
 
         worse = _worsened(covered_before, _covered(shape, neighbours))
@@ -350,6 +518,26 @@ def _apply_one(
     return FixOutcome(issue, True, detail)
 
 
+# Fixes that read the shapes around the one they were given without moving it.
+_NEEDS_NEIGHBOURS = frozenset({"space.series_crowded"})
+
+
+def _margins_of(spec: Optional[Any]) -> Optional[dict[str, float]]:
+    """The master's safe margins as plain inches, or None when it declares none."""
+    margins = getattr(spec, "safe_margins", None)
+    if margins is None:
+        return None
+    kept = {}
+    for side in ("left", "top", "right", "bottom"):
+        # `Margins` names its fields for the unit, and an edge it does not
+        # declare is None rather than zero -- there is no sensible default
+        # frame, so an unset edge simply does not constrain anything.
+        value = getattr(margins, f"{side}_in", None)
+        if value is not None:
+            kept[side] = float(value)
+    return kept or None
+
+
 def _worsened(before: dict[str, int], after: dict[str, int]) -> set[str]:
     """Neighbours this shape now covers more of than it did.
 
@@ -373,8 +561,31 @@ def _neighbours(presentation: Any, issue: Issue, shape: Any) -> list[Any]:
     slides = list(presentation.slides)
     if not issue.slide or not 1 <= issue.slide <= len(slides):
         return []
-    own = {id(s) for s in _walk([shape])}
-    return [s for s in slides[issue.slide - 1].shapes if id(s) not in own]
+    own = _identities([shape])
+    return [
+        s for s in slides[issue.slide - 1].shapes
+        if not (_identities([s]) & own)
+    ]
+
+
+def _identities(shapes: Any) -> set:
+    """A shape and its descendants, identified by OOXML id.
+
+    NOT by `id()`. python-pptx hands out a fresh proxy object every time a
+    shape collection is walked, so the shape found for a finding and the same
+    shape met again while listing its neighbours are two Python objects with
+    two identities. Excluding by those excluded nothing, and the shape came
+    out as its own neighbour -- invisible for a move, because covering
+    yourself does not change when you move, and immediate for a resize, which
+    grew its own self-overlap and was refused for landing on itself.
+    """
+    found = set()
+    for shape in _walk(shapes):
+        try:
+            found.add(int(shape.shape_id))
+        except Exception:
+            found.add(id(shape))        # unidentifiable: at least be consistent
+    return found
 
 
 EMU_PER_INCH = 914400
@@ -543,3 +754,187 @@ def _rebuild_in_place(
         return rebuild(master, staged, target, tuning=tuning)
     finally:
         staged.unlink(missing_ok=True)
+
+
+# --------------------------------------------------------------------------- #
+# Moving a set rather than a member
+# --------------------------------------------------------------------------- #
+#
+# The refusal this exists to answer, from a real deck: 37 of 50 safe-margin
+# fixes came back "moving it would break its alignment with ...". Not one of
+# them was wrong. Slide 1 carried a column of shapes all sitting at left
+# 0.48in against a 0.92in margin, so every one of them was 0.44in outside it,
+# and moving any single one in would have broken the column.
+#
+# The set is what is out of place, so the set is what moves. Every shape
+# sharing the edge travels the same distance -- the move a designer makes by
+# selecting the column and nudging it, and the one that keeps the column a
+# column.
+#
+# Members slightly off the shared edge are put ON it first. Alignment within
+# tolerance is not alignment, it is drift a tolerance forgave, and carrying it
+# along would preserve it at the new position forever. So the set is aligned,
+# then moved: two steps, in that order, because moving a ragged set only
+# relocates the raggedness.
+#
+# Shapes no finding named do move here, which is a departure and a deliberate
+# one. A column half corrected is worse than a column uncorrected. Every shape
+# that moves is checked against its own neighbours before the move is allowed
+# to stand, which is the same check a single move has always had.
+
+
+@dataclass
+class CohortMove:
+    """A set of shapes moved together, and what it takes to put them back."""
+
+    shapes: list[Any]
+    origin: dict[int, tuple[int, int]]
+    covered: dict[int, dict[str, int]]      # what each covered before it moved
+    aligned: int = 0                        # how many were snapped onto the edge
+
+    def revert(self) -> None:
+        for shape in self.shapes:
+            position = self.origin.get(id(shape))
+            if position is not None:
+                shape.left, shape.top = position
+
+    @property
+    def carried(self) -> int:
+        """Shapes that came along, not counting the one the finding named."""
+        return max(0, len(self.shapes) - 1)
+
+
+def _cohort_move(
+    shape: Any,
+    partners: list[Any],
+    neighbours: list[Any],
+    delta: tuple[int, int],
+    context: FixContext,
+) -> Optional[CohortMove]:
+    """Align the set this shape belongs to, then move all of it by `delta`.
+
+    None when there is no set to move, which leaves the caller to refuse the
+    finding exactly as it did before this existed.
+    """
+    dx, dy = delta
+    if not dx and not dy:
+        return None
+
+    members = _sharing_an_edge(shape, partners, context.align_tolerance_in, dx, dy)
+    if not members:
+        return None
+
+    shapes = [shape] + [other for other, _edge in members]
+    carried = _identities(shapes)
+    move = CohortMove(
+        shapes=shapes,
+        origin={id(s): (s.left, s.top) for s in shapes},
+        covered={
+            s.shape_id: _covered(
+                s, [n for n in neighbours if not (_identities([n]) & carried)]
+            )
+            for s in shapes
+        },
+    )
+
+    try:
+        for other, edge in members:
+            if _align_to(other, shape, edge):
+                move.aligned += 1
+        for other in shapes:
+            other.left = (other.left or 0) + dx
+            other.top = (other.top or 0) + dy
+    except Exception:
+        move.revert()
+        log.debug("could not move a set of shapes together", exc_info=True)
+        return None
+    return move
+
+
+def _cohort_worsened(
+    move: CohortMove, neighbours: list[Any]
+) -> set[str]:
+    """Neighbours any of the moved shapes now covers more of.
+
+    Every shape that moved, not only the one the finding named: a shape
+    dragged along by its column can land on something just as easily as the
+    one that was asked to move.
+    """
+    carried = _identities(move.shapes)
+    outside = [n for n in neighbours if not (_identities([n]) & carried)]
+    worse: set[str] = set()
+    for shape in move.shapes:
+        worse |= _worsened(
+            move.covered.get(shape.shape_id, {}), _covered(shape, outside)
+        )
+    return worse
+
+
+def _sharing_an_edge(
+    shape: Any, partners: list[Any], tolerance_in: float, dx: int, dy: int
+) -> list[tuple[Any, str]]:
+    """The partners this shape is aligned with, on the axis it is moving along.
+
+    Only the moving axis: a horizontal nudge cannot break a shared top edge,
+    so a shape sharing only that has no business being dragged sideways.
+    """
+    box = _box(shape)
+    if box is None:
+        return []
+    left, top, right, bottom = box
+    wanted: dict[str, int] = {}
+    if dx:
+        wanted.update(
+            {"left": left, "right": right, "centre-x": (left + right) // 2}
+        )
+    if dy:
+        wanted.update(
+            {"top": top, "bottom": bottom, "centre-y": (top + bottom) // 2}
+        )
+
+    slack = int(tolerance_in * EMU_PER_INCH)
+    found: list[tuple[Any, str]] = []
+    for other in partners:
+        theirs = _box(other)
+        if theirs is None:
+            continue
+        o_left, o_top, o_right, o_bottom = theirs
+        edges = {
+            "left": o_left, "right": o_right, "centre-x": (o_left + o_right) // 2,
+            "top": o_top, "bottom": o_bottom, "centre-y": (o_top + o_bottom) // 2,
+        }
+        for edge, value in wanted.items():
+            if abs(edges[edge] - value) <= slack:
+                found.append((other, edge))
+                break
+    return found
+
+
+def _align_to(other: Any, shape: Any, edge: str) -> bool:
+    """Put `other` exactly on the edge it already nearly shares with `shape`.
+
+    True when that actually moved it, which is what makes the difference
+    between a set that was aligned and one that was merely within tolerance
+    of being aligned.
+    """
+    box, theirs = _box(shape), _box(other)
+    if box is None or theirs is None:
+        return False
+    left, top, right, bottom = box
+    o_left, o_top, o_right, o_bottom = theirs
+    width, height = o_right - o_left, o_bottom - o_top
+    was = (other.left, other.top)
+
+    if edge == "left":
+        other.left = left
+    elif edge == "right":
+        other.left = right - width
+    elif edge == "centre-x":
+        other.left = ((left + right) // 2) - width // 2
+    elif edge == "top":
+        other.top = top
+    elif edge == "bottom":
+        other.top = bottom - height
+    elif edge == "centre-y":
+        other.top = ((top + bottom) // 2) - height // 2
+    return (other.left, other.top) != was

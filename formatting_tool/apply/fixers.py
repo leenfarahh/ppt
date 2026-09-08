@@ -49,6 +49,8 @@ GEOMETRIC = frozenset(
         "space.safe_margin",
         "space.alignment_grid",
         "space.repeat_out_of_line",
+        "space.overlap",
+        "space.row_out_of_line",
         "space.satellite_offset",
         "title.position_inconsistent",
         "logo.geometry",
@@ -70,6 +72,20 @@ GEOMETRIC = frozenset(
 # actually went wrong.
 RELATIVE = frozenset({"space.satellite_offset"})
 
+# Fixes allowed to move a shape's whole alignment set rather than refuse.
+#
+# The hard constraints only, and that is the whole distinction. A deck cannot
+# ship with content outside the frame, so when a column of shapes is outside
+# it together, the column moves together -- shapes no finding named included,
+# because a column half corrected is worse than one uncorrected.
+#
+# A grid snap is a preference, and dragging a neighbour to satisfy a
+# preference is the failure that got `space.alignment_grid` disabled once
+# already: a section label pulled off the table it captioned, and with a set
+# move it would take the table with it. So these stay single-shape moves and
+# still refuse when they would break an alignment.
+COHORT = frozenset({"space.safe_margin", "space.off_canvas"})
+
 # Whitespace that is safe to strip from the end of a paragraph. A vertical tab
 # is a soft line break, which is `typography.manual_line_break`'s business and
 # a deliberate act often enough that removing it here would be a surprise.
@@ -83,6 +99,19 @@ _QUOTED_FONT = re.compile(r"explicit\s+(.+?)\s*$")
 # the unit together, so a lone measurement elsewhere in the same sentence
 # cannot be read as half a point.
 _POINT = re.compile(r"([-+]?\d+(?:\.\d+)?)\s*,\s*([-+]?\d+(?:\.\d+)?)\s*in")
+# "centre y 3.00in, as the rest of the row" -> ("y", 3.00). A row lines up on
+# its middle, not on an edge, so this is a different thing to read than
+# `_EDGE`.
+_CENTRE = re.compile(r"centre\s+([xy])\s+([-+]?\d+(?:\.\d+)?)\s*in", re.IGNORECASE)
+_N = r"([-+]?\d+(?:\.\d+)?)"
+# "clear of 'Tab 0' at 1.00, 0.40, 1.90 x 0.40in"
+_RECT = re.compile(
+    rf"at\s+{_N}\s*,\s*{_N}\s*,\s*{_N}\s*x\s*{_N}\s*in", re.IGNORECASE
+)
+# "evenly spaced across 1.00-8.90in, gap 0.38in"
+_SPREAD = re.compile(
+    rf"across\s+{_N}\s*-\s*{_N}\s*in.*?gap\s+{_N}\s*in", re.IGNORECASE
+)
 # "theme:accent1 #C00000" -> C00000, and "#DADADA" -> DADADA. Six hex digits
 # anchored on the hash, so a delta-E or a shape name in the same sentence
 # cannot be mistaken for a colour.
@@ -315,6 +344,158 @@ def _move_onto(
     shape.left, shape.top = wanted_left, wanted_top
     return (
         f"moved {what} {dx:+.2f}, {dy:+.2f}in onto the position {whose} holds"
+    )
+
+
+def fix_overlap(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[str]:
+    """Nudge the shape that is on top clear of the one under it.
+
+    Two boxes overlap and the geometry cannot say which is in the wrong place,
+    which is why this had no fixer for so long. What it can say is which one
+    landed on the other: z-order records that, and `space.overlap` now reports
+    the finding on the shape in front. So the one that moves is the one that
+    arrived last, which is the same call a designer makes without thinking
+    about it.
+
+    The shortest way out, along one axis. A diagonal nudge clears the same
+    collision by moving further and lands the shape somewhere neither box
+    suggested; pushing straight off the nearest edge keeps whatever alignment
+    the shape had on the other axis.
+    """
+    box = _rect(issue.expected)
+    if box is None:
+        return None
+    if shape.left is None or shape.top is None:
+        return None
+
+    left, top = shape.left, shape.top
+    width, height = shape.width or 0, shape.height or 0
+    other_left, other_top = _emu(box[0]), _emu(box[1])
+    other_right, other_bottom = other_left + _emu(box[2]), other_top + _emu(box[3])
+
+    if left >= other_right or left + width <= other_left:
+        return None
+    if top >= other_bottom or top + height <= other_top:
+        return None
+
+    clear = _emu(_CLEARANCE_IN)
+    ways = (
+        (other_right - left + clear, 0),                 # push right
+        (other_left - (left + width) - clear, 0),        # push left
+        (0, other_bottom - top + clear),                 # push down
+        (0, other_top - (top + height) - clear),         # push up
+    )
+    dx, dy = min(ways, key=lambda way: abs(way[0]) + abs(way[1]))
+
+    new_left, new_top = left + dx, top + dy
+    if not (
+        0 <= new_left and new_left + width <= ctx.width_emu
+        and 0 <= new_top and new_top + height <= ctx.height_emu
+    ):
+        raise LeaveAlone(
+            "the only way clear of the shape under it runs off the slide, so "
+            "one of the two has to be resized or its copy shortened"
+        )
+
+    shape.left, shape.top = new_left, new_top
+    return (
+        f"moved {dx / EMU_PER_INCH:+.2f}, {dy / EMU_PER_INCH:+.2f}in clear of "
+        "the shape underneath, being the one on top of it"
+    )
+
+
+# A hair of daylight, so a shape pushed clear does not come back next run as
+# touching to the nearest EMU.
+_CLEARANCE_IN = 0.02
+
+
+def fix_series_crowded(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[str]:
+    """Spread a collapsed row evenly across the space it already occupies.
+
+    What Distribute Horizontally does, and the only thing that works on a row
+    where every pair overlaps: push the second tab clear of the first and it
+    lands on the third, which is exactly what the move guard refuses. The set
+    has to be spread at once.
+
+    Safe in a way a single move is not, and that is why it may touch shapes no
+    finding named: distributing inside the row's existing span never grows the
+    row's footprint, so it cannot land on anything outside it. The leftmost
+    shape -- the one the finding names -- does not move at all.
+    """
+    start, span, gap = _spread(issue.expected)
+    if start is None or span is None or gap is None:
+        return None
+    if gap < 0:
+        raise LeaveAlone(
+            f"the shapes are wider than the row they sit in, so spreading "
+            f"them still leaves {abs(gap):.2f}in of overlap; they have to be "
+            "narrowed or the row widened"
+        )
+
+    row = _row_with(shape, ctx.neighbours)
+    if len(row) < 2:
+        return None
+
+    cursor = _emu(start)
+    moved = 0
+    for member in row:
+        if member.left != cursor:
+            member.left = cursor
+            moved += 1
+        cursor += (member.width or 0) + _emu(gap)
+    return (
+        f"spread {len(row)} shapes evenly across {start:.2f}-{span:.2f}in "
+        f"with a {gap:.2f}in gap, moving {moved} of them"
+    )
+
+
+def _row_with(shape: Any, neighbours: list) -> list:
+    """The shape and the same-sized shapes sharing its row, left to right."""
+    width, height = shape.width, shape.height
+    centre = (shape.top or 0) + (shape.height or 0) / 2
+    slack = _emu(_ROW_SLACK_IN)
+    row = [shape] + [
+        other for other in neighbours
+        if other.width == width and other.height == height
+        and abs(((other.top or 0) + (other.height or 0) / 2) - centre) <= slack
+    ]
+    return sorted(row, key=lambda s: s.left or 0)
+
+
+# How far a member's centre can sit from the row's and still be in the row.
+_ROW_SLACK_IN = 0.2
+
+
+def fix_row_out_of_line(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[str]:
+    """Put a shape back on the centre line its row or column shares.
+
+    The same act as `space.repeat_out_of_line`, one axis over. That rule reads
+    a shared left or top edge; this one reads a shared centre, because a row
+    of shapes of different heights lines up on its middle and not on its top.
+
+    The row already did the judging: three or more members agreeing is the
+    intent and this one is the exception, which is why the rule reports
+    nothing for a row of two -- there the two disagree and neither is a
+    majority. Those are `space.mirror_pair_offset`, and they go to a designer.
+    """
+    axis, target = _centre_line(issue.expected)
+    if axis is None or target is None:
+        return None
+
+    side = "left" if axis == "x" else "top"
+    extent = shape.width if axis == "x" else shape.height
+    current = getattr(shape, side)
+    if current is None or extent is None:
+        return None
+
+    wanted = int(round(target * EMU_PER_INCH - extent / 2))
+    if wanted == current:
+        return None
+    moved = (wanted - current) / EMU_PER_INCH
+    setattr(shape, side, wanted)
+    return (
+        f"moved {moved:+.2f}in onto the centre {axis} of {target:.2f}in "
+        "the rest of the set shares"
     )
 
 
@@ -611,6 +792,104 @@ def fix_terminal_punctuation(shape: Any, issue: Issue, ctx: "FixContext") -> Opt
     return None
 
 
+def fix_orphan_widow(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[str]:
+    """Bind the last two words together so the wrap takes both down.
+
+    A non-breaking space, which is what a typesetter does and the only one of
+    the obvious options that is not a design decision:
+
+    - Widening the box changes the composition, and re-wraps the whole
+      paragraph, so it may strand a different word instead of no word.
+    - Editing the copy is the writer's call.
+    - "Pull the last word back onto the previous line" is not a separate
+      option; it is what this does. A word cannot be moved without changing
+      where the line breaks, and the break is what a non-breaking space moves.
+
+    One character, no words changed, and undone by deleting it. What it does
+    not do is guarantee the result: binding two words can push both onto the
+    last line and leave two words there, or -- on a very narrow box -- push a
+    longer stub down. The second pass re-measures the deck that was written,
+    with the same renderer, which is where that is caught.
+
+    Only the stranded-word finding. The same rule reports a short last line
+    and a title wrapping past its limit, and neither is fixed by binding two
+    words: a stub is a stub whichever line it sits on.
+    """
+    if not _ORPHAN.search(issue.message or ""):
+        raise LeaveAlone(
+            "this is a short last line or a title wrapping too far, not a "
+            "stranded word; binding two words does not answer either"
+        )
+    if not _has_text(shape):
+        return None
+
+    stranded = (issue.found or "").strip()
+    paragraph = _paragraph_ending_with(shape, stranded)
+    if paragraph is None:
+        raise LeaveAlone(
+            "the copy has changed since the report was made, so the line this "
+            "names is no longer there"
+        )
+    if not _bind_last_two_words(paragraph):
+        raise LeaveAlone(
+            "there is only one word to bind, so nothing can be brought down "
+            "with it"
+        )
+    return (
+        f"bound {stranded!r} to the word before it with a non-breaking space, "
+        "so the two wrap together"
+    )
+
+
+# "Last line is a single stranded word ('everywhere')." -- the one variant of
+# this rule a non-breaking space answers.
+_ORPHAN = re.compile(r"single stranded word", re.IGNORECASE)
+
+# U+00A0. The whole fix, and the reason it is safe: one character, no words
+# changed, removed by deleting it.
+_NBSP = "\u00a0"
+
+
+def _paragraph_ending_with(shape: Any, stranded: str) -> Optional[Any]:
+    """The paragraph whose copy ends in the stranded word the finding names."""
+    if not stranded:
+        return None
+    for paragraph in reversed(list(shape.text_frame.paragraphs)):
+        if (paragraph.text or "").rstrip().endswith(stranded):
+            return paragraph
+    return None
+
+
+def _bind_last_two_words(paragraph: Any) -> bool:
+    """Replace the space before the final word with a non-breaking one.
+
+    Runs make this fiddlier than it reads. The space and the word it precedes
+    are often in different runs -- a bolded last word is enough to split them
+    -- so the space is looked for inside the final run first and in the run
+    before it second.
+    """
+    runs = [run for run in paragraph.runs if run.text]
+    if not runs:
+        return False
+
+    last = runs[-1]
+    stripped = last.text.rstrip()
+    cut = stripped.rfind(" ")
+    if cut > 0:
+        last.text = stripped[:cut] + _NBSP + stripped[cut + 1:]
+        return True
+
+    # The final word is a run of its own; the space is the tail of the one
+    # before it.
+    for run in reversed(runs[:-1]):
+        if run.text.endswith(" "):
+            run.text = run.text[:-1] + _NBSP
+            return True
+        if run.text.strip():
+            return False        # two words with no space between them
+    return False
+
+
 def fix_theme_font_drift(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[str]:
     """Clear a run-level typeface so the run inherits from the layout again.
 
@@ -794,6 +1073,116 @@ def _ai_delete_empty_paragraphs(
     return f"removed {removed} empty paragraph(s) from the end" if removed else None
 
 
+def _ai_move(shape: Any, action: Any, ctx: "FixContext") -> Optional[str]:
+    """Put a shape where the model said, once the frame agrees.
+
+    Geometry from the model was refused outright at first, on the grounds that
+    it is told not to measure off a rendered image. That was the wrong line to
+    draw. The payload carries every shape's box in inches, the slide size and
+    the safe margins, all of them exact; reasoning from those to a position is
+    arithmetic on numbers it was given, not an impression of a picture, and it
+    is what `basis: "geometry"` has always meant.
+
+    What makes it safe is not trusting the number but checking it: the target
+    has to land inside the safe margins, and the move then goes through the
+    same overlap and alignment guards a rule's move does. A slide is a
+    composition whoever proposed the move.
+    """
+    left, top = action.left_in, action.top_in
+    if left is None or top is None:
+        return None
+    width = (shape.width or 0) / EMU_PER_INCH
+    height = (shape.height or 0) / EMU_PER_INCH
+    _within_the_frame(left, top, width, height, ctx)
+
+    wanted = (_emu(left), _emu(top))
+    if wanted == (shape.left, shape.top):
+        return None
+    dx = (wanted[0] - (shape.left or 0)) / EMU_PER_INCH
+    dy = (wanted[1] - (shape.top or 0)) / EMU_PER_INCH
+    # No drift ceiling here, unlike the rule fixes. That ceiling exists to say
+    # "a shape this far from its cohort is part of a different arrangement",
+    # which is a statement about a delta measured off other shapes. This is an
+    # explicit target that has already been checked against the frame, and how
+    # far the shape happens to be from it is evidence of nothing. The distance
+    # is stated so a designer reading the tick list can see it.
+    shape.left, shape.top = wanted
+    return f"moved {dx:+.2f}, {dy:+.2f}in to {left:.2f}, {top:.2f}in"
+
+
+def _ai_resize(shape: Any, action: Any, ctx: "FixContext") -> Optional[str]:
+    """Resize a shape to the box the model named, once the frame agrees.
+
+    Never below a size that could hide content, and never outside the safe
+    margins at its current position -- a box grown past the frame trades one
+    finding for another.
+    """
+    width, height = action.width_in, action.height_in
+    if width is None or height is None:
+        return None
+    if width < _MIN_SIDE_IN or height < _MIN_SIDE_IN:
+        raise LeaveAlone(
+            f"{width:.2f} x {height:.2f}in is too small to hold anything; a "
+            "box that size hides its content rather than fitting it"
+        )
+    left = (shape.left or 0) / EMU_PER_INCH
+    top = (shape.top or 0) / EMU_PER_INCH
+    _within_the_frame(left, top, width, height, ctx)
+
+    wanted = (_emu(width), _emu(height))
+    if wanted == (shape.width, shape.height):
+        return None
+    was_w = (shape.width or 0) / EMU_PER_INCH
+    was_h = (shape.height or 0) / EMU_PER_INCH
+    shape.width, shape.height = wanted
+    return (
+        f"resized from {was_w:.2f} x {was_h:.2f} to {width:.2f} x {height:.2f}in"
+    )
+
+
+# A box smaller than this in either direction cannot be holding anything a
+# reader is meant to see, so a proposal to make one is a mistake rather than a
+# correction.
+_MIN_SIDE_IN = 0.1
+
+
+def _within_the_frame(
+    left: float, top: float, width: float, height: float, ctx: "FixContext"
+) -> None:
+    """Refuse a box that would sit outside the canvas or the safe margins.
+
+    The margins are in the payload the model was given, so a target outside
+    them is not a reading it could defend -- and applying one would satisfy
+    whatever it was aiming at by breaking the rule the deck is measured by.
+    """
+    canvas_w = ctx.width_emu / EMU_PER_INCH
+    canvas_h = ctx.height_emu / EMU_PER_INCH
+    margins = ctx.margins or {}
+    inside_left = margins.get("left", 0.0)
+    inside_top = margins.get("top", 0.0)
+    inside_right = canvas_w - margins.get("right", 0.0)
+    inside_bottom = canvas_h - margins.get("bottom", 0.0)
+
+    if left < inside_left - _EDGE_SLACK_IN or top < inside_top - _EDGE_SLACK_IN:
+        raise LeaveAlone(
+            f"{left:.2f}, {top:.2f}in is outside the safe margins the payload "
+            "gave it"
+        )
+    if (
+        left + width > inside_right + _EDGE_SLACK_IN
+        or top + height > inside_bottom + _EDGE_SLACK_IN
+    ):
+        raise LeaveAlone(
+            f"a {width:.2f} x {height:.2f}in box at {left:.2f}, {top:.2f}in "
+            "runs past the safe margins the payload gave it"
+        )
+
+
+# A hair, so a target computed to the margin itself is not refused over the
+# rounding that put it a thousandth of an inch outside.
+_EDGE_SLACK_IN = 0.01
+
+
 _AI_OPS: dict[str, Callable[[Any, Any, "FixContext"], Optional[str]]] = {
     "recolor_fill": _ai_recolor_fill,
     "recolor_line": _ai_recolor_line,
@@ -802,6 +1191,8 @@ _AI_OPS: dict[str, Callable[[Any, Any, "FixContext"], Optional[str]]] = {
     "set_font_size": _ai_set_font_size,
     "disable_autofit": _ai_disable_autofit,
     "delete_empty_paragraphs": _ai_delete_empty_paragraphs,
+    "move": _ai_move,
+    "resize": _ai_resize,
 }
 
 
@@ -856,12 +1247,16 @@ FIXERS: dict[str, Fixer] = {
     "space.off_canvas": fix_off_canvas,
     "space.safe_margin": fix_safe_margin,
     "space.repeat_out_of_line": fix_repeat_out_of_line,
+    "space.row_out_of_line": fix_row_out_of_line,
+    "space.overlap": fix_overlap,
+    "space.series_crowded": fix_series_crowded,
     "space.satellite_offset": fix_satellite_offset,
     "title.position_inconsistent": fix_title_position,
     "logo.geometry": fix_logo_geometry,
     "typography.whitespace": fix_whitespace,
     "typography.manual_line_break": fix_manual_line_break,
     "typography.terminal_punctuation": fix_terminal_punctuation,
+    "typography.orphan_widow": fix_orphan_widow,
     "font.family.theme_drift": fix_theme_font_drift,
 }
 
@@ -875,11 +1270,15 @@ FIX_ORDER: dict[str, int] = {
     "typography.whitespace": 10,
     "typography.manual_line_break": 10,
     "typography.terminal_punctuation": 10,
+    "typography.orphan_widow": 10,
     "font.family.theme_drift": 10,
     # The series fixes, together: each one puts a shape back where the rest of
     # its set already is, so they cannot fight each other, and both want to
     # run before the clamps below decide anything about the same shape.
+    "space.series_crowded": 15,
     "space.repeat_out_of_line": 20,
+    "space.row_out_of_line": 20,
+    "space.overlap": 30,
     "space.satellite_offset": 20,
     "title.position_inconsistent": 20,
     "logo.geometry": 20,
@@ -898,7 +1297,11 @@ def fix_order(issue: Issue) -> int:
 # `apply --list` can say "needs a designer, because ..." rather than leaving a
 # finding unexplained, which reads like an oversight.
 NEEDS_A_PERSON: dict[str, str] = {
-    "space.overlap": "names two boxes and cannot know which one should move",
+    "space.mirror_pair_offset": (
+        "names two shapes that disagree about a height, and nothing in the "
+        "geometry says which of them moved; moving both to the midpoint would "
+        "level the pair and put both of them off the arrangement they belong to"
+    ),
     "logo.missing": "needs the approved logo file, which the tool does not have",
     "logo.unapproved_asset": "needs the approved logo file to swap in",
     "title.missing": "needs copy that has to be written",
@@ -921,8 +1324,20 @@ NEEDS_A_PERSON: dict[str, str] = {
     "size.role.out_of_range": "resizing type changes how much copy fits",
     "size.role.inconsistent": "resizing type changes how much copy fits",
     "space.text_overflow": "the fix is to edit the copy or resize the box",
-    "typography.orphan_widow": "the fix is to edit the copy",
 }
+
+
+def is_geometric(issue: Issue) -> bool:
+    """Whether applying this finding moves or resizes a shape.
+
+    A rule says so by its id. An AI finding says so by the op it proposed, and
+    both answers lead to the same guards: the overlap and alignment checks
+    exist because a slide is a composition, which is true whoever asked for
+    the move.
+    """
+    if issue.source.value == "rule":
+        return (issue.rule_id or "") in GEOMETRIC
+    return bool(issue.fix and issue.fix.valid and issue.fix.geometric)
 
 
 def fixer_for(issue: Issue) -> Optional[Fixer]:
@@ -992,6 +1407,42 @@ def _point(text: Optional[str]) -> Optional[tuple[float, float]]:
         return None
     match = _POINT.search(text)
     return (float(match.group(1)), float(match.group(2))) if match else None
+
+
+def _rect(expected: Optional[str]) -> Optional[tuple[float, float, float, float]]:
+    """"clear of 'X' at 1.20, 3.40, 2.00 x 0.60in" -> the four numbers.
+
+    The partner's box travels on the finding so a fix knows what it is
+    clearing without going looking for a shape by a name that is not unique.
+    """
+    if not expected:
+        return None
+    match = _RECT.search(expected)
+    if match is None:
+        return None
+    return tuple(float(match.group(i)) for i in range(1, 5))       # type: ignore
+
+
+def _spread(
+    expected: Optional[str],
+) -> tuple[Optional[float], Optional[float], Optional[float]]:
+    """"evenly spaced across 1.00-8.90in, gap 0.38in" -> (1.00, 8.90, 0.38)."""
+    if not expected:
+        return None, None, None
+    match = _SPREAD.search(expected)
+    if match is None:
+        return None, None, None
+    return float(match.group(1)), float(match.group(2)), float(match.group(3))
+
+
+def _centre_line(expected: Optional[str]) -> tuple[Optional[str], Optional[float]]:
+    """"centre y 3.00in, as the rest of the row" -> ("y", 3.00)."""
+    if not expected:
+        return None, None
+    match = _CENTRE.search(expected)
+    if match is None:
+        return None, None
+    return match.group(1).lower(), float(match.group(2))
 
 
 def _margins(expected: Optional[str]) -> dict[str, float]:

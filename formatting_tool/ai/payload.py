@@ -124,6 +124,13 @@ def build_slide_digests(slides: Sequence[SlideProfile]) -> list[dict[str, Any]]:
 def _shape_digest(shape: ShapeProfile) -> dict[str, Any]:
     box = shape.geometry
     digest: dict[str, Any] = {
+        # The OOXML id, unique within its slide, sent so a finding can name a
+        # shape rather than describe one. Names are not unique and in a real
+        # deck are wildly not unique -- sixteen shapes called "Pentagon 7" on
+        # one slide happens -- so a fix matched on a name lands on whichever
+        # came first. This is what makes an AI-proposed correction safe to
+        # apply at all.
+        "id": shape.shape_id,
         "name": shape.name,
         "type": shape.shape_type,
         "role": shape.role.value,

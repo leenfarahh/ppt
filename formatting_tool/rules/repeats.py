@@ -125,6 +125,249 @@ class RepeatedElementRule(Rule):
             )
 
 
+
+
+# --------------------------------------------------------------------------- #
+# Rows and columns inside a set
+# --------------------------------------------------------------------------- #
+#
+# The blind spot these close. Every other space rule models a set as shapes
+# sharing ONE edge: `space.repeat_out_of_line` finds a series and asks which
+# left or top edge the majority agrees on. Two columns of five have two lefts
+# and five tops, so no edge is shared, nothing is out of line with anything,
+# and a shape 0.08in low is invisible. Measured on a deck built for it, both
+# that layout and an eleven-node ring with one node low produced not a single
+# space finding.
+#
+# So a set is read as rows and columns instead of as one edge, and the two
+# rules below split on how much the geometry can actually settle:
+#
+#   3 or more in a row   a majority exists, the odd one out is the defect, and
+#                        the fix is to put it back on the row.
+#   exactly 2            no majority. They disagree and the geometry cannot say
+#                        which of them moved, so both are named and a designer
+#                        decides. This is the ring case, where every pair is a
+#                        pair.
+#
+# The clustering window is wider than the reporting tolerance on purpose.
+# Shapes within `near_miss_factor` of each other are one row -- that is what
+# that tuning value means -- and inside a row anything past `position_in` is
+# drift. Between 0.05in and 0.20in is a defect; past that it is another row.
+
+
+class SeriesRowRule(Rule):
+    """A member of a repeated set sitting off the row or column it belongs to."""
+
+    id = "space.row_out_of_line"
+    category = Category.SPACE
+    description = "One of a set of repeated shapes is off the row or column it sits in."
+    default_severity = Severity.WARNING
+
+    def check(self, ctx: RuleContext) -> Iterable[Issue]:
+        for slide in ctx.deck.slides:
+            if slide.hidden:
+                continue
+            for series in _series(slide, ctx.tuning.repeat_min_members):
+                yield from self._lines(ctx, slide, series, "y")
+                yield from self._lines(ctx, slide, series, "x")
+
+    def _lines(
+        self,
+        ctx: RuleContext,
+        slide: SlideProfile,
+        series: list[ShapeProfile],
+        axis: str,
+    ) -> Iterable[Issue]:
+        tolerance = ctx.spec.tolerances.position_in
+        window = tolerance * ctx.tuning.near_miss_factor
+        centres = [_centre(s)[0 if axis == "x" else 1] for s in series]
+        groups = _cluster_1d(centres, window)
+
+        # A row of two has no majority: both members are equally far from the
+        # midpoint between them, so this rule cannot say which moved.
+        # `MirroredPairRule` reports those, naming both.
+        settled = [g for g in groups if len(g) >= _MAJORITY_NEEDS]
+        if not settled:
+            return
+        # A group holding the whole series is the case
+        # `space.repeat_out_of_line` already reports, and reporting it twice
+        # helps nobody.
+        for group in settled:
+            if len(group) == len(series):
+                continue
+            yield from self._off_line(ctx, slide, series, centres, group, axis)
+
+    def _off_line(
+        self,
+        ctx: RuleContext,
+        slide: SlideProfile,
+        series: list[ShapeProfile],
+        centres: list[float],
+        group: list[int],
+        axis: str,
+    ) -> Iterable[Issue]:
+        tolerance = ctx.spec.tolerances.position_in
+        line = median([centres[i] for i in group])
+        word = "column" if axis == "x" else "row"
+        edge = "centre x" if axis == "x" else "centre y"
+
+        for index in group:
+            drift = abs(centres[index] - line)
+            if drift <= tolerance:
+                continue
+            shape = series[index]
+            yield self.issue(
+                f"One of {len(group)} shapes in this {word} is {drift:.2f}in "
+                f"off the {edge} the other {len(group) - 1} share.",
+                slide=slide,
+                shape=shape,
+                expected=f"{edge} {line:.2f}in, as the rest of the {word}",
+                found=f"{edge} {centres[index]:.2f}in",
+                suggestion=(
+                    f"Select the {len(group)} shapes in this {word} and align "
+                    f"them{' vertically' if axis == 'x' else ' horizontally'}."
+                ),
+            )
+
+
+# Three, because two is a disagreement and three is a majority with an
+# exception. Everything this rule says depends on there being a right answer
+# among the members, and two members never produce one.
+_MAJORITY_NEEDS = 3
+
+
+class MirroredPairRule(Rule):
+    """Two shapes placed as a mirrored pair that do not sit level.
+
+    The arrangement in a radial diagram: eleven nodes around a centre, pairing
+    across the vertical axis, each pair meant to sit at one height. Also the
+    plainer case of two columns, where every row is a pair.
+
+    Reported as a pair rather than as a shape, and left for a designer, which
+    is the honest answer rather than a cautious one: the two disagree about a
+    height and nothing in the geometry says which of them moved. Moving both
+    to the midpoint would level the pair and put both of them 0.04in off the
+    arrangement they belong to, which is a worse deck than the one that came
+    in.
+    """
+
+    id = "space.mirror_pair_offset"
+    category = Category.SPACE
+    description = "Two shapes mirrored across the slide do not sit level."
+    default_severity = Severity.WARNING
+
+    def check(self, ctx: RuleContext) -> Iterable[Issue]:
+        for slide in ctx.deck.slides:
+            if slide.hidden:
+                continue
+            for series in _series(slide, ctx.tuning.repeat_min_members):
+                if len(series) < _MIRROR_NEEDS:
+                    continue
+                yield from self._pairs(ctx, slide, series)
+
+    def _pairs(
+        self, ctx: RuleContext, slide: SlideProfile, series: list[ShapeProfile]
+    ) -> Iterable[Issue]:
+        tolerance = ctx.spec.tolerances.position_in
+        window = tolerance * ctx.tuning.near_miss_factor
+        centres = [_centre(s) for s in series]
+        axis = median([c[0] for c in centres])
+
+        pairs = _mirrored_pairs(centres, axis, window)
+        # Most of the set has to pair before the arrangement is a mirror at
+        # all. Two shapes either side of the middle of a scattered slide are a
+        # coincidence, and reporting one would put a finding on every busy
+        # slide in the deck.
+        paired = {i for pair in pairs for i in pair}
+        if len(paired) < ctx.tuning.majority_fraction * len(series):
+            return
+
+        ceiling = ctx.tuning.repeat_max_drift_in
+        for left, right in pairs:
+            gap = abs(centres[left][1] - centres[right][1])
+            if gap <= tolerance or gap > ceiling:
+                continue
+            first, second = series[left], series[right]
+            yield self.issue(
+                f"{first.name!r} and {second.name!r} are a mirrored pair across "
+                f"the arrangement's axis at {axis:.2f}in, but sit {gap:.2f}in "
+                "apart vertically.",
+                slide=slide,
+                shape=first,
+                expected=f"both at one centre y, level with {second.name!r}",
+                found=(
+                    f"{centres[left][1]:.2f}in and {centres[right][1]:.2f}in"
+                ),
+                suggestion=(
+                    f"Select {first.name!r} and {second.name!r} and align them "
+                    "middle. Which of the two moved is not in the geometry, so "
+                    "check against the rest of the arrangement before nudging."
+                ),
+            )
+
+
+# A mirror needs enough members to be a pattern rather than a coincidence:
+# two pairs, so that one pair can be wrong while the arrangement still reads
+# as mirrored.
+_MIRROR_NEEDS = 4
+
+
+def _cluster_1d(values: list[float], window: float) -> list[list[int]]:
+    """Group values that sit within `window` of each other, as indices.
+
+    Single-link on a sorted list, which is what "these are the same row" means
+    and cannot produce the order-dependent groupings that comparing against a
+    running median would.
+    """
+    order = sorted(range(len(values)), key=lambda i: values[i])
+    groups: list[list[int]] = []
+    for index in order:
+        if groups and values[index] - values[groups[-1][-1]] <= window:
+            groups[-1].append(index)
+        else:
+            groups.append([index])
+    return groups
+
+
+def _mirrored_pairs(
+    centres: list[tuple[float, float]], axis: float, window: float
+) -> list[tuple[int, int]]:
+    """Members that reflect onto each other across `axis`, each used once.
+
+    Nearest reflection first, so a shape sitting almost on the axis does not
+    claim a partner that belongs to somebody else.
+
+    A shape ON the axis has no partner, and saying so is what stops the whole
+    degenerate class this rule would otherwise be full of. A column of six
+    identical boxes all share a centre x, that centre x is the axis, and every
+    one of them reflects onto every other one for nothing: on a real deck that
+    produced eight findings about a vertical stack that is not mirrored at
+    all. A pair has to straddle the axis, one member each side of it.
+    """
+    candidates = []
+    for i, (x, _y) in enumerate(centres):
+        if abs(x - axis) <= window:
+            continue
+        for j in range(i + 1, len(centres)):
+            other = centres[j][0]
+            if abs(other - axis) <= window:
+                continue
+            if (x - axis) * (other - axis) >= 0:
+                continue        # same side of the axis: not a reflection
+            miss = abs((axis - x) + (axis - other))
+            if miss <= window:
+                candidates.append((miss, i, j))
+
+    taken: set[int] = set()
+    pairs: list[tuple[int, int]] = []
+    for _miss, i, j in sorted(candidates):
+        if i in taken or j in taken:
+            continue
+        taken.update((i, j))
+        pairs.append((i, j))
+    return pairs
+
+
 # --------------------------------------------------------------------------- #
 # Finding the series
 # --------------------------------------------------------------------------- #

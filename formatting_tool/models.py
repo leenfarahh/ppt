@@ -162,7 +162,14 @@ FIX_OPS = frozenset({
     "set_font_size",
     "disable_autofit",
     "delete_empty_paragraphs",
+    "move",
+    "resize",
 })
+
+# The ops that change where a shape sits. They go through the same overlap and
+# alignment guards a rule's move does, because a slide is a composition
+# whoever proposed the move.
+GEOMETRIC_OPS = frozenset({"move", "resize"})
 
 
 @dataclass
@@ -178,13 +185,27 @@ class FixAction:
 
     op: str
     shape: Optional[str] = None         # exact name as the payload gave it
+    # The shape's OOXML id from the payload. Preferred over the name whenever
+    # it is there: names repeat within a slide and ids do not.
+    shape_id: Optional[int] = None
     hex: Optional[str] = None           # six hex digits, no leading hash
     font: Optional[str] = None
     size_pt: Optional[float] = None
+    # Inches, for `move` and `resize`. A move takes the first two, a resize
+    # the second two; each is checked against the canvas and the safe margins
+    # before anything is written.
+    left_in: Optional[float] = None
+    top_in: Optional[float] = None
+    width_in: Optional[float] = None
+    height_in: Optional[float] = None
 
     @property
     def valid(self) -> bool:
         return self.op in FIX_OPS
+
+    @property
+    def geometric(self) -> bool:
+        return self.op in GEOMETRIC_OPS
 
 
 @dataclass

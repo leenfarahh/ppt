@@ -288,6 +288,51 @@ there is one way to reach the target:
 | `color.shape.off_palette` | recolours the fill, the outline, or the SVG an icon draws from |
 | `typography.terminal_punctuation` | takes the full stop off the end of a title |
 
+**A set is read as rows and columns, not as one shared edge.** Every space
+rule modelled a set as shapes sharing ONE edge, which meant two columns of
+five -- two lefts, five tops, no edge shared by all of them -- produced not a
+single finding when one shape sat 0.08in low, and an eleven-node radial
+diagram produced none either. `space.row_out_of_line` clusters a series into
+rows and columns by centre and reports a member off the line its row shares;
+`space.mirror_pair_offset` finds members that reflect across the
+arrangement's axis and reports a pair that does not sit level.
+
+The two split on what the geometry can settle. Three or more in a row is a
+majority with an exception, so the exception is named and fixed. Exactly two
+is a disagreement: nothing says which of them moved, and moving both to the
+midpoint would level the pair while putting both off the arrangement they
+belong to, so both are named and a designer decides. A shape sitting ON the
+axis has no partner -- without that, six identical boxes in a column all share
+a centre x, every one reflects onto every other, and a real deck produced
+eight findings about a stack that is not mirrored at all.
+
+**A set moves together, and is squared up before it does.** A column of shapes
+all sitting outside the margin is not eight findings about eight shapes; it is
+one column in the wrong place, and moving any one of them in breaks the
+column. On a real deck that was 37 of 50 safe-margin fixes refused with
+"moving it would break its alignment", every refusal correct. Now the shapes
+sharing the edge travel the same distance, and any that were merely within
+tolerance of the edge are put on it first -- moving a ragged set only
+relocates the raggedness. That deck went from 1 applied to 10, with no
+alignment refusals left.
+
+Only the hard constraints may do this: `space.safe_margin` and
+`space.off_canvas`. A deck cannot ship with content outside the frame, so the
+column moves whole. A grid snap is a preference, and dragging a neighbour to
+satisfy one is the failure that got `space.alignment_grid` disabled once
+already. Every shape that moves is checked against its own neighbours, and the
+whole set goes back if any of them lands on something.
+
+**Applying is followed by a second pass.** The report a designer ticks
+describes the deck as it arrived; once the fixes and the master have been
+applied it is a different file, and nothing had measured that file. So the
+deterministic rules run again on the output, and the result carries both what
+they found and `introduced` -- the findings this run caused rather than the
+ones it inherited. On a real deck that came back with eleven, among them a
+title overlapping the subtitle by 4 square inches. Only the rule layer runs:
+the AI layer costs money, and a second opinion on a file nobody has looked at
+yet is not worth it.
+
 **Which palette entry a colour becomes** is a different question from which is
 nearest, and treating them as one recoloured a red to an orange 33 delta-E
 away and a page of blue headings to a neutral. "Nearest" decides whether a
@@ -329,14 +374,36 @@ to. A theme-bound icon is not itself wrong -- the deck's theme is, and
 colour and no class was recoloured by hand and gets a fixer, which rewrites
 the rule and the literals together. See `formatting_tool/svgicon.py`.
 
+**Orphans and widows are detected and bound.** Where a line breaks is not in
+the file -- a .pptx stores a paragraph and a box, and the renderer decides --
+so `typography.orphan_widow` had no way to fire and never did. PowerPoint now
+supplies the real breaks (`linemetrics.PowerPointComMetrics`), one deck open
+per run, about three seconds on a short deck; `--no-line-metrics` turns it off
+for a fast pass. The fix is a non-breaking space between the last two words,
+which is what a typesetter does: one character, no words changed, undone by
+deleting it. Widening the box was the other candidate and is worse -- it
+changes the composition and re-wraps the paragraph, so it can strand a
+different word instead of no word.
+
 **An AI finding is fixable when it carries one.** The model is asked for a
 `fix`: an `op` from a closed set (recolour a fill, line or text; set an
 approved typeface; set a size; turn off shrink-to-fit; drop trailing empty
-paragraphs) and a target. Most findings have none, which is right -- the AI
-layer exists for the judgement the rules cannot make, and a judgement has no
-op. There is deliberately no move or resize: the model is told not to measure
-off a rendered image, and geometry is what the deterministic layer proves from
-the file.
+paragraphs; move; resize) and a target. Most findings have none, which is
+right -- the AI layer exists for the judgement the rules cannot make, and a
+judgement has no op.
+
+Every shape in the payload carries its OOXML `id`, and a proposal has to
+return it. Names repeat within a slide -- sixteen shapes called "Pentagon 7"
+is a real deck -- so a fix matched on a name lands on whichever came first.
+
+`move` and `resize` were refused outright at first, on the grounds that the
+model is told not to measure off a rendered image. That was the wrong line.
+The payload carries every box in inches, the slide size and the safe margins,
+all exact, so reasoning from those to a position is arithmetic on numbers it
+was given -- which is what `basis: "geometry"` has always meant. A proposed
+box is checked against the safe margins and refused if it falls outside, then
+goes through the same overlap and alignment guards a measured fix gets: a
+slide is a composition whoever proposed the move.
 
 Every proposal is checked against the master before the file is touched. A
 colour has to be a palette entry *exactly* -- "nearest" is how a colour the

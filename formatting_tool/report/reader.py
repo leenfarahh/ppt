@@ -106,9 +106,14 @@ def _fix(raw: Any) -> Optional[FixAction]:
     action = FixAction(
         op=str(raw.get("op") or ""),
         shape=raw.get("shape"),
+        shape_id=raw.get("shape_id"),
         hex=raw.get("hex"),
         font=raw.get("font"),
         size_pt=raw.get("size_pt"),
+        left_in=raw.get("left_in"),
+        top_in=raw.get("top_in"),
+        width_in=raw.get("width_in"),
+        height_in=raw.get("height_in"),
     )
     return action if action.valid else None
 

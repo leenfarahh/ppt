@@ -301,11 +301,17 @@ CIEDE2000, checked against the Sharma reference pairs; CIE76 overstated the
 blues, which is what pushed them onto neutrals.
 
 **Artwork a slide inherits from its layout is carried onto the slide** before
-the rebuild swaps layouts. A photograph on a designed slide is often not on
-the slide -- it is on the layout, and pointing the slide elsewhere loses it
-with nothing to report, because no shape was lost. What does not travel is the
-old brand's furniture, told apart by repetition rather than size: a logo is on
-many layouts because it is on every slide, a section image is on the one
+the rebuild swaps layouts. What a designed slide shows is often not on the
+slide: a section divider carries a full-bleed photograph, the connector lines
+joining its icons and the panels behind its copy, while its own `p:cSld` holds
+nothing but a title. Point it at another layout and all of that is gone with
+nothing to report, because no shape was lost -- there was never a shape.
+
+Every non-placeholder shape travels, not only pictures; a placeholder does not,
+because it is a slot and taking the new layout's position for those is the
+point of a rebuild. What also does not travel is the old brand's furniture,
+told apart by repetition rather than size: a logo or a header band is on many
+layouts because it is on every slide, a section's own artwork is on the one
 layout drawn for it. See `rebuild/pictures.py`.
 
 **Icon colour is not shape colour.** An icon from PowerPoint's library is a

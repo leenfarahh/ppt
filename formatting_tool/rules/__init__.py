@@ -43,6 +43,8 @@ from .space import (
     SafeMarginRule,
     BandWidthRule,
     TextCollisionRule,
+    MatrixGutterRule,
+    UnevenSeriesRule,
     TextOverflowRule,
 )
 from .titles import (
@@ -148,6 +150,8 @@ def build_default_rules(
         TextOverflowRule(metrics=metrics),
         TextCollisionRule(metrics=metrics),
         BandWidthRule(),
+        UnevenSeriesRule(),
+        MatrixGutterRule(),
         AutofitShrinkRule(),
         # Typography
         OrphanWidowRule(metrics=metrics),

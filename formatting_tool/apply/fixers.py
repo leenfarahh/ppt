@@ -366,6 +366,89 @@ def _move_onto(
     )
 
 
+def fix_matrix_gutter(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[str]:
+    """Re-space a component so its two gutters become one.
+
+    From the top-left corner outwards, and nothing is resized. Holding the
+    outer box instead and letting the cells absorb the change was the other
+    option and it is the worse one: resizing a text cell rewraps its copy, and
+    this tool can now measure that a rewrap pushes text out of its box, so the
+    fix would be trading a spacing defect for an overflow. Moving cells cannot
+    do that.
+
+    The component is re-derived here rather than described in the finding, and
+    it is re-derived through the SAME function the rule used --
+    `rules.space.matrix_components`, over the same `Cell` shape. That is not
+    tidiness. A rule and a fixer that each work out for themselves which
+    shapes are in a set will disagree about it, which is exactly how a row of
+    four came to be spread two at a time for as long as `_row_with` compared
+    sizes to the EMU while the rules rounded to a hundredth.
+    """
+    from ..rules.space import Cell, matrix_components  # noqa: PLC0415
+
+    target = _gutter_of(issue.expected)
+    if target is None:
+        return None
+
+    members = [shape] + list(getattr(ctx, "neighbours", None) or [])
+    cells = [
+        Cell(other, (other.left or 0) / EMU_PER_INCH,
+             (other.top or 0) / EMU_PER_INCH,
+             (other.width or 0) / EMU_PER_INCH,
+             (other.height or 0) / EMU_PER_INCH)
+        for other in members
+        if other.left is not None and other.top is not None
+    ]
+    matrix = _matrix_holding(shape, matrix_components(cells, ctx.align_tolerance_in))
+    if matrix is None:
+        raise LeaveAlone(
+            "the component this names is no longer there to re-space; the "
+            "deck has changed since the report was made"
+        )
+
+    moved = 0
+    top = matrix.rows[0][0].top_in
+    for row in matrix.rows:
+        left = row[0].left_in
+        height = max(cell.bottom_in for cell in row) - min(c.top_in for c in row)
+        for cell in row:
+            live = cell.key
+            want_left, want_top = _emu(left), _emu(top + (cell.top_in - min(
+                c.top_in for c in row)))
+            if live.left != want_left or live.top != want_top:
+                live.left, live.top = want_left, want_top
+                moved += 1
+            left += cell.width_in + target
+        top += height + target
+
+    if not moved:
+        return None
+    return (
+        f"re-spaced {len(matrix.cells)} cells of a "
+        f"{len(matrix.rows)}x{len(matrix.rows[0])} component on a "
+        f"{target:.2f}in gutter, moving {moved} of them"
+    )
+
+
+def _matrix_holding(shape: Any, matrices: list):
+    """The component the named shape belongs to, or None."""
+    for matrix in matrices:
+        if any(cell.key is shape for cell in matrix.cells):
+            return matrix
+    return None
+
+
+def _gutter_of(expected: Optional[str]) -> Optional[float]:
+    """"one gutter of 0.058in, across and down" -> 0.058."""
+    if not expected:
+        return None
+    match = _GUTTER.search(expected)
+    return float(match.group(1)) if match else None
+
+
+_GUTTER = re.compile(r"gutter of\s*([-+]?\d+(?:\.\d+)?)\s*in", re.IGNORECASE)
+
+
 def fix_band_width(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[str]:
     """Set the band's left edge and width to the column's.
 
@@ -741,16 +824,34 @@ def fix_series_crowded(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[
 
 
 def _row_with(shape: Any, neighbours: list) -> list:
-    """The shape and the same-sized shapes sharing its row, left to right."""
-    width, height = shape.width, shape.height
+    """The shape and the same-sized shapes sharing its row, left to right.
+
+    Same size to the hundredth of an inch, not to the EMU. That is not
+    slackness, it is agreement with the rule that made the finding: the series
+    rules group on sizes rounded to two decimals, so a fixer matching exactly
+    re-finds a smaller set than the one the finding describes.
+    
+    Measured on a real deck: four column headings of width 2164854, 2164854,
+    2164855 and 2164855 EMU -- one EMU apart, a millionth of an inch. The rule
+    reported four shapes and named an even gap for four; this returned two,
+    the fixer spread those two, and the row came out even by luck because the
+    pair it never touched happened to already sit right. On another deck it
+    would have half-corrected the row and reported success.
+    """
+    width, height = _rounded(shape.width), _rounded(shape.height)
     centre = (shape.top or 0) + (shape.height or 0) / 2
     slack = _emu(_ROW_SLACK_IN)
     row = [shape] + [
         other for other in neighbours
-        if other.width == width and other.height == height
+        if _rounded(other.width) == width and _rounded(other.height) == height
         and abs(((other.top or 0) + (other.height or 0) / 2) - centre) <= slack
     ]
     return sorted(row, key=lambda s: s.left or 0)
+
+
+def _rounded(emu: Optional[int]) -> float:
+    """A size in inches to two decimals, as the series rules bucket them."""
+    return round((emu or 0) / EMU_PER_INCH, 2)
 
 
 # How far a member's centre can sit from the row's and still be in the row.
@@ -2120,8 +2221,13 @@ FIXERS: dict[str, Fixer] = {
     "space.overlap": fix_overlap,
     "space.text_collision": fix_text_collision,
     "space.band_width": fix_band_width,
+    "space.matrix_gutter": fix_matrix_gutter,
     "space.text_overflow": fix_text_overflow,
     "space.series_crowded": fix_series_crowded,
+    # The same remedy, one step earlier: an uneven row and a collapsed
+    # one are both distributed across the span they occupy, and the
+    # finding carries the same target either way.
+    "space.series_uneven": fix_series_crowded,
     "space.satellite_offset": fix_satellite_offset,
     "title.position_inconsistent": fix_title_position,
     "logo.geometry": fix_logo_geometry,
@@ -2156,6 +2262,7 @@ FIX_ORDER: dict[str, int] = {
     # its set already is, so they cannot fight each other, and both want to
     # run before the clamps below decide anything about the same shape.
     "space.series_crowded": 15,
+    "space.series_uneven": 16,
     "space.repeat_out_of_line": 20,
     "space.row_out_of_line": 20,
     "space.overlap": 30,
@@ -2163,6 +2270,7 @@ FIX_ORDER: dict[str, int] = {
     # After the collision fixes and before the margin ones: squaring a band up
     # is a small, local change, and it should not be deciding where anything
     # else goes.
+    "space.matrix_gutter": 38,
     "space.band_width": 40,
     "space.text_overflow": 34,
     "space.satellite_offset": 20,

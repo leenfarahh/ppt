@@ -9,6 +9,7 @@ the deck follows.
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import dataclass
 from math import ceil
 from typing import Iterable, Optional
 
@@ -787,6 +788,371 @@ class CrowdedSeriesRule(Rule):
                 "horizontally across the space they already occupy."
             ),
         )
+
+
+@dataclass(frozen=True)
+class Cell:
+    """One box of a matrix, as either side of the tool can describe it."""
+
+    key: Any            # a shape id for the rules, a live shape for the fixer
+    left_in: float
+    top_in: float
+    width_in: float
+    height_in: float
+
+    @property
+    def right_in(self) -> float:
+        return self.left_in + self.width_in
+
+    @property
+    def bottom_in(self) -> float:
+        return self.top_in + self.height_in
+
+
+@dataclass(frozen=True)
+class Matrix:
+    """Rows of cells sharing a column signature, and the gutters between them."""
+
+    rows: list          # list[list[Cell]], top to bottom, each left to right
+    across: list        # horizontal gutters, left to right
+    down: list          # vertical gutters, top to bottom
+
+    @property
+    def cells(self) -> list:
+        return [cell for row in self.rows for cell in row]
+
+
+def matrix_components(cells: list, tolerance: float) -> list:
+    """Every matrix among these cells.
+
+    Deliberately generic over what a cell IS, because the rule reads shape
+    profiles and the fixer has to reach the same answer from live shapes. The
+    two disagreeing about a set is the bug class that half-spread a row for
+    however long `_row_with` matched sizes to the EMU, and it is not a bug
+    worth having twice.
+
+    A row is two or more cells side by side; a matrix is two or more rows
+    sharing a column signature -- the same left edges and widths, which is
+    what makes a set of rows one object rather than several.
+    """
+    signatures: dict = {}
+    for row in _rows_of(_outermost(cells), tolerance):
+        for run in _contiguous_runs(row):
+            key = tuple((round(c.left_in, 2), round(c.width_in, 2)) for c in run)
+            signatures.setdefault(key, []).append(run)
+
+    found = []
+    for runs in signatures.values():
+        if len(runs) < 2:
+            continue
+        runs.sort(key=lambda row: min(c.top_in for c in row))
+        across = [b.left_in - a.right_in for a, b in zip(runs[0], runs[0][1:])]
+        down = [
+            min(c.top_in for c in lower) - max(c.bottom_in for c in upper)
+            for upper, lower in zip(runs, runs[1:])
+        ]
+        found.append(Matrix(rows=runs, across=across, down=down))
+    return found
+
+
+def _rows_of(cells: list, tolerance: float) -> list:
+    """The cells grouped into rows, each row ordered left to right.
+
+    Clustered against the row being built rather than rounded into fixed
+    buckets, because a bucket has edges: rounding tops to a tenth puts cells
+    at 0.099 and 0.101in into different rows, which is the same component read
+    as two and no gutter found in either.
+    """
+    rows: list = []
+    for cell in sorted(cells, key=lambda c: c.top_in):
+        if rows and cell.top_in - rows[-1][0].top_in <= tolerance:
+            rows[-1].append(cell)
+        else:
+            rows.append([cell])
+    return [sorted(row, key=lambda c: c.left_in) for row in rows]
+
+
+def _outermost(cells: list) -> list:
+    """The cells, minus anything drawn inside one of them.
+
+    A body cell on a real slide carried a chart and the chart's caption, both
+    sharing the row's top edge. Counted as cells they gave that row four
+    members where the rows below it had two, the column signatures no longer
+    matched, and a three-row component was read as the bottom two rows only --
+    which is worse than missing it, because the top row then keeps a gutter
+    the other two lose.
+
+    A shape inside a cell is content. The test is containment rather than
+    size: a wide caption and a narrow one are both content, and what they have
+    in common is sitting within something else.
+    """
+    kept = []
+    for cell in cells:
+        if cell.width_in <= 0 or cell.height_in <= 0:
+            continue
+        inside = any(
+            other is not cell
+            and other.left_in <= cell.left_in + _TOUCH_IN
+            and other.top_in <= cell.top_in + _TOUCH_IN
+            and other.right_in >= cell.right_in - _TOUCH_IN
+            and other.bottom_in >= cell.bottom_in - _TOUCH_IN
+            and (other.width_in * other.height_in) > (cell.width_in * cell.height_in)
+            for other in cells
+        )
+        if not inside:
+            kept.append(cell)
+    return kept
+
+
+def _contiguous_runs(row: list) -> list:
+    """A row split where a gap is a boundary between components.
+
+    Two components side by side share every row, so without this the gap
+    BETWEEN them is read as a gutter: on a real slide a row came out as four
+    cells with gaps 0.06, 0.41, 0.06, and the 0.41 is the space between the
+    left half of the slide and the right half.
+    """
+    gaps = [b.left_in - a.right_in for a, b in zip(row, row[1:])]
+    if not gaps:
+        return []
+    floor = max(min(gaps), _BOUNDARY_FLOOR_IN)
+    runs, run = [], [row[0]]
+    for cell, gap in zip(row[1:], gaps):
+        if gap > _BOUNDARY_FACTOR * floor:
+            runs.append(run)
+            run = [cell]
+        else:
+            run.append(cell)
+    runs.append(run)
+    return [r for r in runs if len(r) >= 2]
+
+
+class MatrixGutterRule(Rule):
+    """A component whose horizontal and vertical gutters nearly agree.
+
+    The case off a real slide: a three-row, two-column component with every
+    horizontal gutter at 0.058in and every vertical one at 0.097in. Each kind
+    is identical to the thousandth, so nothing here is drifting within a kind
+    -- `space.series_uneven` passes it -- and the component still reads as
+    two spacings where it was drawn as one.
+
+    NEARLY is the whole rule, and it is what makes it safe to ship. Measured
+    across four real decks, EVERY multi-column component had a horizontal
+    gutter different from its vertical one: eleven of eleven. Tighter
+    horizontal than vertical spacing is how these decks are built, so a rule
+    that asserted the two must match would fire on almost every component and
+    be wrong almost every time.
+
+    What separates this case from those is the size of the difference. This
+    one is 0.038in apart; the next nearest in four decks is 0.137in, and the
+    rest are 0.30in. So a difference under `_GUTTER_NEAR_IN` reads as two
+    numbers that were meant to be one, and anything above it as two numbers
+    somebody chose.
+
+    The target is the smaller of the two gutters, for the reason set out on
+    `_target_gutter`: it is the only choice that gives two halves of the same
+    component the same answer, and tightening a component cannot push it into
+    whatever sits beside it.
+    """
+
+    id = "space.matrix_gutter"
+    category = Category.SPACE
+    description = "A component's horizontal and vertical gutters nearly agree."
+    default_severity = Severity.WARNING
+
+    def check(self, ctx: RuleContext) -> Iterable[Issue]:
+        for slide in ctx.deck.slides:
+            if slide.hidden:
+                continue
+            cells = [
+                Cell(s.shape_id, s.geometry.left_in, s.geometry.top_in,
+                     s.geometry.width_in, s.geometry.height_in)
+                for s in slide.shapes if not s.is_group
+            ]
+            by_id = {s.shape_id: s for s in slide.shapes}
+            for matrix in matrix_components(cells, ctx.spec.tolerances.position_in):
+                finding = self._mismatch(slide, matrix, by_id)
+                if finding is not None:
+                    yield finding
+
+    def _mismatch(self, slide, matrix, by_id) -> Optional[Issue]:
+        across, down = matrix.across, matrix.down
+        if not across or not down:
+            return None
+        if min(across) <= 0 or min(down) <= 0:
+            return None         # touching or overlapping: not this rule's
+        # Each kind has to be consistent with itself first. Where it is not,
+        # `space.series_uneven` has that to say and saying both would be
+        # asking for two fixes to one row.
+        if (max(across) - min(across) > _EVEN_SLACK_IN
+                or max(down) - min(down) > _EVEN_SLACK_IN):
+            return None
+
+        wide, tall = _median(across), _median(down)
+        apart = abs(wide - tall)
+        if apart <= _EVEN_SLACK_IN or apart > _GUTTER_NEAR_IN:
+            return None
+
+        target = _target_gutter(across, down)
+        anchor = by_id.get(matrix.rows[0][0].key)
+        if anchor is None:
+            return None
+        return self.issue(
+            f"This {len(matrix.rows)}x{len(matrix.rows[0])} component is "
+            f"{wide:.2f}in apart across and {tall:.2f}in down, so it reads as "
+            "two spacings where it was drawn as one.",
+            slide=slide,
+            shape=anchor,
+            expected=f"one gutter of {target:.3f}in, across and down",
+            found=f"{wide:.3f}in across, {tall:.3f}in down",
+            suggestion=(
+                f"Set both gutters to {target:.2f}in. The component is "
+                "re-spaced from its top-left corner, so nothing outside it "
+                "moves and no box is resized."
+            ),
+        )
+
+
+# How far apart two gutters may be and still read as one number drifted into
+# two. Set from four real decks: the case this was written for is 0.038in
+# apart and the next nearest component is 0.137in, so a twentieth of an inch
+# sits between them with room on both sides.
+_GUTTER_NEAR_IN = 0.05
+
+
+def _median(values: list[float]) -> float:
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2
+
+
+def _target_gutter(across: list[float], down: list[float]) -> float:
+    """The gutter the component keeps: the smaller of the two.
+
+    Counting which gutter occurs more often was the first rule and it is not
+    stable. The two halves of one real slide are the same component drawn
+    twice, and a difference of one detected row between them -- three rows on
+    the right, two on the left where a chart sat inside a cell -- flipped the
+    count and gave the two halves DIFFERENT targets: one loosened to 0.097in
+    and the other tightened to 0.058in, so squaring each up would have made
+    the slide less consistent than it started.
+
+    The smaller is stable under that, and it cannot push a component into
+    whatever sits beside it.
+    """
+    return min(_median(across), _median(down))
+
+
+class UnevenSeriesRule(Rule):
+    """A row of repeated shapes spaced unevenly.
+
+    Four column headings 0.783, 0.743 and 0.761in apart. Nothing overlaps and
+    nothing is out of line, so `space.series_crowded` and
+    `space.row_out_of_line` both pass it, and the row still reads as a rhythm
+    that stumbles.
+
+    The same finding and the same remedy as a collapsed row, one step earlier:
+    the set is distributed across the span it already occupies. So it borrows
+    that rule's machinery whole -- the series grouping, the row test, the
+    even-gap arithmetic and its fixer -- and differs only in the trigger.
+    Collapsed is an error because it is broken; uneven is a warning because it
+    is untidy.
+
+    WHAT THIS DELIBERATELY DOES NOT DO. It compares gaps of one kind against
+    each other, never a horizontal gutter against a vertical one. Measured on
+    a real deck, a component had every horizontal gutter at 0.058in and every
+    vertical one at 0.097in -- identical to the thousandth within each kind,
+    and different between them. Nothing there is drifting; the two values are
+    a decision, and tighter horizontal than vertical spacing is an ordinary
+    typographic choice. Making them agree would need a declared gutter to
+    appeal to, and there is not one.
+
+    CONTIGUOUS SERIES ONLY. A row of four where the middle gap is 0.407in and
+    the outer two are 0.058in is two components side by side, not one uneven
+    row, and its fixer spreads everything it finds in the row -- so a series
+    with a boundary gap in it is left alone rather than half-corrected.
+    """
+
+    id = "space.series_uneven"
+    category = Category.SPACE
+    description = "A row of repeated shapes is spaced unevenly."
+    default_severity = Severity.WARNING
+
+    def check(self, ctx: RuleContext) -> Iterable[Issue]:
+        for slide in ctx.deck.slides:
+            if slide.hidden:
+                continue
+            for series in _series_of(slide, ctx.tuning.repeat_min_members):
+                finding = self._uneven(ctx, slide, series)
+                if finding is not None:
+                    yield finding
+
+    def _uneven(self, ctx, slide, series) -> Optional[Issue]:
+        ordered = sorted(series, key=lambda s: s.geometry.left_in)
+        if not _is_a_row(ordered, ctx.spec.tolerances.position_in):
+            return None
+
+        gaps = _gaps_of(ordered)
+        if not gaps or any(gap <= 0 for gap in gaps):
+            return None         # collapsed: `space.series_crowded`'s finding
+        if not _is_contiguous(gaps):
+            return None
+        spread = max(gaps) - min(gaps)
+        if spread <= _EVEN_SLACK_IN:
+            return None
+
+        width = sum(s.geometry.width_in for s in ordered)
+        start = ordered[0].geometry.left_in
+        span = ordered[-1].geometry.left_in + ordered[-1].geometry.width_in
+        gap = (span - start - width) / max(1, len(ordered) - 1)
+        return self.issue(
+            f"{len(ordered)} repeated shapes in a row sit "
+            f"{min(gaps):.2f}-{max(gaps):.2f}in apart, so the row is spaced "
+            "unevenly.",
+            slide=slide,
+            shape=ordered[0],
+            expected=(
+                f"evenly spaced across {start:.2f}-{span:.2f}in, "
+                f"gap {gap:.2f}in"
+            ),
+            found=f"gaps of {', '.join(f'{g:.2f}' for g in gaps)}in",
+            suggestion=(
+                f"Select the {len(ordered)} shapes and distribute them "
+                "horizontally across the space they already occupy."
+            ),
+        )
+
+
+# How far the gaps in one row may disagree before it is a finding. Tight,
+# because within one row of one repeated shape the gaps should be identical:
+# the drift on real decks measured 0.03 to 0.04in, and EMU rounding is four
+# orders of magnitude below that.
+_EVEN_SLACK_IN = 0.02
+
+# What makes a gap a boundary between two groups rather than a gutter: far
+# larger than the smallest gap in the row. Read against the smallest rather
+# than the median, which averages when there are only two gaps and then
+# cannot tell 0.25in from 2.53in apart.
+_BOUNDARY_FACTOR = 2.0
+_BOUNDARY_FLOOR_IN = 0.05
+
+
+def _gaps_of(ordered: list) -> list[float]:
+    """The horizontal gaps between consecutive members of a row."""
+    return [
+        b.geometry.left_in - (a.geometry.left_in + a.geometry.width_in)
+        for a, b in zip(ordered, ordered[1:])
+    ]
+
+
+def _is_contiguous(gaps: list[float]) -> bool:
+    """Whether a row is one group rather than two sitting side by side."""
+    if not gaps:
+        return False
+    floor = max(min(gaps), _BOUNDARY_FLOOR_IN)
+    return max(gaps) <= _BOUNDARY_FACTOR * floor
 
 
 def _usable_width(ctx: RuleContext) -> Optional[tuple[float, float]]:

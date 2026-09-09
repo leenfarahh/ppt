@@ -729,7 +729,13 @@ def _apply_one_uninstrumented(
 
 # Fixes that read the shapes around the one they were given without moving it.
 _NEEDS_NEIGHBOURS = frozenset(
-    {"space.series_crowded", "space.text_overflow", "space.band_width"}
+    {
+        "space.series_crowded",
+        "space.series_uneven",
+        "space.text_overflow",
+        "space.band_width",
+        "space.matrix_gutter",
+    }
 )
 
 

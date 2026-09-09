@@ -366,6 +366,89 @@ def _move_onto(
     )
 
 
+def fix_band_width(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[str]:
+    """Set the band's left edge and width to the column's.
+
+    Both edges, not only the one the finding named. The rule reports the edge
+    that is out because that is what a designer looks for, but it carries the
+    whole target rectangle, and writing both is what makes the fix idempotent:
+    a band set to its column's span comes back next run with nothing to say.
+
+    The band's top and height are its own and are not touched. A band that is
+    the wrong width is not evidence that it is at the wrong height.
+
+    It checks its own room. This is a resize, and the applier guards a
+    geometric move by comparing what a shape covers before and after and
+    restoring its LEFT AND TOP if the move went badly -- which cannot undo a
+    width. So a resize has to ask before it acts rather than acting and
+    trusting the guard to catch it.
+    """
+    target = _rect(issue.expected)
+    if target is None or shape.left is None or shape.width is None:
+        return None
+    want_left, _want_top, want_width, _want_height = target
+    left, width = _emu(want_left), _emu(want_width)
+    if left == shape.left and width == shape.width:
+        return None
+
+    was_left, was_width = shape.left, shape.width
+    blocker = _covers_something_new(shape, left, width, ctx)
+    if blocker is not None:
+        raise LeaveAlone(
+            f"taking the band to its column's edges would put it over "
+            f"{blocker!r}, so one of the two is not where it belongs"
+        )
+    if left < 0 or left + width > ctx.width_emu:
+        raise LeaveAlone(
+            "the column this band spans runs off the slide, so the column is "
+            "the thing to fix rather than the band"
+        )
+
+    shape.left, shape.width = left, width
+    moved = (shape.left - was_left) / EMU_PER_INCH
+    grew = (shape.width - was_width) / EMU_PER_INCH
+    parts = []
+    if abs(moved) >= 0.005:
+        parts.append(f"moved {moved:+.2f}in")
+    if abs(grew) >= 0.005:
+        parts.append(f"{'widened' if grew > 0 else 'narrowed'} {abs(grew):.2f}in")
+    return f"{' and '.join(parts) or 'squared up'} to the column's edges"
+
+
+def _covers_something_new(
+    shape: Any, left: int, width: int, ctx: "FixContext"
+) -> Optional[str]:
+    """The neighbour a re-laid band would newly land on, if any.
+
+    Only what the change ADDS. A band already sitting over the panel behind it
+    must not be refused for an overlap it arrived with; the question is
+    whether squaring it up creates one.
+
+    The shapes of its own column are excluded, and that is the point rather
+    than a detail: the band is being taken TO their edges, so touching them at
+    the boundary is the intended result and counting it as a collision would
+    refuse every fix this rule makes.
+    """
+    if shape.top is None or shape.height is None:
+        return None
+    top, bottom = shape.top, shape.top + shape.height
+    was = (shape.left, shape.left + shape.width)
+    now = (left, left + width)
+
+    for other in getattr(ctx, "neighbours", None) or []:
+        o_left, o_top = getattr(other, "left", None), getattr(other, "top", None)
+        o_w, o_h = getattr(other, "width", None), getattr(other, "height", None)
+        if None in (o_left, o_top, o_w, o_h):
+            continue
+        if o_top >= bottom or o_top + o_h <= top:
+            continue        # not at the band's height at all
+        overlapped_before = o_left < was[1] and o_left + o_w > was[0]
+        overlaps_now = o_left < now[1] and o_left + o_w > now[0]
+        if overlaps_now and not overlapped_before:
+            return str(getattr(other, "name", "a neighbour"))
+    return None
+
+
 def fix_text_overflow(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[str]:
     """Grow the box to the size the rule measured its copy needs.
 
@@ -2036,6 +2119,7 @@ FIXERS: dict[str, Fixer] = {
     "space.row_out_of_line": fix_row_out_of_line,
     "space.overlap": fix_overlap,
     "space.text_collision": fix_text_collision,
+    "space.band_width": fix_band_width,
     "space.text_overflow": fix_text_overflow,
     "space.series_crowded": fix_series_crowded,
     "space.satellite_offset": fix_satellite_offset,
@@ -2076,6 +2160,10 @@ FIX_ORDER: dict[str, int] = {
     "space.row_out_of_line": 20,
     "space.overlap": 30,
     "space.text_collision": 32,
+    # After the collision fixes and before the margin ones: squaring a band up
+    # is a small, local change, and it should not be deciding where anything
+    # else goes.
+    "space.band_width": 40,
     "space.text_overflow": 34,
     "space.satellite_offset": 20,
     "title.position_inconsistent": 20,

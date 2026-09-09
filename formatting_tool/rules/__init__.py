@@ -41,6 +41,7 @@ from .space import (
     CrowdedSeriesRule,
     OverlapRule,
     SafeMarginRule,
+    BandWidthRule,
     TextCollisionRule,
     TextOverflowRule,
 )
@@ -146,6 +147,7 @@ def build_default_rules(
         CrowdedSeriesRule(),
         TextOverflowRule(metrics=metrics),
         TextCollisionRule(metrics=metrics),
+        BandWidthRule(),
         AutofitShrinkRule(),
         # Typography
         OrphanWidowRule(metrics=metrics),

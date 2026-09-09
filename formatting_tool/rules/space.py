@@ -183,6 +183,289 @@ class SafeMarginRule(Rule):
         )
 
 
+class BandWidthRule(Rule):
+    """A band across a column that does not reach the column's edges.
+
+    The defect off a real slide: a headline band reading "A trillion-dollar
+    industry is passing the inflection point" sitting over three rows of
+    content, 0.06in narrower than the rows beneath it. Small enough to survive
+    a review and large enough to see once seen, because the eye reads a band
+    and the block under it as one object and a short edge as a mistake.
+
+    Nothing reported it, and the three rules that look like they should each
+    had a reason:
+
+    - `space.alignment_grid` reads the LEADING edge only, against a deck-wide
+      grid. The band's left edge is right; it is the trailing edge, and
+      therefore the width, that is wrong.
+    - `space.repeat_out_of_line` and `space.row_out_of_line` group through
+      `repeats._series`, which buckets on identical size and type. A band is
+      not the size of the boxes it heads, so it is never in the same group as
+      the column it belongs to.
+    - `space.overlap` and the crowding rules are about shapes touching, and
+      these do not touch.
+
+    What makes it detectable is comparing the band against the BOUNDING BOX of
+    the cluster it caps rather than against any shape in it. The band spans a
+    dark label column and a light body column and matches neither on its own;
+    it matches the pair of them.
+
+    ONE EDGE HAS TO BE RIGHT. That is the discriminator between drift and
+    design: a band dragged into place usually snaps one edge and misses the
+    other, while a band deliberately inset from its column is inset at both
+    ends. Both edges wrong is left alone, which costs the occasional real
+    defect and buys never straightening a band somebody centred on purpose.
+    """
+
+    id = "space.band_width"
+    category = Category.SPACE
+    description = "A band across a column misses the column's edges."
+    default_severity = Severity.WARNING
+
+    def check(self, ctx: RuleContext) -> Iterable[Issue]:
+        for slide in ctx.deck.slides:
+            for band, cluster, span in _bands(slide, ctx.tuning.repeat_min_members):
+                box = band.geometry
+                left_off = box.left_in - span.left_in
+                right_off = (box.left_in + box.width_in) - (
+                    span.left_in + span.width_in
+                )
+
+                anchored = min(abs(left_off), abs(right_off))
+                adrift = max(abs(left_off), abs(right_off))
+                if anchored > _BAND_SLACK_IN or adrift <= _BAND_SLACK_IN:
+                    continue        # both edges adrift, or both already right
+                if adrift > _band_ceiling(box.width_in):
+                    continue        # far enough out to be deliberate
+
+                edge = "right" if abs(right_off) > abs(left_off) else "left"
+                short = "short of" if (
+                    right_off < 0 if edge == "right" else left_off > 0
+                ) else "past"
+                yield self.issue(
+                    f"This band stops {adrift:.2f}in {short} the {edge} edge "
+                    f"of the {len(cluster)} shapes it spans, so it reads as a "
+                    "short edge on an object the eye takes as one.",
+                    slide=slide,
+                    shape=band,
+                    expected=(
+                        f"the column's edges, at {span.left_in:.2f}, "
+                        f"{box.top_in:.2f}, {span.width_in:.2f} x "
+                        f"{box.height_in:.2f}in"
+                    ),
+                    found=(
+                        f"{box.left_in:.2f} to "
+                        f"{box.left_in + box.width_in:.2f}in against a column "
+                        f"from {span.left_in:.2f} to "
+                        f"{span.left_in + span.width_in:.2f}in"
+                    ),
+                    suggestion=(
+                        f"Take the band to the column's {edge} edge. The "
+                        "column is several shapes wide, so it is the band that "
+                        "moves rather than any of them."
+                    ),
+                )
+
+
+# How far a band edge may sit from its column's before it is a finding.
+#
+# Tighter than the deck-wide `position_in`, deliberately. That tolerance is
+# for shapes that should be about aligned; a band and the column it caps
+# should share an edge EXACTLY, so anything past EMU rounding is a defect
+# rather than a near miss. The slide this was found on was out by 0.06in and a
+# 0.05in tolerance would have called it acceptable.
+_BAND_SLACK_IN = 0.02
+
+# And how far out stops being drift and starts being a decision. A band
+# dragged carelessly is out by a hair; one inset on purpose is inset visibly,
+# and straightening that would be the tool overruling a designer.
+#
+# Set from real decks rather than picked. At 0.25in and 5% this reported a
+# grey band on a real slide as 0.23in short on its left -- and it was not: the
+# circular badge icon beside it deliberately overhangs the component, and one
+# overhanging element is enough to move the cluster's bounding edge. The
+# genuine defect was 0.06in on a 6.04in band, so an eighth of an inch and 2%
+# separate the two cleanly and with room either side.
+_BAND_DRIFT_CEILING_IN = 0.12
+_BAND_DRIFT_FRACTION = 0.02
+
+# A band is wide for its height. Without this a label sitting above a column
+# is read as capping it.
+_BAND_ASPECT = 3.0
+
+# And it spans the column rather than sitting over part of it.
+_BAND_COVERAGE = 0.8
+
+# How far below a band its column may start. A band caps what is directly
+# under it; a gap larger than this is two things on one slide.
+_BAND_REACH_IN = 0.6
+
+
+def _is_band(shape) -> bool:
+    """Whether a shape is a drawn band rather than something wide and short.
+
+    Two conditions, and both were learned from the noise. Run over three real
+    decks the first version reported four titles, a subtitle and a footer
+    placeholder: all wide, all short, and all compared against most of the
+    slide because the cluster under a title IS most of the slide.
+
+    A band is FILLED. That is what a band is -- a coloured bar drawn behind
+    copy -- and a title is a text frame with nothing behind it.
+
+    A band is NOT A PLACEHOLDER. A placeholder's width comes from the layout,
+    so a title narrower than the body beneath it is the layout's business or
+    `title.position_inconsistent`'s, and squaring it against the body would
+    fight whichever of those is right.
+
+    Wide for its height, still: a filled square panel is not a band either.
+    """
+    if shape.placeholder_type is not None:
+        return False
+    if not (shape.fill_hex or shape.fill_theme):
+        return False
+    box = shape.geometry
+    return box.width_in >= _BAND_ASPECT * box.height_in
+
+
+def _band_ceiling(width_in: float) -> float:
+    """The most a band may be out and still be read as drift."""
+    return min(_BAND_DRIFT_CEILING_IN, _BAND_DRIFT_FRACTION * width_in)
+
+
+def _bands(slide, minimum: int):
+    """Every (band, cluster) pair on a slide, in document order.
+
+    A band is a wide, short shape with a cluster of shapes directly beneath it
+    or directly above it -- a header or a footer. Both directions, because a
+    footer band across the bottom of a table is the same object and the same
+    defect.
+    """
+    shapes = [
+        s for s in slide.shapes
+        if not s.is_group and s.geometry.width_in > 0 and s.geometry.height_in > 0
+    ]
+    for band in shapes:
+        if not _is_band(band):
+            continue
+        box = band.geometry
+        for below in (True, False):
+            cluster = _capped_cluster(band, shapes, below)
+            if len(cluster) < minimum:
+                continue
+            span = _shared_span(cluster)
+            if span is None or span.width_in <= 0:
+                continue
+            overlap = min(
+                box.left_in + box.width_in, span.left_in + span.width_in
+            ) - max(box.left_in, span.left_in)
+            if overlap < _BAND_COVERAGE * span.width_in:
+                continue
+            # The span travels with the pair. Computed twice, `_bands` and
+            # `check` disagreed about it: this filtered on the shared span and
+            # that compared against the raw bounding box, which on a real
+            # slide included the full-width footer band and read the headline
+            # band as 0.54in off on a left edge that was exact. The rule went
+            # silent on the defect it was written for.
+            yield band, cluster, span
+            break       # a band caps one cluster; the nearer one wins
+
+
+def _capped_cluster(band, shapes, below: bool) -> list:
+    """The run of shapes a band sits directly on top of, or under.
+
+    Grown row by row from the band outwards: the first row is whatever starts
+    within `_BAND_REACH_IN` of the band's edge, and each row after it is
+    whatever starts within the same reach of the last one. That is what stops
+    the cluster running to the bottom of the slide and swallowing a footer, a
+    source line and the page number with it.
+    """
+    box = band.geometry
+    frontier = box.top_in + box.height_in if below else box.top_in
+    cluster: list = []
+    seen = {band.shape_id}
+
+    while True:
+        row = []
+        for shape in shapes:
+            if shape.shape_id in seen:
+                continue
+            rect = shape.geometry
+            # Inside the band's span, allowing for the drift being looked
+            # for. Overlap alone was not enough: the full-width footer band
+            # across the bottom of a real slide overlaps every band above it,
+            # and letting it join the cluster took the cluster's edges out to
+            # the slide's. A shape spilling far past the band is a different
+            # object, not part of the column it caps.
+            spill = _BAND_DRIFT_CEILING_IN
+            if (
+                rect.left_in < box.left_in - spill
+                or rect.left_in + rect.width_in
+                > box.left_in + box.width_in + spill
+            ):
+                continue
+            edge = rect.top_in if below else rect.top_in + rect.height_in
+            gap = (edge - frontier) if below else (frontier - edge)
+            if -_BAND_SLACK_IN <= gap <= _BAND_REACH_IN:
+                row.append(shape)
+        if not row:
+            return cluster
+        cluster.extend(row)
+        seen.update(shape.shape_id for shape in row)
+        frontier = (
+            max(s.geometry.top_in + s.geometry.height_in for s in row)
+            if below else min(s.geometry.top_in for s in row)
+        )
+
+
+def _shared_span(shapes) -> Optional[Geometry]:
+    """The cluster's extent, ignoring an edge only one shape reaches.
+
+    A component's outer edge is a shared edge: three labels start at the same
+    left, three bodies end at the same right. A single shape sticking out past
+    everything else is not the edge of the component, it is an element placed
+    over it -- the circular badge that overhangs a band on a real slide -- and
+    letting it define the span made every band on that slide look short.
+
+    None when neither edge is shared, which is not a component this rule can
+    speak about.
+    """
+    if len(shapes) < 2:
+        return None
+    lefts = sorted(s.geometry.left_in for s in shapes)
+    rights = sorted(
+        (s.geometry.left_in + s.geometry.width_in for s in shapes), reverse=True
+    )
+    left = _shared_edge_value(lefts)
+    right = _shared_edge_value(rights)
+    if left is None or right is None or right <= left:
+        return None
+    bounds = _bounds_of(shapes)
+    return Geometry(
+        left_in=left, top_in=bounds.top_in,
+        width_in=right - left, height_in=bounds.height_in,
+    )
+
+
+def _shared_edge_value(edges: list[float]) -> Optional[float]:
+    """The first edge in this order that at least two shapes sit on."""
+    for index, edge in enumerate(edges):
+        for other in edges[index + 1:]:
+            if abs(other - edge) <= _BAND_SLACK_IN:
+                return edge
+    return None
+
+
+def _bounds_of(shapes) -> Geometry:
+    """The bounding box of a set of shapes."""
+    left = min(s.geometry.left_in for s in shapes)
+    top = min(s.geometry.top_in for s in shapes)
+    right = max(s.geometry.left_in + s.geometry.width_in for s in shapes)
+    bottom = max(s.geometry.top_in + s.geometry.height_in for s in shapes)
+    return Geometry(
+        left_in=left, top_in=top, width_in=right - left, height_in=bottom - top
+    )
+
+
 class TextCollisionRule(Rule):
     """Text that has left its own box and is drawn over another shape.
 

@@ -202,18 +202,6 @@ details.advanced[open] summary::before { content: "\2212  "; }
 .notice.warn { border-left: 3px solid var(--warning); }
 .notice.bad  { border-left: 3px solid var(--blocker); }
 .notice p { margin: 3px 0 0; color: var(--muted); font-size: 12.5px; }
-.notes-list { margin: 9px 0 0; padding: 0; list-style: none; font-size: 12px; }
-.notes-list li {
-  display: flex; gap: 9px; align-items: baseline; flex-wrap: wrap;
-  padding: 4px 0; border-top: 1px solid var(--line);
-}
-.notes-list .slide {
-  font-family: var(--mono); font-size: 11px; color: var(--faint); flex: none;
-}
-/* The note verbatim, which is the part a designer is actually reading. */
-.notes-list q { color: var(--ink); flex: 1 1 260px; }
-.notes-list .where { font-size: 11px; color: var(--muted); flex: none; }
-.notes-list li.kept .where { color: var(--blocker); font-weight: 600; }
 
 /* ---------- findings ---------- */
 .deck-group { margin-top: 30px; }
@@ -284,6 +272,19 @@ details.advanced[open] summary::before { content: "\2212  "; }
    long run does not interleave one slide's list with the next slide's shots. */
 .slide-block { margin-top: 20px; padding-bottom: 18px; border-bottom: 1px solid var(--line); }
 .slide-block:last-child { border-bottom: 0; padding-bottom: 0; }
+/* Folds like the full list below, and looks like it, so the two read as the
+   same kind of thing at two scales. */
+.slide-fold { margin-top: 9px; font-size: 12px; }
+.slide-fold summary {
+  cursor: pointer; color: var(--muted); list-style: none; width: fit-content;
+}
+.slide-fold summary::-webkit-details-marker { display: none; }
+.slide-fold summary::before { content: "+ "; color: var(--faint); }
+.slide-fold[open] summary::before { content: "\2212  "; }
+.slide-fold summary:hover { color: var(--ink); }
+/* The count of things the render cannot show, on the summary, so a folded
+   list still says that some of what it holds is unmarkable. */
+.slide-fold .off-count { color: var(--warning); }
 .slide-changes { margin: 10px 0 0; padding: 0; list-style: none; font-size: 12px; }
 .slide-changes li {
   display: flex; gap: 7px; align-items: baseline;
@@ -294,6 +295,15 @@ details.advanced[open] summary::before { content: "\2212  "; }
 .slide-changes li.found { background: var(--tint); border-radius: 3px; }
 .slide-changes.empty { color: var(--faint); font-size: 12px; margin: 10px 0 0; }
 /* Shares the badge with the full list, and the flash that answers a click. */
+/* A change with nothing to point at has to be as visible in the list as the
+   ones that do, not quieter than them. Faint grey was the first attempt and
+   it read as decoration -- the row a designer most needs to notice, because
+   they cannot check it against the render, was the one hardest to see. */
+.slide-changes .num.off {
+  background: var(--warning); color: var(--surface);
+  min-width: 0; padding: 0 5px; letter-spacing: .04em;
+}
+.slide-changes li.offcanvas b { color: var(--warning); }
 .slide-changes .num {
   display: inline-block; min-width: 15px; text-align: center;
   background: var(--hl); color: #fff;
@@ -305,7 +315,13 @@ details.advanced[open] summary::before { content: "\2212  "; }
 /* ---------- change highlights ---------- */
 /* The box is positioned against the image, so the wrapper has to be exactly
    the image's size: inline-block and a block img, no line-box slack. */
-.frame { position: relative; display: block; }
+/* Clipped, as a guarantee rather than a hope: a box is positioned from
+   measured geometry, and a shape half off the slide edge is a real thing to
+   mark, so the half that is on the slide is drawn and the rest is cut. */
+.frame { position: relative; display: block; overflow: hidden; }
+/* The reserved box. `height:auto` would be zero until the image loads, which
+   is exactly when the overlay is being positioned against it. */
+.frame img { width: 100%; height: auto; display: block; }
 .hl {
   position: absolute;
   border: 2px solid var(--hl);
@@ -378,7 +394,7 @@ details.advanced[open] summary::before { content: "\2212  "; }
 /* Folded by default, so it needs to look like something that opens. */
 .changes { margin-top: 10px; }
 .changes summary::before { content: "+ "; }
-.changes[open] summary::before { content: "2  "; }
+.changes[open] summary::before { content: "\2212  "; }
 .changes summary:hover { color: var(--muted); }
 .aidebug .batch { margin-top: 12px; }
 .aidebug .batch-head {
@@ -484,6 +500,10 @@ const state = {
   // what a designer actually reads. Held here rather than left to <details>
   // because every tick re-renders the section and would fold it back.
   changesOpen: false,
+  // Per-slide fold state, by slide number, for the lists under each pair of
+  // renders. Only holds slides the reader has actually toggled; the rest fall
+  // back to the length rule in `slideListOpen`.
+  slideOpen: {},
   highlight: true,     // draw the boxes over the before/after renders
 };
 
@@ -688,7 +708,6 @@ function render() {
     summaryHTML(report, issues, counts, visible, elapsed),
     noticesHTML(logs, ai, report),
     applyBarHTML(issues),
-    notesHTML(),
     appliedHTML(),
     previewHTML(),
     visible.length ? groupsHTML(visible) : emptyHTML(issues.length),
@@ -850,50 +869,13 @@ function applyBarHTML(issues) {
   </section>`;
 }
 
-/* Production notes this run moved off the slides.
- *
- * Always shown, never folded, and shown whatever happened to the note. A note
- * is a message a person wrote to another person on purpose, so every one of
- * them wants a human decision: the ones that became comments are waiting in
- * PowerPoint's Comments pane, the ones on a notes page are off the slide but
- * nobody has been told about them, and the ones that could not be moved are
- * still on the slide and must not be sent. Deleting them quietly, which is
- * what this used to do, made all three invisible. */
-function notesHTML() {
-  const notes = (state.applied && state.applied.notes) || [];
-  if (!notes.length) return "";
-  const kept = notes.filter((n) => n.where === "kept");
-  const label = {
-    comment: "in a PowerPoint comment",
-    notes: "on the slide's notes page",
-    kept: "STILL ON THE SLIDE",
-  };
-  return `<div class="notice ${kept.length ? "bad" : "warn"} notes"><div>
-    <b>${notes.length} production note${notes.length === 1 ? "" : "s"}
-      moved off the slide${notes.length === 1 ? "" : "s"}.</b>
-    <p>${kept.length
-      ? `${kept.length} could not be moved and ${kept.length === 1
-          ? "is" : "are"} still on the deck. Take ${kept.length === 1
-          ? "it" : "them"} off before this goes out.`
-      : "Nothing was deleted: each note was copied out before its shape came "
-        + "off, so every one is still readable somewhere."}
-      Re-check each of these.</p>
-    <ul class="notes-list">
-      ${notes.map((n) => `<li class="${esc(n.where)}">
-        <span class="slide">slide ${esc(n.slide)}</span>
-        <q>${esc(n.text)}</q>
-        <span class="where">${label[n.where] || esc(n.where)}</span>
-      </li>`).join("")}
-    </ul>
-  </div></div>`;
-}
-
 function appliedHTML() {
   const r = state.applied;
   if (!r) return "";
   // The same numbering the boxes on the renders carry, so a box and its line
   // are one thing addressed two ways. Numbered rows get an id to jump to.
-  const rows = changeRows().map((a) => `<li id="chg-${a.n}" class="numbered">
+  const rows = changeRows().map((a) => `<li
+    ${a.n === null ? "" : `id="chg-${markKey(a)}"`} class="numbered">
     <span class="num">${a.n}</span>
     ${a.slide ? `slide ${a.slide}` : "deck"}${a.shape ? ` &middot; ${esc(a.shape)}` : ""}
     &mdash; ${esc(a.detail)}${a.round === 2
@@ -953,7 +935,7 @@ function previewHTML() {
           <div class="shot ${rebuilt ? "stale" : ""}"><span>Slide ${s.slide} &mdash; after</span>
             ${shotHTML(s.after, s.slide, "after", mine, true)}</div>
         </div>
-        ${slideChangesHTML(mine)}
+        ${slideChangesHTML(s.slide, rowsForSlide(s.slide))}
       </div>`;
     }).join("")}
   </section>`;
@@ -977,14 +959,85 @@ function changeRows() {
     ...((r.recheck && r.recheck.second_round) || [])
       .filter((o) => o.applied).map((o) => ({ ...o, round: 2 })),
   ];
-  return rows.map((row, i) => ({ ...row, n: i + 1 }));
+  // Numbered WITHIN each slide, so slide 3 shows 1, 2, 3.
+  //
+  // One sequence across the whole run was the first attempt and it was a bad
+  // one. It is what made a three-change slide read "3, 11, 274": the numbers
+  // were positions in a 300-change deck, which is a fact about the run and
+  // not about the slide anyone is looking at. It bought the ability to jump
+  // from a box to one global list, and the per-slide lists that now sit under
+  // each pair of renders made that pointless.
+  //
+  // Deck-level changes have no slide and no box, so they get no number.
+  //
+  // A number is only spent on a change that can be POINTED AT. Deck-level
+  // changes have no slide; and a shape parked in the grey area beside the
+  // canvas -- which a working deck is full of -- has a box at left -0.24 or
+  // 1.25, so there is nowhere on the render to draw it. Numbering those too
+  // was the rest of what looked wrong: the list counted them and the slide
+  // could not show them, so the visible numbers came out full of holes and
+  // the undrawable boxes piled up in the page margin.
+  const seen = new Map();
+  return rows.map((row) => {
+    if (!row.slide || !onCanvas(row.box_before) && !onCanvas(row.box_after)) {
+      return { ...row, n: null };
+    }
+    const next = (seen.get(row.slide) || 0) + 1;
+    seen.set(row.slide, next);
+    return { ...row, n: next };
+  });
+}
+
+/* A box trimmed to the part of it that is on the slide, or null if none is.
+ *
+ * Clipping the frame alone left the box's number badge outside the picture
+ * with the rest of the overhang, so a shape half off the edge got a box with
+ * no number on it. Trimming instead means the box hugs exactly the part a
+ * reader can see, and the badge sits on it. `overflow: hidden` stays on the
+ * frame as a guarantee rather than a mechanism. */
+function clampToCanvas(box) {
+  if (!onCanvas(box)) return null;
+  const [x, y, w, h] = box;
+  const left = Math.max(0, x);
+  const top = Math.max(0, y);
+  return [left, top, Math.min(1, x + w) - left, Math.min(1, y + h) - top];
+}
+
+/* The handle a box and its two list rows agree on.
+ *
+ * The number alone stopped being unique the moment numbering became per
+ * slide: every slide has a 1, so `getElementById("chg-slide-1")` answered
+ * with whichever slide came first and a box on slide 4 jumped to slide 3.
+ * Two namespaces because the same change is listed twice -- once under its
+ * slide, once in the full list -- and an id may only appear once. */
+function markKey(row) {
+  return `${row.slide}-${row.n}`;
+}
+
+/* Whether a box overlaps the slide at all.
+ *
+ * Fractions of the slide, so the canvas is 0..1 on both axes. A shape parked
+ * beside the slide measures negative, one hanging off the right measures past
+ * 1, and neither has anything to point at on the render. Overlapping counts
+ * as on: a shape half off the edge is half visible, and clipping draws the
+ * half that is. */
+function onCanvas(box) {
+  if (!box) return false;
+  const [x, y, w, h] = box;
+  return x + w > 0 && y + h > 0 && x < 1 && y < 1;
+}
+
+/* Every change on one slide, drawable or not, in list order. */
+function rowsForSlide(slide) {
+  return changeRows().filter((row) => row.slide === slide);
 }
 
 /* Those of them that can be drawn, grouped by the slide they are on. */
 function changeMarks() {
   const marks = new Map();
   for (const row of changeRows()) {
-    if (!row.slide || (!row.box_before && !row.box_after)) continue;
+    // A row with no number has nothing drawable, by construction.
+    if (!row.slide || row.n === null) continue;
     if (!marks.has(row.slide)) marks.set(row.slide, []);
     marks.get(row.slide).push(row);
   }
@@ -1001,32 +1054,107 @@ function changeMarks() {
  *
  * The full list stays where it is. It holds the deck-level changes, which
  * belong to no slide, and everything that was skipped, which has no box. */
-function slideChangesHTML(marks) {
+/* Open when short, folded when long, and whatever the reader last chose.
+ *
+ * Both defaults are wrong on their own. A three-change slide wants its list
+ * open, because the numbers on the render only mean anything if what they
+ * stand for is within reading distance -- that is the whole point of these
+ * lists sitting under the pair. A slide with two hundred and eighty changes,
+ * which a real deck produces, wants it folded, because otherwise one slide's
+ * list buries the next slide's renders and the preview cannot be scrolled
+ * through at all.
+ *
+ * An explicit toggle always wins and is remembered per slide, so re-rendering
+ * -- which every tick of the apply bar does -- does not fold a list the reader
+ * just opened. */
+const SLIDE_LIST_OPEN_UP_TO = 8;
+
+function slideListOpen(slide, count) {
+  const chosen = state.slideOpen[slide];
+  return chosen === undefined ? count <= SLIDE_LIST_OPEN_UP_TO : chosen;
+}
+
+function slideChangesHTML(slide, marks) {
   if (!marks.length) {
     return `<p class="slide-changes empty">Nothing on this slide changed.
       It is shown for context.</p>`;
   }
-  return `<ul class="slide-changes">
-    ${marks.map((m) => `<li id="chg-slide-${m.n}">
-      <span class="num">${m.n}</span>
+  const off = marks.filter((m) => m.n === null).length;
+  return `<details class="slide-fold" data-slide="${slide}"
+    ${slideListOpen(slide, marks.length) ? "open" : ""}>
+    <summary>${marks.length} change${marks.length === 1 ? "" : "s"} on this
+      slide${off ? ` <span class="off-count">&middot; ${off} not on the
+      canvas</span>` : ""}</summary>
+  <ul class="slide-changes">
+    ${marks.map((m) => `<li class="${m.n === null ? "offcanvas" : ""}"
+      ${m.n === null ? "" : `id="chgs-${markKey(m)}"`}>
+      ${m.n === null
+        ? `<span class="num off" title="This shape sits outside the slide
+             canvas, so there is nothing on the render to mark">off</span>`
+        : `<span class="num">${m.n}</span>`}
       ${m.shape ? `<b>${esc(m.shape)}</b> &mdash; ` : ""}${esc(m.detail)}
       ${m.round === 2 ? `<span class="meta">(second pass)</span>` : ""}
     </li>`).join("")}
-  </ul>`;
+  </ul></details>`;
 }
+
+/* One box per rectangle, carrying every change that landed on it.
+ *
+ * Three fixes to the same shape used to draw three identical boxes stacked
+ * exactly on each other, so two of the three numbers were hidden underneath
+ * the third. That is what "numbers for boxes that aren't visible" was: they
+ * were drawn, on top of one another, which is the same as not being drawn.
+ *
+ * The rectangle is rounded before it is compared. Two fixes to one shape can
+ * leave it a hair apart -- a recolour does not move it, a nudge does -- and
+ * boxes half a pixel apart are the same box to a reader. */
+function mergedMarks(marks, isAfter) {
+  const groups = new Map();
+  for (const m of marks) {
+    const box = clampToCanvas(
+      (isAfter ? m.box_after : m.box_before) || m.box_before
+    );
+    if (!box) continue;
+    const key = box.map((v) => v.toFixed(3)).join(",");
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(m);
+  }
+  return [...groups.values()].map((group) => ({
+    ...group[0],
+    // The trimmed rectangle, so the drawing and the grouping agree.
+    box: clampToCanvas(
+      (isAfter ? group[0].box_after : group[0].box_before) || group[0].box_before
+    ),
+    // Every number on the box, so the label matches the lines below it.
+    label: group.map((m) => m.n).join(" "),
+    n: group[0].n,
+    title: group
+      .map((m) => `${m.n}. ${m.shape ? m.shape + " - " : ""}${m.detail}`)
+      .join("; "),
+  }));
+}
+
 
 function shotHTML(src, slide, which, marks, isAfter) {
   if (!src) return "<i>not rendered</i>";
-  const img = `<img src="${esc(src)}" loading="lazy" alt="slide ${slide} ${which}">`;
+  // No lazy loading, and the frame reserves the slide's shape up front.
+  //
+  // This is what threw boxes into the blank margin of the page. A lazily
+  // loaded image below the fold has no size until it arrives, so its frame
+  // collapsed to nothing and the boxes -- positioned in percentages of that
+  // nothing -- scattered into a small cluster wherever the collapsed frame
+  // happened to sit. The aspect ratio comes off the rendered PNG itself
+  // rather than being assumed 16:9, because a 4:3 deck would be wrong.
+  const ratio = (state.preview && state.preview.aspect) || (16 / 9);
+  const img = `<img src="${esc(src)}" alt="slide ${slide} ${which}"
+    style="aspect-ratio:${ratio}">`;
   if (!state.highlight || !marks.length) return img;
-  const boxes = marks.map((m) => {
+  const boxes = mergedMarks(marks, isAfter).map((m) => {
     // On the after image a shape that was removed has no box, so the one it
     // used to occupy is drawn instead, dashed: the change is the gap, and a
     // gap is the one edit with nothing left to point at.
-    const box = (isAfter ? m.box_after : m.box_before) || m.box_before;
     const gone = isAfter && !m.box_after;
-    if (!box) return "";
-    const [x, y, w, h] = box;
+    const [x, y, w, h] = m.box;
     // The number and nothing else. Shape names on the boxes read as a wall of
     // text over the very slide they are describing, and on a table of pills
     // they covered it completely; the name belongs on the line the number
@@ -1034,8 +1162,8 @@ function shotHTML(src, slide, which, marks, isAfter) {
     return `<span class="hl ${gone ? "gone" : ""} ${y < 0.06 ? "high" : ""}"
       style="left:${(x * 100).toFixed(3)}%;top:${(y * 100).toFixed(3)}%;
              width:${(w * 100).toFixed(3)}%;height:${(h * 100).toFixed(3)}%"
-      title="${esc(m.shape ? m.shape + " — " + m.detail : m.detail)}"><b
-      data-jump="${m.n}" role="button" tabindex="0">${m.n}</b></span>`;
+      title="${esc(m.title)}"><b
+      data-jump="${markKey(m)}" role="button" tabindex="0">${esc(m.label)}</b></span>`;
   }).join("");
   return `<span class="frame">${img}${boxes}</span>`;
 }
@@ -1179,6 +1307,12 @@ function wireResults() {
     state.changesOpen = changes.open;
   });
 
+  for (const fold of document.querySelectorAll("details.slide-fold")) {
+    fold.addEventListener("toggle", () => {
+      state.slideOpen[fold.dataset.slide] = fold.open;
+    });
+  }
+
   wirePreview();
 }
 
@@ -1213,17 +1347,27 @@ function wirePreview() {
  * display:none and land nowhere. Opening it first is the whole trick, and the
  * flash is what stops a jump into forty near-identical lines from leaving the
  * reader hunting for which one moved. */
-function jumpToChange(n) {
-  // The row under the slide first: it is already on screen, so nothing has to
-  // be unfolded and nothing scrolls away from the render being compared.
-  let row = document.getElementById(`chg-slide-${n}`);
+function jumpToChange(key) {
+  // The row under the slide first: it is beside the render being compared, so
+  // reaching it costs no scrolling away from the picture. Its list may be
+  // folded, though -- long ones start that way -- and an anchor into a closed
+  // <details> lands nowhere, so it is opened first, exactly as the full list
+  // below is.
+  let row = document.getElementById(`chgs-${key}`);
+  if (row) {
+    const fold = row.closest("details.slide-fold");
+    if (fold && !fold.open) {
+      fold.open = true;
+      state.slideOpen[fold.dataset.slide] = true;
+    }
+  }
   if (!row) {
     const details = document.querySelector("details.changes");
     if (details && !details.open) {
       details.open = true;
       state.changesOpen = true;
     }
-    row = document.getElementById(`chg-${n}`);
+    row = document.getElementById(`chg-${key}`);
   }
   if (!row) return;
   row.scrollIntoView({ behavior: "smooth", block: "center" });

@@ -338,27 +338,15 @@ def _report_apply(result) -> None:
         print("\n  Skipped:", file=out)
         for outcome in result.skipped:
             print(f"    {outcome}", file=out)
-    if result.notes_lifted:
-        kept = [lifted for lifted in result.notes_lifted if not lifted.moved]
+    if result.removed:
         print(
-            f"\n  {len(result.notes_lifted)} production note(s) off the slides."
-            " Each one needs a designer to re-check it:",
+            f"\n  {len(result.removed)} production note(s) taken off the deck. "
+            "Nothing else was removed:",
             file=out,
         )
-        for lifted in result.notes_lifted:
-            print(f"    slide {lifted.lift.slide}: {lifted.lift.text!r}", file=out)
-            print(f"      -> {lifted.detail}", file=out)
-        if kept:
-            print(
-                f"    {len(kept)} of these is still ON the slide and must not "
-                "go out as it stands.",
-                file=out,
-            )
-        else:
-            print(
-                "    Nothing was deleted: every note was copied out first.",
-                file=out,
-            )
+        for outcome in result.removed:
+            where = f"slide {outcome.issue.slide}" if outcome.issue.slide else "deck"
+            print(f"    {where}: {outcome.detail}", file=out)
     if result.rebuilt is not None:
         print("", file=out)
         _report_rebuild(result.rebuilt)

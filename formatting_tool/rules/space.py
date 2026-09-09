@@ -12,6 +12,7 @@ from collections import Counter
 from math import ceil
 from typing import Iterable, Optional
 
+from ..linemetrics import LineMetricsProvider, NullLineMetrics, ShapeKey
 from ..models import Category, Geometry, Issue, Margins, Severity, SlideProfile, TextRole
 
 # How a grid finding says its lines came from the master rather than from
@@ -180,6 +181,193 @@ class SafeMarginRule(Rule):
             bottom_in=stated.bottom_in if stated.bottom_in is not None
             else round(height - frame.bottom_in, 2),
         )
+
+
+class TextCollisionRule(Rule):
+    """Text that has left its own box and is drawn over another shape.
+
+    The defect this was written for, off a real slide: four status columns,
+    each a line of copy over a thin progress bar. Two of them ran to a third
+    line, left their box, and were drawn across the bar. Nothing reported it.
+
+    Neither existing rule could. `space.overlap` measures STORED boxes and
+    only between two text-bearing shapes -- and on that slide the boxes did
+    not touch at all, the copy box ending at 5.02in and the bar starting at
+    5.06in. `space.text_overflow` knew the text was too tall for its box but
+    not what was underneath it. The collision exists only once the text is
+    drawn, so only a renderer can see it: `linemetrics` reports the rectangle
+    PowerPoint drew, and 0.19in of it was on the bar.
+
+    Reported on the shape that has to MOVE, which is the same call
+    `space.overlap` makes and for the same reason: geometry cannot say which
+    of two shapes is in the wrong place, but z-order says which one landed on
+    the other, and `slide.shapes` is in document order.
+
+    The finding carries the position to move to rather than a description of
+    the problem, because the arithmetic belongs where the measurement is. What
+    it does not carry is permission: the applier checks every geometric move
+    against the shapes around it and reverts one that lands on a neighbour or
+    breaks an alignment, so a shape with nowhere to go stays where it is and
+    the report says so.
+    """
+
+    id = "space.text_collision"
+    category = Category.SPACE
+    description = "Text spilling out of its box is drawn over another shape."
+    default_severity = Severity.ERROR
+
+    def __init__(self, metrics: Optional[LineMetricsProvider] = None) -> None:
+        self.metrics = metrics or NullLineMetrics()
+
+    def check(self, ctx: RuleContext) -> Iterable[Issue]:
+        if not self.metrics.available:
+            return
+        for slide, shape in ctx.text_shapes():
+            if shape.is_group or not shape.text.strip():
+                continue
+            box = shape.geometry
+            if box.width_in <= 0 or box.height_in <= 0:
+                continue
+            bounds = self.metrics.bounds(ShapeKey(slide.number, shape.shape_id))
+            if bounds is None:
+                continue
+            if _overhang(bounds, box)[0] <= _MEASURED_SLACK_IN:
+                continue
+            hit = _first_shape_under(slide, shape, bounds)
+            if hit is None:
+                continue
+
+            plan = _separation(ctx.deck, slide, shape, bounds, hit)
+            if plan is None:
+                continue
+            mover, still, dx, dy = plan
+            rect = still.geometry
+            yield self.issue(
+                f"{mover.name!r} and text spilling out of "
+                f"{(still if mover is shape else shape).name!r} are drawn over "
+                f"each other; {mover.name!r} is in front, so it is the one "
+                f"that moves.",
+                slide=slide,
+                shape=mover,
+                expected=(
+                    f"clear of {still.name!r} at {rect.left_in:.2f}, "
+                    f"{rect.top_in:.2f}, {rect.width_in:.2f} x "
+                    f"{rect.height_in:.2f}in, moved to "
+                    f"{mover.geometry.left_in + dx:.2f}, "
+                    f"{mover.geometry.top_in + dy:.2f}in"
+                ),
+                found=(
+                    f"text drawn to {bounds.bottom_in:.2f}in over a shape "
+                    f"starting at {rect.top_in:.2f}in"
+                ),
+                suggestion=(
+                    f"Move {mover.name!r} by {dx:+.2f}, {dy:+.2f}in, which is "
+                    "the shortest way clear. If there is no room for that, "
+                    "shorten the copy or give the text box the height it needs."
+                ),
+            )
+
+
+def _separation(deck, slide, shape, bounds, hit):
+    """Who moves and by how much, or None if neither can be nudged clear.
+
+    The rectangle that matters for the text is the INK, not the box: the box
+    is 0.22in tall and the text is drawn 0.40in tall, and it is the drawn
+    height that is on the bar. The ink travels with the box, so a move
+    computed against the ink is applied to the box unchanged.
+
+    Front first, per z-order, which is the shape that arrived last and landed
+    on the other. If its shortest way out leaves the slide, the other one is
+    tried instead -- one of the two is usually against an edge, and refusing
+    both because the front one is would leave the defect in the deck.
+    """
+    ink = Geometry(
+        left_in=bounds.left_in, top_in=bounds.top_in,
+        width_in=bounds.width_in, height_in=bounds.height_in,
+    )
+    order = list(slide.shapes)
+    try:
+        text_at = next(i for i, s in enumerate(order) if s.shape_id == shape.shape_id)
+        hit_at = next(i for i, s in enumerate(order) if s.shape_id == hit.shape_id)
+    except StopIteration:
+        return None
+
+    # (the one that moves, the one it clears, the rectangle to clear it of,
+    #  the rectangle that moves)
+    front_first = (
+        [(hit, shape, ink, hit.geometry), (shape, hit, hit.geometry, ink)]
+        if hit_at > text_at
+        else [(shape, hit, hit.geometry, ink), (hit, shape, ink, hit.geometry)]
+    )
+    for mover, still, obstacle, moving in front_first:
+        delta = _shortest_way_out(moving, obstacle)
+        if delta is None:
+            continue
+        dx, dy = delta
+        # A nudge, or nothing. Text with wrapping off can overhang its box by
+        # inches, and then the shortest way out is to relocate something
+        # across the slide -- a source line shunted 2in to clear a panel is
+        # not the fix anyone wanted, and the real answer there is to turn
+        # wrapping on or shorten the line. Past this the finding stands and
+        # says so, with no target on it.
+        if abs(dx) > _MAX_NUDGE_IN or abs(dy) > _MAX_NUDGE_IN:
+            continue
+        box = mover.geometry
+        if (
+            box.left_in + dx >= 0
+            and box.top_in + dy >= 0
+            and box.left_in + dx + box.width_in <= deck.width_in
+            and box.top_in + dy + box.height_in <= deck.height_in
+        ):
+            return mover, still, dx, dy
+    return None
+
+
+def _shortest_way_out(moving: Geometry, obstacle: Geometry):
+    """The smallest translation that separates two rectangles, or None.
+
+    One axis, never a diagonal: a diagonal clears the same collision by moving
+    further and lands the shape somewhere neither rectangle suggested. An axis
+    the two fully share is not a collision on that axis but an alignment --
+    a bar the width of the text above it -- so it is not a way out.
+    """
+    clear = _CLEAR_IN
+    across = (
+        (obstacle.left_in + obstacle.width_in - moving.left_in + clear, 0.0),
+        (obstacle.left_in - (moving.left_in + moving.width_in) - clear, 0.0),
+    )
+    down = (
+        (0.0, obstacle.top_in + obstacle.height_in - moving.top_in + clear),
+        (0.0, obstacle.top_in - (moving.top_in + moving.height_in) - clear),
+    )
+    ways = []
+    if not _shares_axis(moving.left_in, moving.width_in,
+                        obstacle.left_in, obstacle.width_in):
+        ways.extend(across)
+    if not _shares_axis(moving.top_in, moving.height_in,
+                        obstacle.top_in, obstacle.height_in):
+        ways.extend(down)
+    if not ways:
+        ways = list(across) + list(down)
+    return min(ways, key=lambda way: abs(way[0]) + abs(way[1]))
+
+
+def _shares_axis(a: float, a_size: float, b: float, b_size: float) -> bool:
+    """Whether one span is entirely inside the other on this axis."""
+    return (a >= b and a + a_size <= b + b_size) or (
+        b >= a and b + b_size <= a + a_size
+    )
+
+
+# A hair of daylight, so a shape pushed clear does not come back next run as
+# touching to the nearest EMU.
+_CLEAR_IN = 0.02
+
+# The most a shape may be nudged to clear a collision. Beyond this the move
+# is not tidying a slide, it is redesigning one: three quarters of an inch is
+# already a visible relocation, and an overhang that needs more than that is
+# a copy or wrapping problem wearing a geometry problem's clothes.
+_MAX_NUDGE_IN = 0.75
 
 
 class OverlapRule(Rule):
@@ -477,9 +665,22 @@ class TextOverflowRule(Rule):
     and over whatever is under it. On a real deck a body paragraph came out
     across the heading below it and the subtitle above.
 
-    Exact rendered heights need a renderer -- see `formatting_tool.linemetrics`
-    -- and there still is not one. What is here are the two proxies the TODO
-    on this rule asked for, which need no renderer and catch that case:
+    Measured when a renderer is wired in, estimated when one is not.
+
+    `formatting_tool.linemetrics` now reports the rectangle PowerPoint drew
+    the text into, which settles what the estimate could only guess at, and
+    settles a case the estimate cannot see at all: a box 0.22in tall holding
+    three lines of 8pt renders 0.40in of text, and the 0.18in that does not
+    fit lands on the shape below. The stored boxes never touch, so
+    `space.overlap` -- which measures stored boxes, and only between two
+    text-bearing shapes -- is silent, and a status bar under a status line is
+    exactly that geometry. Measured, it is arithmetic.
+
+    A measured overflow also says WHAT it runs over, which is the difference
+    between "this box is a little tight" and "this line is drawn across a red
+    bar on a slide going to a client".
+
+    Without a renderer, the two proxies below, which need none:
 
     - Wrapping off, and the longest line wider than the box. One line, no
       wrap, and a width the box does not have.
@@ -503,7 +704,11 @@ class TextOverflowRule(Rule):
     description = "Text overflows its shape."
     default_severity = Severity.ERROR
 
+    def __init__(self, metrics: Optional[LineMetricsProvider] = None) -> None:
+        self.metrics = metrics or NullLineMetrics()
+
     def check(self, ctx: RuleContext) -> Iterable[Issue]:
+        measurable = self.metrics.available
         for slide, shape in ctx.text_shapes():
             if shape.is_group or not shape.text.strip():
                 continue
@@ -512,6 +717,21 @@ class TextOverflowRule(Rule):
                 continue
 
             mode = (shape.autofit or "").upper()
+
+            # Measured first, and where a measurement exists it is the whole
+            # answer: the estimate has nothing to add to it, including for
+            # shrink-to-fit, which the estimate has to skip because it cannot
+            # know what the text was shrunk to.
+            if measurable:
+                bounds = self.metrics.bounds(
+                    ShapeKey(slide.number, shape.shape_id)
+                )
+                if bounds is not None:
+                    finding = self._measured(slide, shape, box, bounds)
+                    if finding is not None:
+                        yield finding
+                    continue
+
             if mode.startswith("TEXT_TO_FIT"):
                 # The text is made to fit. That it had to be is a finding, and
                 # `size.autofit_shrink` is the one that makes it.
@@ -523,6 +743,64 @@ class TextOverflowRule(Rule):
                 finding = self._wrapped(slide, shape, box, mode)
             if finding is not None:
                 yield finding
+
+    def _measured(self, slide, shape, box, bounds) -> Optional[Issue]:
+        """What the renderer drew, against the box it was meant to stay in.
+
+        The bottom edge only. Text is drawn into a box whose width the wrap
+        already respects, so the overflow that happens in practice is
+        vertical; a width overhang on a wrapped box means the measurement is
+        of something this rule does not understand.
+        """
+        over, edge = _overhang(bounds, box)
+        if over <= _MEASURED_SLACK_IN:
+            return None
+
+        # What it runs OVER is `space.text_collision`'s finding. That one is
+        # reported on the shape that has to move and carries a target, so it
+        # can be applied; this one is about a box too small for its copy.
+        hit = _first_shape_under(slide, shape, bounds)
+        needed = _box_for(bounds, box, edge)
+        return self.issue(
+            f"Text is drawn {bounds.width_in:.2f} x {bounds.height_in:.2f}in "
+            f"in a {box.width_in:.2f} x {box.height_in:.2f}in box, "
+            f"overhanging the {edge} by {over:.2f}in"
+            + (f" and running over {hit.name!r}." if hit is not None
+               else " and running outside it."),
+            slide=slide,
+            shape=shape,
+            severity=Severity.WARNING,
+            # The box the copy needs, in the shape a fixer can read -- but
+            # ONLY when the overflow runs into free space. Growing the box is
+            # arithmetic there: the copy and the type are untouched and the
+            # stored box stops lying about what is drawn.
+            #
+            # Where the text already runs over something, growing the box
+            # reaches straight into the shape it is colliding with, so no
+            # target is offered and `space.text_collision` -- which moves the
+            # other shape -- is left to answer it. Withheld here rather than
+            # refused in the fixer because the fixer's view of the slide is
+            # the top-level shapes, and this rule has looked at all of them.
+            expected=(
+                (
+                    f"a box its copy fits, at {needed.left_in:.2f}, "
+                    f"{needed.top_in:.2f}, {needed.width_in:.2f} x "
+                    f"{needed.height_in:.2f}in"
+                )
+                if hit is None
+                else f"text within {box.width_in:.2f} x {box.height_in:.2f}in"
+            ),
+            found=(
+                f"{bounds.width_in:.2f} x {bounds.height_in:.2f}in of text, "
+                f"{over:.2f}in past the {edge}"
+                + (f", over {hit.name!r}" if hit is not None else "")
+            ),
+            suggestion=(
+                f"Give the box the {edge} room its copy needs, or shorten the "
+                "copy. Resizing type changes how much fits, so it is not done "
+                "here."
+            ),
+        )
 
     def _unwrapped(self, slide, shape, box) -> Optional[Issue]:
         """Wrapping is off, so every paragraph is one line however long it is."""
@@ -580,6 +858,127 @@ class TextOverflowRule(Rule):
 # a line: the wrap is estimated rather than rendered, and an estimate half a
 # line out should not produce a finding.
 _SLACK_IN = 0.25
+
+# And how far a MEASURED overflow has to reach, which is far less, because
+# nothing is being guessed at. Two points: enough to swallow the rounding in a
+# value PowerPoint reports to a tenth of a point, not enough to hide a line of
+# 8pt type.
+_MEASURED_SLACK_IN = 0.03
+
+# Slack on the collision test, so two shapes that merely abut are not called a
+# collision.
+_TOUCH_IN = 0.01
+
+# What PowerPoint leaves between a text frame's edge and its text unless told
+# otherwise, on the axis being grown. A box grown to exactly the ink would
+# re-overflow by this much the moment it is redrawn.
+_INSET_IN = 0.05
+
+
+def _box_for(bounds, box, edge: str):
+    """The box this copy would fit in, grown on the edge it overflows.
+
+    Grown, never shrunk, and on one edge only. The left and top stay where
+    the designer put them: a box that overflows its bottom is not evidence
+    that its top is wrong, and moving two edges to fix one is how a fix starts
+    making composition decisions.
+    """
+    if edge in ("bottom", "top"):
+        height = max(
+            box.height_in, bounds.bottom_in + _INSET_IN - box.top_in
+        )
+        return Geometry(
+            left_in=box.left_in, top_in=box.top_in,
+            width_in=box.width_in, height_in=height,
+        )
+    width = max(box.width_in, bounds.right_in + _INSET_IN - box.left_in)
+    return Geometry(
+        left_in=box.left_in, top_in=box.top_in,
+        width_in=width, height_in=box.height_in,
+    )
+
+
+def _first_shape_under(slide, shape, bounds):
+    """The shape the overhanging text is drawn across, if there is one.
+
+    The test is on the part of the text that is OUTSIDE its own box, and that
+    is the whole point rather than a detail. Text over a coloured panel is
+    ordinary layout when the box is doing it deliberately -- a caption on a
+    photo, a label on a band -- and `space.overlap` declines to report it for
+    exactly that reason. Text that has left its box to land on that panel is
+    not deliberate, and the overhang is what tells the two apart.
+
+    Any edge. It began as "below the box", because a wrapped paragraph can
+    only grow downwards, but wrapping off is common in a hand-built deck and
+    then a long line runs off the right instead. Asking whether the collision
+    lies outside the box covers both, and the top and left with them, without
+    four special cases.
+
+    Searched in z-order and the first hit returned: one name makes the finding
+    readable, and a designer who looks will see the rest.
+    """
+    box = shape.geometry
+    for other in slide.shapes:
+        if getattr(other, "shape_id", None) == shape.shape_id:
+            continue
+        rect = getattr(other, "geometry", None)
+        if rect is None or rect.width_in <= 0 or rect.height_in <= 0:
+            continue
+        hit = _intersection(bounds, rect)
+        if hit is None:
+            continue
+        # Inside the text's own box, this is the layout doing what it meant
+        # to. Outside it, the text has gone somewhere nobody put it.
+        if _within(hit, box):
+            continue
+        return other
+    return None
+
+
+def _intersection(a, b):
+    """The rectangle two rectangles share, or None if they barely touch.
+
+    Takes anything with left/top/width/height in inches, which is both
+    `Geometry` and `TextBounds`.
+    """
+    left = max(a.left_in, b.left_in)
+    top = max(a.top_in, b.top_in)
+    right = min(a.left_in + a.width_in, b.left_in + b.width_in)
+    bottom = min(a.top_in + a.height_in, b.top_in + b.height_in)
+    if right - left <= _TOUCH_IN or bottom - top <= _TOUCH_IN:
+        return None
+    return Geometry(
+        left_in=left, top_in=top,
+        width_in=right - left, height_in=bottom - top,
+    )
+
+
+def _within(inner, outer) -> bool:
+    """Whether one rectangle sits inside another, give or take a hair."""
+    return (
+        inner.left_in >= outer.left_in - _TOUCH_IN
+        and inner.top_in >= outer.top_in - _TOUCH_IN
+        and inner.left_in + inner.width_in
+        <= outer.left_in + outer.width_in + _TOUCH_IN
+        and inner.top_in + inner.height_in
+        <= outer.top_in + outer.height_in + _TOUCH_IN
+    )
+
+
+def _overhang(bounds, box) -> tuple[float, str]:
+    """How far the drawn text reaches past its box, and over which edge.
+
+    The largest of the four, because that is the one a reader sees and the one
+    a fix has to answer. Wrapped text overhangs the bottom; text with wrapping
+    off overhangs the right.
+    """
+    edges = (
+        (bounds.bottom_in - (box.top_in + box.height_in), "bottom"),
+        (bounds.right_in - (box.left_in + box.width_in), "right"),
+        (box.left_in - bounds.left_in, "left"),
+        (box.top_in - bounds.top_in, "top"),
+    )
+    return max(edges, key=lambda edge: edge[0])
 
 # Average glyph advance as a fraction of point size, for the proportional
 # faces a deck is set in. Deliberately low, which under-counts the width of a

@@ -153,15 +153,27 @@ def test_the_whole_set_is_put_back_when_it_would_land_on_something(
 
 
 def test_only_the_hard_constraints_may_move_a_set() -> None:
-    """A deck cannot ship with content outside the frame, so a column outside
-    it together moves together. A grid snap is a preference, and dragging a
-    neighbour to satisfy one is the failure that got `space.alignment_grid`
-    disabled once already -- a section label pulled off the table it
-    captioned, and with a set move it would take the table with it."""
-    assert COHORT == {"space.safe_margin", "space.off_canvas"}
+    """The line is defect against preference, and it has not moved.
+
+    A deck cannot ship with content outside the frame, so a column outside it
+    together moves together. Text drawn across another shape is the same kind
+    of thing -- a client sees it -- and it needs the set move more than
+    either: four status bars in a row with one of them under copy that ran
+    long, nudge that one on its own and the row is broken, which is a defect
+    traded for a defect.
+
+    A grid snap is a preference, and dragging a neighbour to satisfy one is
+    the failure that got `space.alignment_grid` disabled once already -- a
+    section label pulled off the table it captioned, and with a set move it
+    would have taken the table with it. Those stay out.
+    """
+    assert COHORT == {
+        "space.safe_margin", "space.off_canvas", "space.text_collision",
+    }
     assert "space.alignment_grid" not in COHORT
     assert "space.repeat_out_of_line" not in COHORT
     assert "space.satellite_offset" not in COHORT
+    assert "space.text_overflow" not in COHORT      # it resizes, it never moves
 
 
 def test_only_the_moving_axis_drags_anything(tmp_path: Path) -> None:

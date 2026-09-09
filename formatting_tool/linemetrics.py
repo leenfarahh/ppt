@@ -48,8 +48,33 @@ class ShapeKey:
     shape_id: int
 
 
+@dataclass(frozen=True)
+class TextBounds:
+    """The rectangle the renderer actually drew a shape's text into, in inches.
+
+    Not the shape's box. The two differ whenever the text does not fit, and
+    the difference is the defect: a box 0.22in tall holding three lines of 8pt
+    draws 0.40in of text, and the 0.18in that does not fit lands on whatever
+    is underneath. Nothing in the .pptx says so -- the file stores a paragraph
+    and a box, and the renderer decides -- so this can only be measured.
+    """
+
+    left_in: float
+    top_in: float
+    width_in: float
+    height_in: float
+
+    @property
+    def right_in(self) -> float:
+        return self.left_in + self.width_in
+
+    @property
+    def bottom_in(self) -> float:
+        return self.top_in + self.height_in
+
+
 class LineMetricsProvider(Protocol):
-    """Supplies rendered line breaks for a text box."""
+    """Supplies rendered line breaks and text bounds for a text box."""
 
     @property
     def available(self) -> bool:
@@ -58,6 +83,10 @@ class LineMetricsProvider(Protocol):
 
     def lines(self, key: ShapeKey) -> Optional[list[str]]:
         """Rendered lines for one shape, or None if unknown."""
+        ...
+
+    def bounds(self, key: ShapeKey) -> Optional[TextBounds]:
+        """Where the text was actually drawn, or None if unknown."""
         ...
 
 
@@ -71,6 +100,9 @@ class NullLineMetrics:
         return False
 
     def lines(self, key: ShapeKey) -> Optional[list[str]]:
+        return None
+
+    def bounds(self, key: ShapeKey) -> Optional[TextBounds]:
         return None
 
 
@@ -93,6 +125,7 @@ class PowerPointComMetrics:
     def __init__(self, deck_path: str | Path) -> None:
         self.deck_path = Path(deck_path)
         self._lines: dict[ShapeKey, list[str]] = {}
+        self._bounds: dict[ShapeKey, TextBounds] = {}
         self._loaded = False
         self._ok = False
 
@@ -106,6 +139,11 @@ class PowerPointComMetrics:
         if not self._loaded:
             self._load()
         return self._lines.get(key)
+
+    def bounds(self, key: ShapeKey) -> Optional[TextBounds]:
+        if not self._loaded:
+            self._load()
+        return self._bounds.get(key)
 
     def _load(self) -> None:
         self._loaded = True
@@ -163,14 +201,42 @@ class PowerPointComMetrics:
             count = int(text_range.Lines().Count)
             if not count:
                 return
-            self._lines[ShapeKey(slide, int(shape.Id))] = [
+            key = ShapeKey(slide, int(shape.Id))
+            self._lines[key] = [
                 str(text_range.Lines(i + 1).Text) for i in range(count)
             ]
+            # Read in the same pass, off the same range. Opening the deck is
+            # what costs seconds; two more property reads per shape cost
+            # nothing, and asking again later would mean opening it twice.
+            bounds = _bounds_of(text_range)
+            if bounds is not None:
+                self._bounds[key] = bounds
         except Exception:
             # A shape with a frame but no range, a placeholder PowerPoint will
             # not talk about, a picture pretending to have text. None of them
             # is a failure of the deck.
             log.debug("no line metrics for a shape on slide %d", slide, exc_info=True)
+
+
+_POINTS_PER_INCH = 72.0
+
+
+def _bounds_of(text_range: Any) -> Optional[TextBounds]:
+    """The rendered text rectangle off a COM TextRange, in inches.
+
+    PowerPoint reports these in points and relative to the slide, which is
+    the same frame of reference `ShapeProfile.geometry` uses once converted,
+    so the two can be compared directly.
+    """
+    try:
+        return TextBounds(
+            left_in=float(text_range.BoundLeft) / _POINTS_PER_INCH,
+            top_in=float(text_range.BoundTop) / _POINTS_PER_INCH,
+            width_in=float(text_range.BoundWidth) / _POINTS_PER_INCH,
+            height_in=float(text_range.BoundHeight) / _POINTS_PER_INCH,
+        )
+    except Exception:
+        return None
 
 
 _MSO_GROUP = 6

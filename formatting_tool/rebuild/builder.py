@@ -37,10 +37,11 @@ in the RebuildResult.
 from __future__ import annotations
 
 import copy
+import hashlib
 import logging
 from dataclasses import dataclass, field
 from io import BytesIO
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Optional, Sequence
 
 from ..classify import SlideKind
@@ -691,13 +692,71 @@ def _reimport_image(rel: Any, tgt_part: Any) -> str:
     source_type = _content_type(rel.target_part)
     blob = rel.target_part.blob
     target_type = _sniffed_type(blob)
-    if source_type and target_type and source_type != target_type:
+    if target_type is None:
+        # Nothing recognised the bytes, which is not the same as bad bytes.
+        # An icon out of PowerPoint's own library is an SVG with an EMF
+        # fallback, and Pillow identifies neither, so `get_or_add_image_part`
+        # raised on both halves of every one of them: the SVG was dropped as
+        # an "invisible enhancement" and the EMF was left holding the source's
+        # relationship id, which means nothing on the new slide. The icon
+        # arrived as a broken-image box -- "The picture can't be displayed" --
+        # and only for library icons, which is why some survived and some did
+        # not.
+        #
+        # These do not need identifying. They are valid parts already; what
+        # they need is a partname in the target package and the content type
+        # the source declared. See `_carry_media`.
+        return _carry_media(rel, tgt_part, source_type)
+    if source_type and source_type != target_type:
         raise MediaTypeMismatch(
             f"the source calls this {source_type} and re-importing it would "
             f"write {target_type}"
         )
     _image_part, rid = tgt_part.get_or_add_image_part(BytesIO(blob))
     return rid
+
+
+def _carry_media(rel: Any, tgt_part: Any, source_type: Optional[str]) -> str:
+    """Copy media bytes across verbatim, keeping the type the source declared.
+
+    Used for the parts python-pptx will not sniff. It does the two things
+    `get_or_add_image_part` was doing that actually matter -- a free partname
+    in the target package, and dedup so an icon on twenty slides is stored
+    once -- and skips the part that was in the way, asking Pillow what the
+    bytes are.
+
+    The type is taken from the source rather than guessed, which is the whole
+    reason this is safe: the source package declared it, PowerPoint wrote it,
+    and copying a declaration is not a decision. Where the source declares
+    nothing there is nothing to copy faithfully, so it raises and the caller
+    reports the shape as it would any other media it cannot rebuild.
+    """
+    from pptx.opc.package import Part  # noqa: PLC0415 - lazy, opc internals
+
+    if not source_type:
+        raise MediaTypeMismatch(
+            "these bytes are of no type anything here can name, so copying "
+            "them would be a guess"
+        )
+
+    blob = rel.target_part.blob
+    package = tgt_part.package
+    # Dedup by content, like the image path it stands in for. Held on the
+    # package because that is what the parts belong to, and a rebuild makes
+    # one of those per run.
+    carried = getattr(package, "_carried_media", None)
+    if carried is None:
+        carried = {}
+        package._carried_media = carried
+
+    key = (source_type, hashlib.sha1(blob).hexdigest())
+    part = carried.get(key)
+    if part is None:
+        extension = PurePosixPath(str(rel.target_part.partname)).suffix or ".bin"
+        partname = package.next_partname(f"/ppt/media/image%d{extension}")
+        part = Part(partname, source_type, package, blob)
+        carried[key] = part
+    return tgt_part.relate_to(part, rel.reltype)
 
 
 class MediaTypeMismatch(Exception):

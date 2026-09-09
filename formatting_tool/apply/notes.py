@@ -1,35 +1,27 @@
-"""Taking a production note off a slide without throwing it away.
+"""Keeping a copy of every production note this run deletes.
 
-A note addressed to whoever is building the deck must not reach the client:
-"Design - redo the map", "TBC with legal", "@Sara update these numbers". The
-first version of this deleted the shape, which is correct about the slide and
-wrong about the note. Somebody wrote it on purpose, it is usually the only
-record that the thing it asks for is outstanding, and deletion is the one edit
-a designer cannot check by looking at the result -- everything else this tool
-does leaves evidence on the slide, and this leaves a gap.
+`remove_note` deletes the shape, and that is deliberately not what this
+module touches. What it adds is the copy: the note's text goes into a real
+PowerPoint comment on the slide it came from, anchored where the shape sat, so
+the message survives even though the shape does not. A designer opens the
+Comments pane and finds "Design - redo the map" waiting; a client opens the
+deck and finds nothing.
 
-So the note is moved rather than removed, and the order of the two halves is
-the whole design: the copy is made FIRST and the shape comes off only once the
-copy exists. A failure halfway leaves the note on the slide, which is a defect
-somebody notices, rather than nowhere, which is a defect nobody can.
+It runs as one pass over the WRITTEN file, after the applier has finished with
+it, for two reasons. A comment is added by the desktop application, which
+needs a file on disk rather than the object tree python-pptx is holding; and
+the second round re-saves the deck through python-pptx, so a comment written
+before that would be written into a file about to be rewritten.
 
-Three destinations, best first:
+Which means the copy is made after the deletion, not before it, and the
+guarantee is weaker than it sounds: if PowerPoint cannot be reached, the shape
+is already gone. The note is not lost -- the report quotes it verbatim, which
+is where it has always been recoverable from -- but it is not in the deck
+either, and the run says so rather than letting that pass unremarked.
 
-1. A real PowerPoint comment, through the desktop application's own API. It
-   lands in the Comments pane where a designer already looks for work assigned
-   to them, anchored at the spot the note occupied, and PowerPoint writes it in
-   whatever format its own version uses -- a modern comment on current builds,
-   which is a set of parts and author GUIDs not worth hand-rolling.
-
-2. The slide's notes page, when PowerPoint is not there to ask. Off the slide,
-   still in the file, still attached to the right slide.
-
-3. Nothing: the shape stays where it is and the report says so. Reached when
-   neither of the above worked, and it is a better answer than either losing
-   the note or shipping it.
-
-Whichever happened is reported per note, because "moved to a comment" and
-"moved to the notes page" are different things for a designer to go and check.
+The comment is filed under a name rather than a person, so a designer reading
+the pane can tell at a glance which notes they wrote and which one a tool
+moved for them.
 """
 
 from __future__ import annotations
@@ -41,33 +33,25 @@ from typing import Any, Optional, Sequence
 
 log = logging.getLogger(__name__)
 
-# The author a comment is filed under. Not a person: a designer reading the
-# pane has to be able to tell at a glance which notes they wrote and which one
-# a tool moved for them.
 COMMENT_AUTHOR = "Deck check"
 COMMENT_INITIALS = "DC"
 
-# What the note is prefixed with wherever it lands, so it reads as a record of
-# something moved rather than as a fresh instruction from nobody.
-PREFIX = "Production note, moved off the slide by Deck check:"
+# What the note is prefixed with, so it reads as a record of something taken
+# off the slide rather than as a fresh instruction from nobody.
+PREFIX = "Production note, removed from the slide by Deck check:"
 
 _EMU_PER_POINT = 12700
 
 
 @dataclass(frozen=True)
-class NoteLift:
-    """One production note to move, and where it sat."""
+class NoteCopy:
+    """One deleted note, and where its shape sat."""
 
     slide: int                          # 1-based
-    shape_id: Optional[int]
     shape: Optional[str]
     text: str
     left_pt: float = 0.0
     top_pt: float = 0.0
-
-    @property
-    def key(self) -> tuple[int, Optional[int]]:
-        return (self.slide, self.shape_id)
 
     @property
     def body(self) -> str:
@@ -75,183 +59,89 @@ class NoteLift:
 
 
 @dataclass(frozen=True)
-class LiftResult:
-    """What became of one note."""
-
-    lift: NoteLift
-    where: str                          # "comment", "notes" or "kept"
+class CopyResult:
+    note: NoteCopy
+    copied: bool
     detail: str
-
-    @property
-    def moved(self) -> bool:
-        return self.where in ("comment", "notes")
 
 
 def emu_to_points(value: Optional[int]) -> float:
     return float(value or 0) / _EMU_PER_POINT
 
 
-def lift_notes(deck: Path, lifts: Sequence[NoteLift]) -> list[LiftResult]:
-    """Move each note into a comment and take its shape off the slide.
+def copy_notes_to_comments(deck: Path, notes: Sequence[NoteCopy]) -> list[CopyResult]:
+    """Write one PowerPoint comment per deleted note. Never raises.
 
-    Returns one result per note, in the order given. Never raises: a note that
-    could not be moved is reported as kept, and the deck is left with the note
-    still on it, which is the safe end of the trade.
+    A failure here costs the copy, not the run: the fixes are applied and the
+    file is written by the time this is called.
     """
-    if not lifts:
+    if not notes:
         return []
 
     from .. import powerpoint      # noqa: PLC0415 - Windows only, lazy
 
-    if powerpoint.available():
-        try:
-            return powerpoint.run(lambda app: _through_powerpoint(app, deck, lifts))
-        except Exception:
-            log.warning(
-                "could not move %d production note(s) into comments through "
-                "PowerPoint; falling back to the notes pages",
-                len(lifts), exc_info=True,
+    if not powerpoint.available():
+        return [
+            CopyResult(
+                note, False,
+                "no comment was made: desktop PowerPoint is needed for that "
+                "and is not available here",
             )
+            for note in notes
+        ]
 
     try:
-        return _through_notes_pages(deck, lifts)
-    except Exception:
+        return powerpoint.run(lambda app: _write(app, deck, notes))
+    except Exception as exc:
         log.warning(
-            "could not move %d production note(s) off the slides at all; they "
-            "are still on the deck", len(lifts), exc_info=True,
+            "could not write %d production note(s) into comments on %s",
+            len(notes), deck.name, exc_info=True,
         )
         return [
-            LiftResult(
-                lift, "kept",
-                "could not be moved, so it is still on the slide; take it off "
-                "by hand before this goes out",
-            )
-            for lift in lifts
+            CopyResult(note, False, f"no comment could be made ({exc})")
+            for note in notes
         ]
 
 
-def _through_powerpoint(app: Any, deck: Path, lifts: Sequence[NoteLift]) -> list[LiftResult]:
-    """Add a comment per note, then delete the shape it came from.
+def _write(app: Any, deck: Path, notes: Sequence[NoteCopy]) -> list[CopyResult]:
+    """One session, one save, a comment per note.
 
-    One session, one save, and the comment written before the deletion. The
-    two are not a transaction -- nothing here is -- but in this order the
-    failure that matters cannot happen: there is no point at which the note
-    exists in neither place.
+    Anchored at the position the shape occupied, which is why that was
+    recorded before the deletion: by the time this runs there is nothing on
+    the slide left to ask.
     """
     from ..rebuild.master_apply import _retry   # noqa: PLC0415 - shared COM retry
     from .. import powerpoint                   # noqa: PLC0415
 
-    results: list[LiftResult] = []
+    results: list[CopyResult] = []
     presentation = _retry(
         lambda: app.Presentations.Open(str(deck.resolve()), False, False, False)
     )
     try:
         count = int(presentation.Slides.Count)
-        for lift in lifts:
-            if not 1 <= lift.slide <= count:
-                results.append(LiftResult(
-                    lift, "kept",
-                    f"slide {lift.slide} is not in the deck any more",
+        for note in notes:
+            if not 1 <= note.slide <= count:
+                results.append(CopyResult(
+                    note, False,
+                    f"slide {note.slide} is not in the written deck",
                 ))
                 continue
-            slide = presentation.Slides(lift.slide)
+            slide = presentation.Slides(note.slide)
             try:
-                _retry(lambda s=slide, l=lift: s.Comments.Add(
-                    l.left_pt, l.top_pt, COMMENT_AUTHOR, COMMENT_INITIALS, l.body
+                _retry(lambda s=slide, n=note: s.Comments.Add(
+                    n.left_pt, n.top_pt, COMMENT_AUTHOR, COMMENT_INITIALS, n.body
                 ))
             except Exception as exc:
-                # The comment is what makes the deletion safe, so without it
-                # the shape stays.
-                results.append(LiftResult(
-                    lift, "kept",
-                    f"the comment could not be added ({exc}), so the note is "
-                    "still on the slide",
+                results.append(CopyResult(
+                    note, False, f"the comment could not be added ({exc})"
                 ))
                 continue
-            removed = _delete_shape(slide, lift)
-            results.append(LiftResult(
-                lift, "comment",
-                "moved into a PowerPoint comment on slide "
-                f"{lift.slide}" + ("" if removed else
-                                   ", but its shape could not be deleted"),
+            results.append(CopyResult(
+                note, True,
+                f"its text was copied into a PowerPoint comment on slide "
+                f"{note.slide}",
             ))
         _retry(presentation.Save)
     finally:
         powerpoint.quietly(presentation.Close)
     return results
-
-
-def _delete_shape(slide: Any, lift: NoteLift) -> bool:
-    """Delete the note's shape, matched on the id the report named.
-
-    PowerPoint's `Shape.Id` is the same number as the OOXML shape id the rest
-    of the tool matches on, which is what lets a finding written by the python
-    side be acted on here. Names are not used: a real deck carries sixteen
-    shapes of the same name on one slide.
-    """
-    try:
-        for shape in list(slide.Shapes):
-            if lift.shape_id is not None and int(shape.Id) == lift.shape_id:
-                shape.Delete()
-                return True
-    except Exception:
-        log.debug("could not delete the note's shape", exc_info=True)
-    return False
-
-
-def _through_notes_pages(deck: Path, lifts: Sequence[NoteLift]) -> list[LiftResult]:
-    """Move each note to its slide's notes page, with python-pptx alone.
-
-    The destination when PowerPoint cannot be asked. A notes page is not the
-    Comments pane and nobody is notified by it, but it is off the slide, still
-    beside the right slide, and still there tomorrow.
-    """
-    from pptx import Presentation      # noqa: PLC0415 - lazy heavy dependency
-
-    presentation = Presentation(str(deck))
-    slides = list(presentation.slides)
-    results: list[LiftResult] = []
-    changed = False
-
-    for lift in lifts:
-        if not 1 <= lift.slide <= len(slides):
-            results.append(LiftResult(
-                lift, "kept", f"slide {lift.slide} is not in the deck any more"
-            ))
-            continue
-        slide = slides[lift.slide - 1]
-        try:
-            frame = slide.notes_slide.notes_text_frame
-            frame.text = (
-                f"{frame.text}\n\n{lift.body}" if frame.text.strip() else lift.body
-            )
-        except Exception as exc:
-            results.append(LiftResult(
-                lift, "kept",
-                f"the notes page could not be written ({exc}), so the note is "
-                "still on the slide",
-            ))
-            continue
-
-        shape = _find_by_id(slide, lift)
-        if shape is not None:
-            parent = shape._element.getparent()
-            if parent is not None:
-                parent.remove(shape._element)
-        changed = True
-        results.append(LiftResult(
-            lift, "notes",
-            f"moved to the notes page of slide {lift.slide}, because "
-            "PowerPoint was not available to make it a comment",
-        ))
-
-    if changed:
-        presentation.save(str(deck))
-    return results
-
-
-def _find_by_id(slide: Any, lift: NoteLift) -> Optional[Any]:
-    for shape in slide.shapes:
-        if lift.shape_id is not None and shape.shape_id == lift.shape_id:
-            return shape
-    return None

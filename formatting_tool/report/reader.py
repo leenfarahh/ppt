@@ -89,6 +89,7 @@ def _issue(entry: dict[str, Any]) -> Issue:
         suggestion=entry.get("suggestion"),
         confidence=entry.get("confidence"),
         evidence=entry.get("evidence"),
+        widest_line_chars=entry.get("widest_line_chars"),
         fix=_fix(entry.get("fix")),
         id=entry.get("id"),
     )

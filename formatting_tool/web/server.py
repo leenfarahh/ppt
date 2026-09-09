@@ -311,15 +311,6 @@ class _Handler(BaseHTTPRequestHandler):
                  "box_before": o.box_before, "box_after": o.box_after}
                 for o in result.removed
             ],
-            # Every production note this run touched and what became of it.
-            # Kept apart from `removed` because a note that could not be moved
-            # is not an applied fix, and it is the one a designer most needs to
-            # see: it is still on the slide.
-            "notes": [
-                {"slide": r.lift.slide, "shape": r.lift.shape,
-                 "text": r.lift.text, "where": r.where, "detail": r.detail}
-                for r in result.notes_lifted
-            ],
             # The second pass. The report the page ticked describes the deck
             # as it arrived; this describes the one it is about to download.
             "recheck": {
@@ -387,6 +378,10 @@ class _Handler(BaseHTTPRequestHandler):
         return {
             "session": session.id,
             "renderer_ok": bool(before),
+            # The rendered shape of a slide, so the page can reserve the right
+            # space before the images arrive. Without it the overlay boxes are
+            # positioned against a collapsed <img> and scatter outside it.
+            "aspect": _aspect_of(before, after),
             "slides": [
                 {
                     "slide": n,
@@ -611,6 +606,36 @@ def _render_into(deck: Path, directory: Path) -> dict[int, str]:
         out[number] = target.name
     images.cleanup()
     return out
+
+
+def _aspect_of(*renders: dict[int, str]) -> Optional[float]:
+    """Width over height of the rendered slides, read off a PNG header.
+
+    Exact rather than assumed: a 4:3 deck is still a thing, and guessing 16:9
+    would put every overlay box in the wrong place on one. Read from the file
+    the renderer just wrote, which costs 24 bytes.
+    """
+    for render in renders:
+        for path in render.values():
+            size = _png_size(Path(path))
+            if size and size[1]:
+                return round(size[0] / size[1], 6)
+    return None
+
+
+def _png_size(path: Path) -> Optional[tuple[int, int]]:
+    """A PNG's pixel dimensions, from its IHDR chunk."""
+    try:
+        with path.open("rb") as handle:
+            head = handle.read(24)
+    except OSError:
+        return None
+    if len(head) < 24 or not head.startswith(b"\x89PNG"):
+        return None
+    return (
+        int.from_bytes(head[16:20], "big"),
+        int.from_bytes(head[20:24], "big"),
+    )
 
 
 def _existing_images(directory: Path) -> dict[int, str]:

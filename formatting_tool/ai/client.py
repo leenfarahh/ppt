@@ -140,6 +140,10 @@ Production notes:
 - Report each one with category "production_note" and `fix.op` "remove_note",
   naming the shape by its id. Quote the text verbatim in `found`, because
   removing something is the one act nobody can check by looking at the result.
+- `remove_note` DELETES the shape. Its text is afterwards copied into a
+  PowerPoint comment, so the words are recoverable, but the shape and its
+  formatting are gone for good: a caption you call a note comes back as a
+  comment nobody asked for, on a slide now missing a caption.
 - Ask one question: is this addressed to the people making the deck, or to the
   people reading it? Only the first is a note. A caption that happens to be
   worded as an instruction is content: "Select a plot size to continue" on a
@@ -148,6 +152,9 @@ Production notes:
 - When it could be either, it is content. Leaving a note in costs a designer
   ten seconds; taking a caption out of a client deck is a defect nobody sees
   until the client does. Say so with a low confidence rather than removing it.
+- Report ONLY a request addressed to whoever is building the deck. A red
+  bubble asking for a redraw is one. A slide that merely looks unfinished is
+  not, and neither is a heading you would have worded differently.
 
 Proposing a correction, in `fix`:
 

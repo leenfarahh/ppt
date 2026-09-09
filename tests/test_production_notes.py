@@ -165,16 +165,40 @@ def test_a_placeholder_is_never_removed(tmp_path: Path) -> None:
 
 def test_an_unsure_model_removes_nothing(tmp_path: Path) -> None:
     """Leaving a note in costs a designer ten seconds. Taking a caption out of
-    a client deck is a defect nobody sees until the client does."""
+    a client deck is a defect nobody sees until the client does.
+
+    Read off `_SURE_ENOUGH` rather than repeating its value. The threshold has
+    moved once already -- down to 0.6 while the note was copied into a comment
+    first, back to 0.8 when that came out -- and a hard-coded number turns
+    from "clearly under the bar" into "exactly on it" without the test
+    noticing.
+    """
+    from formatting_tool.apply.fixers import _SURE_ENOUGH
+
     deck, name, shape_id = _deck(tmp_path)
     out = tmp_path / "clean.pptx"
-    issue = _issue(name, shape_id, confidence=0.6)
+    issue = _issue(name, shape_id, confidence=_SURE_ENOUGH - 0.1)
 
     result = apply_fixes(deck, [issue], out, selected=[issue.id], spec=_spec())
 
     assert not result.applied
     assert "more certainty" in result.skipped[0].detail
     assert name in _names(out)
+
+
+def test_a_model_at_the_threshold_does_remove_it(tmp_path: Path) -> None:
+    """The other side of the same bar, so a change to it cannot pass unnoticed
+    in both directions at once."""
+    from formatting_tool.apply.fixers import _SURE_ENOUGH
+
+    deck, name, shape_id = _deck(tmp_path)
+    out = tmp_path / "clean.pptx"
+    issue = _issue(name, shape_id, confidence=_SURE_ENOUGH)
+
+    result = apply_fixes(deck, [issue], out, selected=[issue.id], spec=_spec())
+
+    assert len(result.applied) == 1
+    assert name not in _names(out)
 
 
 def test_the_bar_for_removing_is_higher_than_for_reporting() -> None:
@@ -224,47 +248,30 @@ def test_nothing_is_removed_without_a_master(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# The note is moved, not destroyed
+# A copy is kept, and the deletion does not depend on it
 # --------------------------------------------------------------------------- #
 #
-# Deleting a production note is correct about the slide and wrong about the
-# note: somebody wrote it on purpose, it is often the only record that the
-# thing it asks for is outstanding, and a deletion is the one edit nobody can
-# check by looking at the result. So the note is copied out FIRST and the shape
-# comes off only once the copy exists.
-
-def _comment_parts(path: Path) -> list[str]:
-    import zipfile
-
-    with zipfile.ZipFile(path) as archive:
-        return [n for n in archive.namelist() if "comment" in n.lower()]
-
+# The shape still goes, unconditionally, in the applier's own pass. What is
+# added is a copy of what it said, put into a real PowerPoint comment on the
+# slide it came from and anchored where it sat. The message survives; the
+# shape does not.
+#
+# Which way round those two happen is the thing worth pinning. The comment is
+# written to the file AFTER it has been saved, because PowerPoint needs a file
+# and the second round re-saves the deck. So a comment that cannot be written
+# does not save the shape, and the report has to say so.
 
 def _comment_text(path: Path) -> str:
     import zipfile
 
     with zipfile.ZipFile(path) as archive:
         return "".join(
-            archive.read(n).decode("utf-8", "ignore") for n in _comment_parts(path)
+            archive.read(n).decode("utf-8", "ignore")
+            for n in archive.namelist() if "comment" in n.lower()
         )
 
 
-def _notes_text(path: Path) -> str:
-    from pptx import Presentation
-
-    slide = Presentation(str(path)).slides[0]
-    if not slide.has_notes_slide:
-        return ""
-    return slide.notes_slide.notes_text_frame.text
-
-
-def test_the_note_becomes_a_real_powerpoint_comment(tmp_path: Path) -> None:
-    """The destination a designer already looks in for work assigned to them.
-
-    Written by PowerPoint's own API rather than assembled here: a current
-    build writes a modern comment, which is a set of parts and author GUIDs
-    not worth hand-rolling.
-    """
+def test_the_note_is_copied_into_a_powerpoint_comment(tmp_path: Path) -> None:
     from formatting_tool import powerpoint
 
     if not powerpoint.available():
@@ -276,92 +283,19 @@ def test_the_note_becomes_a_real_powerpoint_comment(tmp_path: Path) -> None:
 
     result = apply_fixes(deck, [issue], out, selected=[issue.id], spec=_spec())
 
-    assert [r.where for r in result.notes_lifted] == ["comment"]
-    assert NOTE in _comment_text(out)          # the note survived, verbatim
-    assert "Comment box" not in _names(out)    # and the shape did not
+    assert [c.copied for c in result.notes_copied] == [True]
+    assert NOTE in _comment_text(out)          # the text survived, verbatim
+    assert name not in _names(out)             # the shape did not
+    assert "copied into a PowerPoint comment" in result.applied[0].detail
 
 
-def test_without_powerpoint_the_note_goes_to_the_notes_page(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The fallback. Not the Comments pane and nobody is notified by it, but
-    off the slide, beside the right slide, and still there tomorrow."""
-    from formatting_tool import powerpoint
-
-    monkeypatch.setattr(powerpoint, "available", lambda: False)
-
-    deck, name, shape_id = _deck(tmp_path)
-    issue = _issue(name, shape_id)
-    out = tmp_path / "clean.pptx"
-
-    result = apply_fixes(deck, [issue], out, selected=[issue.id], spec=_spec())
-
-    assert [r.where for r in result.notes_lifted] == ["notes"]
-    assert NOTE in _notes_text(out)
-    assert "Comment box" not in _names(out)
-    assert "notes page" in result.applied[0].detail
-
-
-def test_a_note_that_cannot_be_copied_out_stays_on_the_slide(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The failure that matters, and the reason for the order of the two halves.
-
-    With both destinations broken there is no copy, so the shape must not come
-    off. A note left on a slide is a defect somebody notices; a note deleted
-    with no copy anywhere is one nobody can.
-    """
-    from formatting_tool import powerpoint
-    from formatting_tool.apply import notes as notes_module
-
-    monkeypatch.setattr(powerpoint, "available", lambda: False)
-
-    def broken(deck, lifts):
-        raise RuntimeError("no writable destination")
-
-    monkeypatch.setattr(notes_module, "_through_notes_pages", broken)
-
-    deck, name, shape_id = _deck(tmp_path)
-    issue = _issue(name, shape_id)
-    out = tmp_path / "clean.pptx"
-
-    result = apply_fixes(deck, [issue], out, selected=[issue.id], spec=_spec())
-
-    assert [r.where for r in result.notes_lifted] == ["kept"]
-    assert "Comment box" in _names(out)        # still there, which is the point
-    assert result.applied == []                # and not reported as corrected
-    assert any("still on the slide" in o.detail for o in result.skipped)
-
-
-def test_the_note_is_quoted_in_the_report_whatever_became_of_it(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Every path has to leave the designer able to re-check it, and that means
-    the report quotes the note rather than saying a shape was dealt with."""
-    from formatting_tool import powerpoint
-
-    monkeypatch.setattr(powerpoint, "available", lambda: False)
-
-    deck, name, shape_id = _deck(tmp_path)
-    issue = _issue(name, shape_id)
-    out = tmp_path / "clean.pptx"
-
-    result = apply_fixes(deck, [issue], out, selected=[issue.id], spec=_spec())
-
-    assert result.notes_lifted[0].lift.text == NOTE
-    lines = [o.detail for o in result.applied + result.skipped]
-    assert any("redo the map" in line for line in lines)
-
-
-def test_the_moved_note_says_where_it_came_from(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A bare instruction appearing in a comment reads as coming from nobody.
-    It is prefixed so it reads as a record of something moved."""
+def test_the_note_still_says_the_prefix_it_came_from(tmp_path: Path) -> None:
+    """A bare instruction in a comment reads as coming from nobody."""
     from formatting_tool import powerpoint
     from formatting_tool.apply.notes import PREFIX
 
-    monkeypatch.setattr(powerpoint, "available", lambda: False)
+    if not powerpoint.available():
+        pytest.skip("desktop PowerPoint is needed to make a comment")
 
     deck, name, shape_id = _deck(tmp_path)
     issue = _issue(name, shape_id)
@@ -369,4 +303,42 @@ def test_the_moved_note_says_where_it_came_from(
 
     apply_fixes(deck, [issue], out, selected=[issue.id], spec=_spec())
 
-    assert PREFIX in _notes_text(out)
+    assert PREFIX.split(":")[0] in _comment_text(out)
+
+
+def test_a_comment_that_cannot_be_made_does_not_save_the_shape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The honest consequence of the order, asserted rather than hoped for.
+
+    The deletion is the applier's and runs first; this pass only adds a copy.
+    So with PowerPoint unreachable the shape is still gone -- and the outcome
+    line has to say no comment was made, because the report is then the only
+    place the note survives.
+    """
+    from formatting_tool import powerpoint
+
+    monkeypatch.setattr(powerpoint, "available", lambda: False)
+
+    deck, name, shape_id = _deck(tmp_path)
+    issue = _issue(name, shape_id)
+    out = tmp_path / "clean.pptx"
+
+    result = apply_fixes(deck, [issue], out, selected=[issue.id], spec=_spec())
+
+    assert [c.copied for c in result.notes_copied] == [False]
+    assert name not in _names(out)                 # removed regardless
+    assert "no comment was made" in result.applied[0].detail
+    assert "redo the map" in result.applied[0].detail   # still quoted
+
+
+def test_nothing_is_written_when_no_note_was_removed(tmp_path: Path) -> None:
+    """A run with no notes must not open PowerPoint at all."""
+    deck, name, shape_id = _deck(tmp_path, text=CAPTION)
+    issue = _issue(name, shape_id, confidence=0.2, text=CAPTION)
+    out = tmp_path / "clean.pptx"
+
+    result = apply_fixes(deck, [issue], out, selected=[issue.id], spec=_spec())
+
+    assert result.notes_copied == []
+    assert name in _names(out)

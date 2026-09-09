@@ -41,6 +41,7 @@ from .space import (
     CrowdedSeriesRule,
     OverlapRule,
     SafeMarginRule,
+    TextCollisionRule,
     TextOverflowRule,
 )
 from .titles import (
@@ -51,6 +52,7 @@ from .titles import (
 )
 from .typography import (
     ManualLineBreakRule,
+    HeadingBalanceRule,
     OrphanWidowRule,
     TitlePunctuationRule,
     WhitespaceHygieneRule,
@@ -142,11 +144,13 @@ def build_default_rules(
         SafeMarginRule(),
         OverlapRule(),
         CrowdedSeriesRule(),
-        TextOverflowRule(),
+        TextOverflowRule(metrics=metrics),
+        TextCollisionRule(metrics=metrics),
         AutofitShrinkRule(),
         # Typography
         OrphanWidowRule(metrics=metrics),
-        ManualLineBreakRule(),
+        HeadingBalanceRule(metrics=metrics),
+        ManualLineBreakRule(metrics=metrics),
         WhitespaceHygieneRule(),
         TitlePunctuationRule(),
     ]

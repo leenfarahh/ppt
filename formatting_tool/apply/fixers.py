@@ -51,6 +51,7 @@ GEOMETRIC = frozenset(
         "space.alignment_grid",
         "space.repeat_out_of_line",
         "space.overlap",
+        "space.text_collision",
         "space.row_out_of_line",
         "space.satellite_offset",
         "title.position_inconsistent",
@@ -85,7 +86,16 @@ RELATIVE = frozenset({"space.satellite_offset"})
 # already: a section label pulled off the table it captioned, and with a set
 # move it would take the table with it. So these stay single-shape moves and
 # still refuse when they would break an alignment.
-COHORT = frozenset({"space.safe_margin", "space.off_canvas"})
+#
+# `space.text_collision` is here on the same terms as the other two: text
+# drawn across a shape is a defect, not a preference. And it needs the set
+# move more than either of them. Four status bars in a row, one of them under
+# copy that ran long: nudge that one down on its own and the row is broken,
+# which is a defect a client sees just as readily as the collision was. The
+# set moves or nothing does.
+COHORT = frozenset(
+    {"space.safe_margin", "space.off_canvas", "space.text_collision"}
+)
 
 # Whitespace that is safe to strip from the end of a paragraph. A vertical tab
 # is a soft line break, which is `typography.manual_line_break`'s business and
@@ -353,6 +363,174 @@ def _move_onto(
     shape.left, shape.top = wanted_left, wanted_top
     return (
         f"moved {what} {dx:+.2f}, {dy:+.2f}in onto the position {whose} holds"
+    )
+
+
+def fix_text_overflow(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[str]:
+    """Grow the box to the size the rule measured its copy needs.
+
+    The one remedy here that is arithmetic rather than judgement. Shortening
+    copy is the writer's, resizing type changes how much fits and is the
+    designer's, and moving the neighbour is `space.text_collision`'s. Growing
+    the box touches neither the words nor the type: it stops the stored box
+    lying about what is drawn, which is the whole reason this rule exists --
+    a deck rebuilt onto a master arrives at the master's size with nothing
+    shrinking it, and a box that measured smaller than its text is where that
+    goes wrong.
+
+    Grows, never shrinks, and on one edge only -- the rule decides which. The
+    left and top stay put: a box that overflows its bottom is no evidence its
+    top is wrong.
+
+    It checks its own room, which is the part worth reading. The applier
+    guards every geometric move by comparing what a shape covers before and
+    after and putting it BACK if the move landed on a neighbour -- but "back"
+    means left and top, so a resize would sail through a guard that cannot
+    undo it. So this asks first and does not resize at all unless the answer
+    is yes.
+    """
+    if shape.width is None or shape.height is None:
+        return None
+    target = _rect(issue.expected)
+    if target is None:
+        # The rule offers a box to grow into only where the overflow runs
+        # into free space. No box means it declined, and the reason belongs
+        # in the report rather than as the applier's "already correct".
+        raise LeaveAlone(
+            "this overflow has no box to grow into: the text runs over "
+            "another shape, so growing would reach straight into it. Moving "
+            "that shape is space.text_collision's finding; the other way out "
+            "is shorter copy"
+        )
+
+    # Only a top-anchored box. This is the trap the whole fix fell into:
+    # growing a box does not move top-anchored text, and DOES move middle- or
+    # bottom-anchored text, by half the growth and all of it respectively.
+    # Measured on a real box, growing 0.22in to 0.50in moved bottom-anchored
+    # copy down 0.28in -- onto the very bar it was meant to clear, which it
+    # had not even been touching before. So a box that would relocate its own
+    # copy is not grown, and the report says why.
+    anchor = _anchor_of(shape)
+    if anchor not in ("top", None):
+        raise LeaveAlone(
+            f"the text in this box is {anchor}-anchored, so growing the box "
+            "would move the copy down rather than give it room; shorten the "
+            "copy or anchor the text to the top first"
+        )
+
+    _, _, want_w, want_h = target
+    width, height = _emu(want_w), _emu(want_h)
+    if width <= shape.width and height <= shape.height:
+        return None            # nothing to grow; the box already fits
+
+    width, height = max(width, shape.width), max(height, shape.height)
+    blocker = _grown_onto(shape, width, height, ctx)
+    if blocker is not None:
+        raise LeaveAlone(
+            f"the room the copy needs is taken by {blocker!r}, so the box "
+            "cannot grow into it; shorten the copy or move one of the two"
+        )
+    if (
+        shape.left + width > ctx.width_emu
+        or shape.top + height > ctx.height_emu
+    ):
+        raise LeaveAlone(
+            "the room the copy needs runs off the slide, so the copy has to "
+            "come down instead"
+        )
+
+    grew = []
+    if width > shape.width:
+        grew.append(f"{(width - shape.width) / EMU_PER_INCH:+.2f}in wider")
+    if height > shape.height:
+        grew.append(f"{(height - shape.height) / EMU_PER_INCH:+.2f}in taller")
+    shape.width, shape.height = width, height
+    return f"grew the box {' and '.join(grew)}, to the size its copy needs"
+
+
+def _anchor_of(shape: Any) -> Optional[str]:
+    """Where the text sits in its box: "top", "middle", "bottom", or None.
+
+    None when the shape will not say, which is read as top: that is
+    PowerPoint's default and the only value growing the box is safe for, so
+    an unreadable anchor should not be assumed to be one of the others.
+    """
+    try:
+        anchor = shape.text_frame.vertical_anchor
+    except Exception:
+        return None
+    if anchor is None:
+        return None
+    name = str(getattr(anchor, "name", anchor)).upper()
+    if "MIDDLE" in name or "CENTER" in name or "CENTRE" in name:
+        return "middle"
+    if "BOTTOM" in name:
+        return "bottom"
+    return "top"
+
+
+def _grown_onto(
+    shape: Any, width: int, height: int, ctx: "FixContext"
+) -> Optional[str]:
+    """The neighbour a grown box would land on, if any.
+
+    Only what the growth ADDS is tested. A box already overlapping a panel it
+    sits on -- a caption on a photo -- must not be refused for an overlap it
+    had before this ran; the question is whether growing makes a new one.
+    """
+    if shape.left is None or shape.top is None:
+        return None
+    was_right, was_bottom = shape.left + shape.width, shape.top + shape.height
+    now_right, now_bottom = shape.left + width, shape.top + height
+
+    for other in getattr(ctx, "neighbours", None) or []:
+        left, top = getattr(other, "left", None), getattr(other, "top", None)
+        o_w, o_h = getattr(other, "width", None), getattr(other, "height", None)
+        if None in (left, top, o_w, o_h):
+            continue
+        if left >= now_right or left + o_w <= shape.left:
+            continue
+        if top >= now_bottom or top + o_h <= shape.top:
+            continue
+        # It overlaps the grown box. Did it overlap the old one too?
+        overlapped_before = (
+            left < was_right and left + o_w > shape.left
+            and top < was_bottom and top + o_h > shape.top
+        )
+        if not overlapped_before:
+            return str(getattr(other, "name", "a neighbour"))
+    return None
+
+
+def fix_text_collision(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[str]:
+    """Move the shape to the clear position the finding names.
+
+    All the arithmetic is the rule's: it measured where the renderer put the
+    text, worked out which of the two shapes is in front, and computed the
+    shortest way out for it. What is left here is applying a position, which
+    is why this is four lines and `fix_overlap` is forty -- that one has to
+    derive the way out from two boxes at apply time.
+
+    It is also why this needs no guard of its own. `space.text_collision` is
+    in GEOMETRIC, so the applier checks the result against every neighbour and
+    puts the shape back if the move lands on one or breaks an alignment the
+    shape already had. A status bar with something directly beneath it stays
+    where it is, and the report says which shape stopped it.
+    """
+    target = _point(issue.expected)
+    if target is None or shape.left is None or shape.top is None:
+        return None
+
+    was = (shape.left, shape.top)
+    shape.left, shape.top = _emu(target[0]), _emu(target[1])
+    dx = (shape.left - was[0]) / EMU_PER_INCH
+    dy = (shape.top - was[1]) / EMU_PER_INCH
+    if abs(dx) < 0.001 and abs(dy) < 0.001:
+        shape.left, shape.top = was
+        return None
+    return (
+        f"moved {dx:+.2f}, {dy:+.2f}in clear of the text drawn over it, "
+        "being the shape in front"
     )
 
 
@@ -943,6 +1121,192 @@ def fix_terminal_punctuation(shape: Any, issue: Issue, ctx: "FixContext") -> Opt
     return None
 
 
+def fix_heading_balance(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[str]:
+    """Break a heading at a word so it takes as many lines as its row.
+
+    A soft return, and deliberately so. Narrowing the box would wrap the copy
+    without touching it, and would leave one box of a row a different width
+    from the other three -- trading a ragged row of headings for a ragged row
+    of boxes, which the repeat rules would then report. Widening is the same
+    trade. The break is the only one of the three that changes nothing about
+    the composition.
+
+    Where it falls is the whole value of doing this in the file rather than
+    leaving it to the wrap: "MBA SURVEY*" reads as MBA / SURVEY* and never as
+    MBA SURVEY / *. So the split is chosen at a word boundary and, where there
+    is a choice, at the one that leaves the two lines closest in width --
+    which is what a designer does by eye and what the rest of this module
+    already measures with `_width_units`.
+
+    One paragraph only. A heading of two paragraphs already breaks where its
+    author put the break, and the line count the row is being squared to is
+    then a fact about the copy rather than the wrap.
+    """
+    want = _line_count(issue.expected)
+    if want is None or not _has_text(shape):
+        return None
+
+    paragraphs = [p for p in shape.text_frame.paragraphs if p.text.strip()]
+    if len(paragraphs) != 1:
+        raise LeaveAlone(
+            "this heading is already more than one paragraph, so where it "
+            "breaks is the copy's business rather than the wrap's"
+        )
+    paragraph = paragraphs[0]
+    if "\v" in paragraph.text:
+        raise LeaveAlone(
+            "this heading already carries a manual break, so it is being "
+            "shaped by hand and squaring it up is a design call"
+        )
+
+    breaks = want - 1
+    points = _split_points(paragraph.text, breaks)
+    if points is None:
+        raise LeaveAlone(
+            f"this heading has too few words to sit on {want} lines, so the "
+            "row can only be squared up by rewording it"
+        )
+
+    for offset in reversed(points):        # last first, so earlier ones hold
+        if not _break_at(paragraph, offset):
+            raise LeaveAlone(
+                "the words of this heading are split across runs in a way "
+                "this cannot break cleanly; break it by hand"
+            )
+    return (
+        f"broke the heading across {want} lines at a word, to match the "
+        f"{want}-line headings beside it"
+    )
+
+
+def _line_count(expected: Optional[str]) -> Optional[int]:
+    """"2 lines, as the rest of the row" -> 2."""
+    if not expected:
+        return None
+    match = _LINES.search(expected)
+    return int(match.group(1)) if match else None
+
+
+_LINES = re.compile(r"(\d+)\s+lines", re.IGNORECASE)
+
+
+def _split_points(text: str, breaks: int) -> Optional[list[int]]:
+    """Character offsets to break at, or None if the copy has too few words.
+
+    Chosen to leave the lines as even in width as possible, measured with the
+    same weighting the orphan fix uses rather than by counting characters --
+    "AMBASSADORS" and "illliiill" are not the same width and a heading split
+    by character count comes out visibly lopsided.
+
+    Brute force over the word boundaries, which is the right algorithm here: a
+    heading is a handful of words, and the alternative is a greedy pass that
+    gets the two-break case wrong.
+    """
+    words = text.split()
+    if len(words) < breaks + 1:
+        return None
+
+    # The offset of the start of each word, so a boundary can be reported as a
+    # position in the original string rather than as a word index.
+    offsets, cursor = [], 0
+    for word in words:
+        cursor = text.index(word, cursor)
+        offsets.append(cursor)
+        cursor += len(word)
+
+    from itertools import combinations
+
+    best, best_cost = None, None
+    for cut in combinations(range(1, len(words)), breaks):
+        lines, start = [], 0
+        for index in list(cut) + [len(words)]:
+            lines.append(" ".join(words[start:index]))
+            start = index
+        widths = [_width_units(line) for line in lines]
+        # The widest line is what the row is judged on, and the spread is
+        # what makes a split look deliberate. Both, so a two-break heading
+        # does not come out as one long line and two stubs.
+        cost = (max(widths), max(widths) - min(widths))
+        if best_cost is None or cost < best_cost:
+            best, best_cost = cut, cost
+    return [offsets[index] for index in best]
+
+
+def _break_at(paragraph: Any, offset: int) -> bool:
+    """Put a soft return where `offset` starts a new line, or return False.
+
+    Straight on the XML, not through `paragraph.runs`. That property builds a
+    fresh tuple of fresh proxies each time it is read, so a run split in two
+    cannot be found in it afterwards -- the first version of this looked the
+    new run up that way, raised, and left the copy duplicated as "MBAMBA
+    SURVEY*" behind the exception. Elements do not move under you.
+
+    Run surgery either way, because a heading's words are routinely split
+    across runs: a bolded first word is enough, and the space to remove may
+    be the tail of one run while the word after it starts the next.
+    """
+    from copy import deepcopy  # noqa: PLC0415 - only needed on this path
+
+    from pptx.oxml.ns import qn  # noqa: PLC0415 - lazy, oxml internals
+
+    runs = paragraph._p.findall(qn("a:r"))
+    if not runs:
+        return False
+
+    cursor = 0
+    for index, run in enumerate(runs):
+        node = run.find(qn("a:t"))
+        text = (node.text or "") if node is not None else ""
+        start_at, end_at = cursor, cursor + len(text)
+        cursor = end_at
+        if offset > end_at or offset <= start_at:
+            continue
+
+        local = offset - start_at
+        head, tail = text[:local].rstrip(), text[local:].lstrip()
+        if head and tail:
+            # Both halves are in this run: keep the first, put the second in
+            # a copy of the same run so it keeps its formatting, and break
+            # between them.
+            twin = deepcopy(run)
+            node.text = head
+            twin.find(qn("a:t")).text = tail
+            run.addnext(twin)
+            run.addnext(run.makeelement(qn("a:br"), {}))
+            return True
+
+        if head and not tail:
+            # The break falls at this run's end. Trim its trailing space and
+            # break after it; the next run already starts the second line.
+            node.text = head
+            run.addnext(run.makeelement(qn("a:br"), {}))
+            _lstrip_run(runs[index + 1] if index + 1 < len(runs) else None, qn)
+            return True
+
+        if tail and not head and index > 0:
+            # The break falls at this run's start, so it belongs after the
+            # run before it.
+            previous = runs[index - 1]
+            _rstrip_run(previous, qn)
+            node.text = tail
+            previous.addnext(previous.makeelement(qn("a:br"), {}))
+            return True
+        return False
+    return False
+
+
+def _rstrip_run(run: Any, qn: Any) -> None:
+    node = run.find(qn("a:t")) if run is not None else None
+    if node is not None and node.text:
+        node.text = node.text.rstrip()
+
+
+def _lstrip_run(run: Any, qn: Any) -> None:
+    node = run.find(qn("a:t")) if run is not None else None
+    if node is not None and node.text:
+        node.text = node.text.lstrip()
+
+
 def fix_orphan_widow(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[str]:
     """Bind the last two words together so the wrap takes both down.
 
@@ -958,9 +1322,17 @@ def fix_orphan_widow(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[st
 
     One character, no words changed, and undone by deleting it. What it does
     not do is guarantee the result: binding two words can push both onto the
-    last line and leave two words there, or -- on a very narrow box -- push a
-    longer stub down. The second pass re-measures the deck that was written,
-    with the same renderer, which is where that is caught.
+    last line and leave two words there. The second pass re-measures the deck
+    that was written, with the same renderer, which is where that is caught.
+
+    What it must never do is bind a pair too wide for the box. An unbreakable
+    token wider than the line it has to sit on is not wrapped by PowerPoint,
+    it is BROKEN, mid-word: "Demand is no longer speculative" in a narrow pill
+    came out "speculati / ve", and "commercial threshold" came out "thre /
+    shold". A stranded word is untidy; a word snapped in half is a defect a
+    client sees first. So the pair is measured against the widest line the
+    renderer actually drew in that shape before anything is written. See
+    `_pair_fits`.
 
     Only the stranded-word finding. The same rule reports a short last line
     and a title wrapping past its limit, and neither is fixed by binding two
@@ -980,6 +1352,18 @@ def fix_orphan_widow(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[st
         raise LeaveAlone(
             "the copy has changed since the report was made, so the line this "
             "names is no longer there"
+        )
+    pair = _pair_to_bind(paragraph)
+    if pair is None:
+        raise LeaveAlone(
+            "there is only one word to bind, so nothing can be brought down "
+            "with it"
+        )
+    if not _pair_fits(pair, issue.widest_line_chars):
+        raise LeaveAlone(
+            f"binding {pair!r} would make one token too wide for the box, and "
+            "PowerPoint breaks a token it cannot fit in the middle of a word "
+            "rather than wrapping it; widen the box or edit the copy"
         )
     if not _bind_last_two_words(paragraph):
         raise LeaveAlone(
@@ -1009,6 +1393,65 @@ def _paragraph_ending_with(shape: Any, stranded: str) -> Optional[Any]:
         if (paragraph.text or "").rstrip().endswith(stranded):
             return paragraph
     return None
+
+
+def _pair_to_bind(paragraph: Any) -> Optional[str]:
+    """The two words a non-breaking space would fuse, as they would then read.
+
+    Read off the copy rather than off the runs, because what matters here is
+    the width of the resulting token and a token does not care which run its
+    halves came from.
+    """
+    words = (paragraph.text or "").split()
+    if len(words) < 2:
+        return None
+    return f"{words[-2]} {words[-1]}"
+
+
+def _pair_fits(pair: str, widest_line_chars: Optional[int]) -> bool:
+    """Whether the bound pair can sit on one line in this shape.
+
+    The widest line the renderer drew is the evidence, and it is evidence of
+    exactly the right thing: that much text demonstrably fits on one line in
+    this box, at this font, at this size. No stored width can say that, and
+    re-deriving it means driving PowerPoint again.
+
+    Erring towards declining is deliberate. Character counts are a proxy for
+    width -- "milliliter" and "WWWWWWWWWW" do not measure the same -- so the
+    comparison is weighted to soften the worst of that, and where it is still
+    wrong the cost is asymmetric: a fix declined leaves a stranded word for a
+    designer to see, and a fix applied wrongly snaps a word in half in a
+    client deck. The real cases miss by 60-80%, far outside the noise.
+
+    With no evidence -- an older report, or a hand-built finding -- there is
+    nothing to check against and the fix goes ahead as it did before. Refusing
+    everything unmeasured would disable the fix wherever the report predates
+    this.
+    """
+    if not widest_line_chars or widest_line_chars <= 0:
+        return True
+    return _width_units(pair) <= _width_units("n" * widest_line_chars)
+
+
+# Rough advance widths, relative to a lowercase "n". Enough to stop a line of
+# "l"s and a line of "W"s from being called the same width, which is the whole
+# error a character count makes.
+_NARROW = set("iljtfrI.,;:!|()[]{}/ ") | {"'", '"', "\\"}
+_WIDE = set("mwMWQ@%&")
+
+
+def _width_units(text: str) -> float:
+    total = 0.0
+    for char in text:
+        if char in _NARROW:
+            total += 0.45
+        elif char in _WIDE:
+            total += 1.55
+        elif char.isupper() or char.isdigit():
+            total += 1.15
+        else:
+            total += 1.0
+    return total
 
 
 def _bind_last_two_words(paragraph: Any) -> bool:
@@ -1185,6 +1628,11 @@ _REMOVES = frozenset({"remove_note"})
 # Not the 0.5 that separates a judgement call from a defect. Leaving a note in
 # costs a designer ten seconds; taking a caption out of a client deck is a
 # defect nobody sees until the client does, and the two are not worth the same.
+#
+# It was briefly 0.6, while `remove_note` copied the note into a PowerPoint
+# comment before deleting the shape and a wrong call was therefore
+# recoverable. The comment is gone and the deletion is final again, so the
+# price of being wrong is back to what it was and so is the bar.
 _SURE_ENOUGH = 0.8
 
 
@@ -1442,15 +1890,14 @@ def _ai_remove_note(shape: Any, action: Any, ctx: "FixContext") -> Optional[str]
     and taking a caption out of a client deck is a defect nobody sees until
     the client does.
 
-    And it is no longer a removal. The note is copied into a PowerPoint
-    comment first and the shape comes off only once the copy exists, so a
-    designer keeps the message and the client does not see it. That happens in
-    one pass at the end of the run -- see apply.notes -- because it needs the
-    written file and the desktop application, so all this does is record the
-    note and leave the shape where it is.
-
-    What was moved is put back into the outcome verbatim. A report that says
+    What was removed is put back into the outcome verbatim. A report that says
     "removed a shape" is not enough to check; one that quotes what it said is.
+
+    The note is also recorded on the way past, so that a later pass can put
+    its text into a PowerPoint comment on the same slide -- see apply.notes.
+    That is a copy, not a reprieve: the deletion below is unchanged and
+    unconditional, and the record is taken before it because the shape's
+    position is wanted and in a moment there will be no shape to ask.
     """
     try:
         if shape.is_placeholder:
@@ -1471,35 +1918,39 @@ def _ai_remove_note(shape: Any, action: Any, ctx: "FixContext") -> Optional[str]
             "and cannot read is not one to delete"
         )
 
-    from .notes import NoteLift, emu_to_points   # noqa: PLC0415 - avoids a cycle
+    element = getattr(shape, "_element", None)
+    parent = element.getparent() if element is not None else None
+    if parent is None:
+        return None
 
-    lifts = getattr(ctx, "lifted_notes", None)
-    if lifts is None:
-        # No collector, so nobody is going to move this note anywhere and the
-        # only remaining option would be to destroy it. Which is the one thing
-        # this must not do.
-        raise LeaveAlone(
-            "this note can only be taken off the slide by copying it into a "
-            "comment first, and there is nowhere to record that here"
-        )
+    # Recorded first, because this reads the shape and the next line destroys
+    # it. Whether a comment can be written from this is settled later and
+    # cannot stop the removal.
+    _record_note(shape, action, ctx, text)
 
-    lifts.append(NoteLift(
+    parent.remove(element)
+    return f"removed the production note {_shorten(text)}"
+
+
+def _record_note(shape: Any, action: Any, ctx: "FixContext", text: str) -> None:
+    """Note down what is about to be deleted, for the comment pass.
+
+    Silent when there is nowhere to record to -- a caller that assembled a
+    FixContext by hand, which the tests do. The deletion is not conditional on
+    this working; a note with no copy is reported as a note with no copy.
+    """
+    notes = getattr(ctx, "removed_notes", None)
+    if notes is None:
+        return
+    from .notes import NoteCopy, emu_to_points   # noqa: PLC0415 - avoids a cycle
+
+    notes.append(NoteCopy(
         slide=getattr(ctx, "slide", None) or 0,
-        shape_id=action.shape_id if action.shape_id is not None else (
-            getattr(shape, "shape_id", None)
-        ),
         shape=action.shape,
         text=text.strip(),
         left_pt=emu_to_points(getattr(shape, "left", None)),
         top_pt=emu_to_points(getattr(shape, "top", None)),
     ))
-    # Deliberately provisional. The final pass rewrites this line with what
-    # actually became of the note, and if that pass never runs the wording is
-    # still true: the note is on the slide and the report is flagging it.
-    return (
-        f"production note {_shorten(text)} is being moved off the slide; "
-        "check the report for where it went"
-    )
 
 
 def _text_of(shape: Any) -> str:
@@ -1584,6 +2035,8 @@ FIXERS: dict[str, Fixer] = {
     "space.repeat_out_of_line": fix_repeat_out_of_line,
     "space.row_out_of_line": fix_row_out_of_line,
     "space.overlap": fix_overlap,
+    "space.text_collision": fix_text_collision,
+    "space.text_overflow": fix_text_overflow,
     "space.series_crowded": fix_series_crowded,
     "space.satellite_offset": fix_satellite_offset,
     "title.position_inconsistent": fix_title_position,
@@ -1592,6 +2045,7 @@ FIXERS: dict[str, Fixer] = {
     "typography.manual_line_break": fix_manual_line_break,
     "typography.terminal_punctuation": fix_terminal_punctuation,
     "typography.orphan_widow": fix_orphan_widow,
+    "typography.heading_balance": fix_heading_balance,
     "font.family.theme_drift": fix_theme_font_drift,
     "font.family.arabic": fix_arabic_font,
     "typography.rtl_not_set": fix_rtl_not_set,
@@ -1608,6 +2062,9 @@ FIX_ORDER: dict[str, int] = {
     "typography.manual_line_break": 10,
     "typography.terminal_punctuation": 10,
     "typography.orphan_widow": 10,
+    # Before the orphan fix, which measures a last line: squaring the row up
+    # changes where every line of the heading falls.
+    "typography.heading_balance": 8,
     "font.family.theme_drift": 10,
     "font.family.arabic": 10,
     "typography.rtl_not_set": 10,
@@ -1618,6 +2075,8 @@ FIX_ORDER: dict[str, int] = {
     "space.repeat_out_of_line": 20,
     "space.row_out_of_line": 20,
     "space.overlap": 30,
+    "space.text_collision": 32,
+    "space.text_overflow": 34,
     "space.satellite_offset": 20,
     "title.position_inconsistent": 20,
     "logo.geometry": 20,
@@ -1662,7 +2121,6 @@ NEEDS_A_PERSON: dict[str, str] = {
     "font.family.mixed_in_shape": "which of the faces in play is correct is a design call",
     "size.role.out_of_range": "resizing type changes how much copy fits",
     "size.role.inconsistent": "resizing type changes how much copy fits",
-    "space.text_overflow": "the fix is to edit the copy or resize the box",
 }
 
 

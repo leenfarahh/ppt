@@ -118,6 +118,13 @@ class Issue:
     # difference between "the text does not collide" as an observation and as
     # a guess, and a designer weighing a finding needs to know which.
     evidence: Optional[str] = None
+    # Typography findings only: the widest line the renderer actually drew in
+    # this shape, in characters. It is the one piece of evidence about how much
+    # text fits on a line here, and the orphan fix needs it -- binding two
+    # words into one unbreakable token is only safe if the token fits, and a
+    # token that does not fit is broken mid-word by PowerPoint. Measured, not
+    # derived: a .pptx does not store where a line breaks.
+    widest_line_chars: Optional[int] = None
     # A mechanical correction the AI layer proposed, when it could name one.
     # None on every rule finding: those carry a measured target in `expected`
     # and their fixers read it from there.

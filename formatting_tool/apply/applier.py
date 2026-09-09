@@ -127,14 +127,14 @@ class FixContext:
     # applier already has open.
     neighbours: list = field(default_factory=list)
     # Which slide the finding being fixed is on, filled in per finding beside
-    # `neighbours`. The AI ops are handed the proposal rather than the finding
-    # and a proposal names a shape but not a slide, which the note lift needs.
+    # `neighbours`. The AI ops are handed the proposal rather than the finding,
+    # and a proposal names a shape but not a slide.
     slide: Optional[int] = None
-    # Production notes to move into comments once the file is written, and the
-    # shapes to take off the slides after each copy exists. Collected here
-    # rather than acted on in place because both halves need the saved file and
-    # the desktop application. See apply.notes.
-    lifted_notes: list = field(default_factory=list)
+    # Notes this run has deleted, recorded as they went, so their text can be
+    # put into PowerPoint comments once the file is written. Collecting rather
+    # than acting in place because a comment needs the saved file and the
+    # desktop application. See apply.notes.
+    removed_notes: list = field(default_factory=list)
 
 
 @dataclass
@@ -178,9 +178,9 @@ class ApplyResult:
     # afterwards. See `_second_round`.
     second_round: list[FixOutcome] = field(default_factory=list)
     settled: list[Issue] = field(default_factory=list)
-    # What became of each production note: moved into a PowerPoint comment,
-    # moved to a notes page, or left on the slide. See apply.notes.
-    notes_lifted: list[Any] = field(default_factory=list)
+    # One entry per deleted production note, saying whether its text made it
+    # into a PowerPoint comment. See apply.notes.
+    notes_copied: list[Any] = field(default_factory=list)
 
     @property
     def changed(self) -> int:
@@ -188,12 +188,11 @@ class ApplyResult:
 
     @property
     def removed(self) -> list[FixOutcome]:
-        """Production notes taken off a slide, which always need a second look.
+        """Shapes taken off the deck, which is the one change with no evidence.
 
         Everything else this does leaves something on the slide to look at. A
-        note that has been moved leaves a gap, so it is listed on its own
-        rather than being one line among forty, each outcome quotes what the
-        note said, and `notes_lifted` says where it went.
+        removal leaves a gap, so it is listed on its own rather than being one
+        line among forty, and each outcome quotes what the shape said.
         """
         return [
             outcome for outcome in self.applied
@@ -309,59 +308,73 @@ def apply_fixes(
     result.before = list(issues)
     _recheck(result, spec)
     _second_round(result, context, spec)
-    _lift_notes(result, context)
+    _copy_notes(result, context)
     return result
 
 
-def _lift_notes(result: ApplyResult, context: FixContext) -> None:
-    """Move the run's production notes into comments, last of all.
+def _copy_notes(result: ApplyResult, context: FixContext) -> None:
+    """Put each deleted note's text into a comment on the written deck.
 
-    Last because both halves need the file as it will be sent: a comment is
-    added by the desktop application, and the second round re-saves the deck
-    through python-pptx, so doing this earlier would mean writing a comment
-    into a file that is about to be rewritten.
+    Last of all, because the second round re-saves the output through
+    python-pptx and a comment written before that would be thrown away by it.
 
-    The outcome lines are rewritten here rather than at removal time for the
-    same reason. The fixer could only say what it intended; this can say what
-    happened, and "moved into a PowerPoint comment" and "still on the slide,
-    take it off by hand" are not the same news.
+    Adds nothing to the deck's content and removes nothing from it: the
+    deletions already happened, in the applier's own pass, and this neither
+    checks nor undoes them. What it can do is fail, and then the outcome line
+    says the note was removed without a copy being left behind.
     """
-    lifts = list(getattr(context, "lifted_notes", []) or [])
-    if not lifts:
+    notes = list(getattr(context, "removed_notes", []) or [])
+    if not notes:
         return
 
-    from .fixers import _shorten  # noqa: PLC0415 - one quoting rule, not two
-    from .notes import lift_notes  # noqa: PLC0415 - Windows-only COM underneath
+    from .notes import copy_notes_to_comments  # noqa: PLC0415 - COM underneath
 
-    result.notes_lifted = lift_notes(result.output, lifts)
+    result.notes_copied = copy_notes_to_comments(result.output, notes)
 
-    by_key = {r.lift.key: r for r in result.notes_lifted}
-    for outcome in result.applied:
-        action = outcome.issue.fix
-        if action is None or action.op != "remove_note":
-            continue
-        found = by_key.get((outcome.issue.slide or 0, action.shape_id))
-        if found is None:
-            continue
-        # Quoted from the note itself, not scraped back out of the fixer's
-        # provisional sentence. The text is on the lift; parsing prose to
-        # recover a value that was never lost is how the quote went missing.
-        outcome.detail = (
-            f"production note {_shorten(found.lift.text)} {found.detail}"
-        )
-        # A note that could not be moved was not corrected, whatever the
-        # fixer reported: the shape is still on the slide.
-        if not found.moved:
-            outcome.applied = False
-            result.skipped.append(outcome)
-    result.applied = [o for o in result.applied if o.applied]
+    # Matched by position: both lists are in the order the notes were removed.
+    outcomes = [
+        outcome for outcome in result.applied
+        if outcome.issue.fix is not None
+        and outcome.issue.fix.op == "remove_note"
+    ]
+    for outcome, copied in zip(outcomes, result.notes_copied):
+        outcome.detail = f"{outcome.detail}; {copied.detail}"
 
-    kept = [r for r in result.notes_lifted if not r.moved]
-    if kept:
+    missed = [c for c in result.notes_copied if not c.copied]
+    if missed:
         log.warning(
-            "%d production note(s) could not be moved off the slides and are "
-            "still on the deck", len(kept),
+            "%d production note(s) were removed without a comment being left "
+            "behind; the report quotes what they said", len(missed),
         )
+
+
+# Fixes whose result the recheck can only judge with a renderer, because a
+# rule that would otherwise object to them tells them apart by line count.
+_MEASURED_AFTER = frozenset({"typography.heading_balance"})
+
+
+def _needs_measuring(result: ApplyResult) -> bool:
+    return any(
+        (outcome.issue.rule_id or "") in _MEASURED_AFTER
+        for outcome in result.applied
+    )
+
+
+# Pairs that must not be applied to the same shape in one run, because the
+# second undoes the first. The applier is allowed to correct what its own
+# fixes caused -- that is what the second round is for -- but not to reverse a
+# fix it just made, which is a loop dressed up as tidying.
+_OPPOSED = {
+    "typography.manual_line_break": {"typography.heading_balance"},
+}
+
+
+def _reverses_a_fix(issue: Issue, applied: dict) -> bool:
+    """Whether acting on this finding would undo something already applied."""
+    opposed = _OPPOSED.get(issue.rule_id or "")
+    if not opposed:
+        return False
+    return bool(opposed & applied.get((issue.slide, issue.shape_id), set()))
 
 
 def _second_round(
@@ -388,7 +401,14 @@ def _second_round(
     """
     if not result.rechecked:
         return
-    todo = fixable(result.introduced)
+    already: dict = {}
+    for outcome in result.applied:
+        key = (outcome.issue.slide, outcome.issue.shape_id)
+        already.setdefault(key, set()).add(outcome.issue.rule_id or "")
+    todo = [
+        issue for issue in fixable(result.introduced)
+        if not _reverses_a_fix(issue, already)
+    ]
     if not todo:
         result.settled = list(result.recheck)
         return
@@ -440,12 +460,33 @@ def _recheck(result: ApplyResult, spec: Optional[Any]) -> None:
     if spec is None:
         return
     from ..extract import read_deck            # noqa: PLC0415 - lazy, heavy
+    from ..linemetrics import PowerPointComMetrics  # noqa: PLC0415
     from ..rules import RuleContext, build_default_rules, run_rules
 
     try:
         deck = read_deck(result.output)
+        # A renderer here, but only when the run has done something a
+        # renderer is needed to judge.
+        #
+        # Measuring means opening the written deck in PowerPoint, which costs
+        # seconds on a real deck, and the recheck runs on every apply. So it
+        # is paid for where it changes the answer: `heading_balance` squares a
+        # row up with a soft return, `manual_line_break` exempts a balanced
+        # row from its warning, and it can only tell a balanced row by
+        # counting lines. Blind, the recheck called those breaks forced wraps
+        # and the second round took them straight back out -- the headings
+        # came out exactly as they went in.
+        #
+        # The gap this leaves is worth knowing: on other runs the measured
+        # rules stay silent in the recheck, so `introduced` cannot include an
+        # overflow or a collision the fixes caused. That was true before any
+        # of this and is a separate thing to fix.
+        metrics = (
+            PowerPointComMetrics(result.output)
+            if _needs_measuring(result) else None
+        )
         result.recheck = run_rules(
-            RuleContext(deck=deck, spec=spec), build_default_rules()
+            RuleContext(deck=deck, spec=spec), build_default_rules(metrics)
         )
         # Findings arrive from the rules without one, and the second round
         # reports them by id the way every other outcome does.
@@ -687,7 +728,7 @@ def _apply_one_uninstrumented(
 
 
 # Fixes that read the shapes around the one they were given without moving it.
-_NEEDS_NEIGHBOURS = frozenset({"space.series_crowded"})
+_NEEDS_NEIGHBOURS = frozenset({"space.series_crowded", "space.text_overflow"})
 
 
 _PALETTE_RULES = ("color.text.off_palette", "color.shape.off_palette")

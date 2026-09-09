@@ -106,6 +106,7 @@ class Rule(ABC):
         expected: Optional[str] = None,
         found: Optional[str] = None,
         suggestion: Optional[str] = None,
+        widest_line_chars: Optional[int] = None,
     ) -> Issue:
         return Issue(
             category=self.category,
@@ -119,4 +120,5 @@ class Rule(ABC):
             expected=expected,
             found=found,
             suggestion=suggestion,
+            widest_line_chars=widest_line_chars,
         )

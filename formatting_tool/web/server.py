@@ -307,7 +307,8 @@ class _Handler(BaseHTTPRequestHandler):
             # Listed apart from the rest: a removal is the one change with
             # nothing left on the slide to check it against.
             "removed": [
-                {"id": o.issue.id, "slide": o.issue.slide, "detail": o.detail}
+                {"id": o.issue.id, "slide": o.issue.slide, "detail": o.detail,
+                 "box_before": o.box_before, "box_after": o.box_after}
                 for o in result.removed
             ],
             # The second pass. The report the page ticked describes the deck
@@ -319,7 +320,8 @@ class _Handler(BaseHTTPRequestHandler):
                 # what the deck measures now that it has.
                 "second_round": [
                     {"id": o.issue.id, "detail": o.detail,
-                     "applied": o.applied, "slide": o.issue.slide}
+                     "applied": o.applied, "slide": o.issue.slide,
+                     "box_before": o.box_before, "box_after": o.box_after}
                     for o in result.second_round
                 ],
                 "settled": len(result.settled),
@@ -336,7 +338,11 @@ class _Handler(BaseHTTPRequestHandler):
                 ],
             },
             "applied": [
-                {"id": o.issue.id, "detail": o.detail, "slide": o.issue.slide}
+                {"id": o.issue.id, "detail": o.detail, "slide": o.issue.slide,
+                 "shape": o.issue.shape, "rule_id": o.issue.rule_id,
+                 # Where to draw the change on the rendered slides. See
+                 # FixOutcome.
+                 "box_before": o.box_before, "box_after": o.box_after}
                 for o in result.applied
             ],
             "skipped": [

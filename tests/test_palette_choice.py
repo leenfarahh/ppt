@@ -156,3 +156,57 @@ def test_hue_family_is_bounded() -> None:
     """A red and an orange are about 40 degrees apart on the wheel and are not
     the same decision."""
     assert HUE_TOLERANCE < 40.0
+
+
+# --------------------------------------------------------------------------- #
+# What the rule does with a colour that has no intended entry
+# --------------------------------------------------------------------------- #
+#
+# `intended_palette_entry` declining is not the end of it. The rule falls back
+# to the nearest entry so the finding is applicable, and marks it so the
+# fallback is visible in the report and in the applied line. The tests above
+# pin the primitive's judgement; these pin what is done with it.
+
+def _target_for(value: str, palette=None):
+    from formatting_tool.models import RuleTuning, Tolerances
+    from formatting_tool.rules.colors import _target
+
+    return _target(
+        value, palette if palette is not None else PALETTE,
+        Tolerances().color_delta_e, RuleTuning(),
+    )
+
+
+def test_the_default_limit_is_the_gate_these_tests_use() -> None:
+    """The tests pass a limit of 12 directly; the rule multiplies a tolerance
+    by a factor to get there. If those drift apart, every judgement above is
+    being asserted against a gate production does not use."""
+    from formatting_tool.models import RuleTuning, Tolerances
+
+    assert Tolerances().color_delta_e * RuleTuning().suggestion_factor == GATE
+
+
+def test_a_red_falls_back_to_the_nearest_entry_and_says_so() -> None:
+    """The palette holds no red, so there is no intended entry and the rule
+    snaps it to the nearest anyway. What keeps that honest is the mark: a
+    designer reading the finding is told it reads as a different colour."""
+    expected, suggestion = _target_for("A32020")
+
+    assert expected.startswith("nearest ")
+    assert "#E97132" in expected               # accent2, the nearest
+    assert "reads as a different colour" in suggestion
+
+
+def test_an_intended_entry_is_not_marked_as_a_fallback() -> None:
+    """The mark has to mean something, so it is absent when the rule is sure."""
+    expected, _ = _target_for("1A6688")
+
+    assert not expected.startswith("nearest ")
+    assert "#156082" in expected
+
+
+def test_a_palette_with_nothing_in_it_still_names_no_colour() -> None:
+    """The one case with no target at all: nothing to be nearest to."""
+    expected, _ = _target_for("A32020", {})
+
+    assert expected == "brand palette"

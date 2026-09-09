@@ -113,6 +113,14 @@ class FixContext:
     # proposed position is checked against: the model is given these in its
     # payload, so a target outside them is not a reading it could defend.
     margins: Optional[dict[str, float]] = None
+    # One decision per off-palette colour, made across the whole deck at once
+    # so that colours which are distinct in the deck stay distinct in the
+    # output. Without it each colour snaps to its own nearest entry and a
+    # three-step legend can come out one colour. See apply.colorplan.
+    #
+    # None when there is no palette to plan against, and then the colour
+    # fixers read their target off the finding as they did before.
+    color_plan: Optional[Any] = None
     # The other shapes on the finding's slide, filled in per finding. Scratch
     # rather than configuration: the two fixes that spread a row need to find
     # the row, and going back to the file for it would re-read a deck the
@@ -125,6 +133,16 @@ class FixOutcome:
     issue: Issue
     applied: bool
     detail: str
+    # Where the shape sat before the fix and where it sits after, each as
+    # (left, top, width, height) in fractions of the slide. Fractions rather
+    # than EMU because the only consumer is an overlay drawn on a rendered
+    # slide of whatever pixel size PowerPoint produced, and a fraction is
+    # already the percentage that overlay needs.
+    #
+    # Only filled in on an applied outcome, and either may be None: a
+    # deck-level finding names no shape, and a removal leaves none behind.
+    box_before: Optional[tuple[float, float, float, float]] = None
+    box_after: Optional[tuple[float, float, float, float]] = None
 
     @property
     def slide(self) -> Optional[int]:
@@ -230,6 +248,9 @@ def apply_fixes(
         max_drift_in=(tuning or RuleTuning()).repeat_max_drift_in,
         brand=FixBrand.from_spec(spec) if spec is not None else None,
         margins=_margins_of(spec),
+        # Built from `wanted` and `issues` both: what to recolour, and what
+        # stays as it is and therefore constrains the recolouring.
+        color_plan=_color_plan_for(wanted, issues, spec, tuning, tolerances),
     )
     result = ApplyResult(deck=deck.name, output=out)
 
@@ -376,7 +397,68 @@ def _recheck(result: ApplyResult, spec: Optional[Any]) -> None:
 # One finding
 # --------------------------------------------------------------------------- #
 
+def _box_fraction(
+    shape: Any, context: FixContext
+) -> Optional[tuple[float, float, float, float]]:
+    """A shape's box as fractions of the slide, or None if it has no box.
+
+    An inherited placeholder can carry None for any of the four, and a table
+    or a connector can carry a negative width; neither is a rectangle worth
+    drawing, so both come back as nothing rather than as a box the overlay
+    would put in the wrong place.
+    """
+    if shape is None or not context.width_emu or not context.height_emu:
+        return None
+    try:
+        left, top = shape.left, shape.top
+        width, height = shape.width, shape.height
+    except Exception:                      # a shape that will not be measured
+        return None
+    if None in (left, top, width, height) or width <= 0 or height <= 0:
+        return None
+    return (
+        left / context.width_emu,
+        top / context.height_emu,
+        width / context.width_emu,
+        height / context.height_emu,
+    )
+
+
 def _apply_one(
+    issue: Issue,
+    presentation: Any,
+    context: FixContext,
+    in_breach: Optional[set] = None,
+    moved: Optional[set] = None,
+) -> FixOutcome:
+    """Apply one finding, and record where its shape was and where it ended up.
+
+    The boxes are what lets the UI point at a fix rather than describe it:
+    "moved 0.65in back onto the canvas" is a sentence, and a rectangle drawn
+    on the before and after renders is the same claim a designer can check at
+    a glance.
+
+    Measured either side of the fix rather than inside it, and by looking the
+    shape up a second time, so no fixer has to be taught to report anything.
+    The second lookup costs one walk of one slide and cannot disagree with
+    what was fixed: it matches on the OOXML id, which a fix does not change.
+    """
+    found = _find_shape(presentation, issue) if issue.slide and issue.shape else None
+    before = _box_fraction(found, context)
+
+    outcome = _apply_one_uninstrumented(issue, presentation, context, in_breach, moved)
+
+    if outcome.applied:
+        outcome.box_before = before
+        # Looked up again rather than reusing the reference: a fix that
+        # replaces a shape rather than editing it leaves the old object
+        # detached, and a removal leaves nothing at all, which is a None the
+        # overlay reads as "there is a gap here now".
+        outcome.box_after = _box_fraction(_find_shape(presentation, issue), context)
+    return outcome
+
+
+def _apply_one_uninstrumented(
     issue: Issue,
     presentation: Any,
     context: FixContext,
@@ -538,6 +620,50 @@ def _apply_one(
 
 # Fixes that read the shapes around the one they were given without moving it.
 _NEEDS_NEIGHBOURS = frozenset({"space.series_crowded"})
+
+
+_PALETTE_RULES = ("color.text.off_palette", "color.shape.off_palette")
+
+
+def _color_plan_for(
+    wanted: Sequence[Issue],
+    issues: Sequence[Issue],
+    spec: Optional[Any],
+    tuning: Optional[RuleTuning],
+    tolerances: Optional[Tolerances],
+) -> Optional[Any]:
+    """Plan every off-palette colour together, or None with no palette to plan.
+
+    Two sets go in, and the second is the one that is easy to leave out. The
+    colours being fixed are obvious. The colours NOT being fixed matter just
+    as much: a green pill nobody ticked keeps its green, and that green is
+    then a colour no other pill may be recoloured to. Passing only the
+    selection would let a fix collide with a shape sitting right beside it.
+    """
+    palette = getattr(spec, "palette", None)
+    if not palette:
+        return None
+
+    from .colorplan import build_color_plan  # noqa: PLC0415 - avoids a cycle
+    from .fixers import _hex_of  # noqa: PLC0415
+
+    def colours(source: Sequence[Issue]) -> list[str]:
+        return [
+            hexed
+            for issue in source
+            if (issue.rule_id or "") in _PALETTE_RULES
+            for hexed in [_hex_of(issue.found)]
+            if hexed
+        ]
+
+    tol = (tolerances or Tolerances()).color_delta_e
+    return build_color_plan(
+        selected=colours(wanted),
+        everything=colours(issues),
+        palette=dict(palette),
+        tolerance=tol,
+        limit=tol * (tuning or RuleTuning()).suggestion_factor,
+    )
 
 
 def _margins_of(spec: Optional[Any]) -> Optional[dict[str, float]]:

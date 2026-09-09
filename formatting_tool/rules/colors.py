@@ -60,17 +60,25 @@ def _theme_note(slot: Optional[str], spec) -> Optional[str]:
 
 
 def _target(value: str, palette: dict, tolerance: float, tuning) -> tuple:
-    """What a colour should become, and what to say when nothing qualifies.
+    """What a colour should become, and how sure the rule is about it.
 
-    Two questions that were one, which is how a red came to be recoloured to
-    an orange 33 delta-E away. "Which entry is nearest" decides whether a
+    Two questions, kept apart. "Which entry is nearest" decides whether a
     colour is off-palette at all and always has an answer. "Which entry was it
     meant to be" is allowed to have none -- a palette holding no red has no
-    answer for a red -- and only that one may become a target.
+    answer for a red -- and it is the one that produces a confident target.
 
-    The limit is the distance past which the rule already declined to
-    recommend anything. Naming a target it would not recommend, and then
-    applying it, was the whole defect.
+    Both end in a target now, and the difference is carried in the wording
+    rather than in whether there is one. An intended entry is named plainly. A
+    colour with no intended entry falls back to the nearest, prefixed
+    `nearest`, and both the suggestion and the applied line say it reads as a
+    different colour.
+
+    That fallback is the reason this docstring is long. It is what recoloured
+    a red to an orange 33 delta-E away and a page of blue headings to a
+    neutral, and it is deliberately back: a deck left with its off-palette
+    colours in place is the more common complaint, and a marked fallback a
+    designer can see and reject beats a finding that does nothing. The prefix
+    is what makes it rejectable, so it is load-bearing, not decoration.
     """
     limit = tolerance * tuning.suggestion_factor
     label, distance = intended_palette_entry(value, palette, limit)
@@ -83,10 +91,14 @@ def _target(value: str, palette: dict, tolerance: float, tuning) -> tuple:
     near, far = nearest_palette_entry(value, palette)
     if near:
         return (
-            "brand palette",
+            # `nearest` marks it as the fallback; the hex is still in there,
+            # so the fixer reads a target out of it the same way as any other.
+            f"nearest {near} #{palette.get(near, '')}",
             f"No palette entry is this colour: the closest, {near} "
             f"#{palette.get(near, '')}, is {far:.1f} away and reads as a "
-            "different colour. A designer picks the right one.",
+            "different colour. Applying this snaps it there anyway, so check "
+            "the result -- picking the entry this was meant to be is a "
+            "design call.",
         )
     return "brand palette", "Recolour to a palette entry."
 

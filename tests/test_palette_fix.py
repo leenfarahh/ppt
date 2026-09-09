@@ -215,3 +215,129 @@ def test_an_outline_finding_recolours_the_outline_not_the_fill(
     fixed = Presentation(str(out)).slides[0].shapes[0]
     assert str(fixed.line.color.rgb) == NAVY
     assert str(fixed.fill.fore_color.rgb) == GREY     # the fill did not move
+
+
+# --------------------------------------------------------------------------- #
+# The fallback target
+# --------------------------------------------------------------------------- #
+#
+# A colour the rule found no intended entry for is snapped to the nearest one
+# anyway, because a finding that corrects nothing is the more common
+# complaint. The fixer has to apply it and has to say what it did, since this
+# is the one recolour that changes a colour's hue.
+
+ORANGE = "E97132"
+RED = "A32020"
+FALLBACK = f"nearest theme:accent2 #{ORANGE}"
+
+
+def test_a_marked_fallback_is_recognised() -> None:
+    from formatting_tool.apply.fixers import _is_fallback
+
+    assert _is_fallback(_issue("color.text.off_palette", expected=FALLBACK))
+    assert not _is_fallback(
+        _issue("color.text.off_palette", expected=f"theme:dk1 #{NAVY}")
+    )
+
+
+def test_the_hex_is_still_read_out_of_a_marked_target() -> None:
+    """The mark is a prefix, not a replacement: the fixer reads the target the
+    same way it reads any other."""
+    assert _hex_of(FALLBACK) == ORANGE
+
+
+def test_a_red_is_recoloured_to_the_nearest_entry(tmp_path: Path) -> None:
+    """The case this exists for: a red title on a palette holding no red."""
+    pytest.importorskip("pptx")
+    from pptx import Presentation
+    from pptx.dml.color import RGBColor
+    from pptx.util import Inches
+
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    box = slide.shapes.add_textbox(Inches(1), Inches(1), Inches(6), Inches(1))
+    box.name = "Title"
+    box.text_frame.text = "a red heading"
+    box.text_frame.paragraphs[0].runs[0].font.color.rgb = RGBColor.from_string(RED)
+    deck = tmp_path / "messy.pptx"
+    prs.save(str(deck))
+
+    issue = _issue(
+        "color.text.off_palette", slide=1, shape="Title", shape_id=box.shape_id,
+        found=f"#{RED}", expected=FALLBACK,
+    )
+    out = tmp_path / "fixed.pptx"
+
+    result = apply_fixes(deck, [issue], out)
+
+    assert len(result.applied) == 1
+    detail = result.applied[0].detail
+    # The warning is the whole reason this is allowed to apply.
+    assert "nearest" in detail
+    assert "reads as a different colour" in detail
+    run = (Presentation(str(out)).slides[0].shapes[0]
+           .text_frame.paragraphs[0].runs[0])
+    assert str(run.font.color.rgb) == ORANGE
+
+
+def test_a_confident_target_is_not_hedged(tmp_path: Path) -> None:
+    """The warning has to distinguish, so it must be absent when the rule
+    named the entry the colour was meant to be."""
+    pytest.importorskip("pptx")
+    from pptx import Presentation
+    from pptx.dml.color import RGBColor
+    from pptx.util import Inches
+
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    box = slide.shapes.add_textbox(Inches(1), Inches(1), Inches(6), Inches(1))
+    box.name = "Body"
+    box.text_frame.text = "off by a little"
+    box.text_frame.paragraphs[0].runs[0].font.color.rgb = RGBColor.from_string(BLACK)
+    deck = tmp_path / "messy.pptx"
+    prs.save(str(deck))
+
+    issue = _issue(
+        "color.text.off_palette", slide=1, shape="Body", shape_id=box.shape_id,
+        found=f"#{BLACK}", expected=f"theme:dk1 #{NAVY}",
+    )
+    out = tmp_path / "fixed.pptx"
+
+    result = apply_fixes(deck, [issue], out)
+
+    assert len(result.applied) == 1
+    assert "reads as a different colour" not in result.applied[0].detail
+
+
+def test_a_finding_with_no_colour_at_all_is_still_left_alone(
+    tmp_path: Path,
+) -> None:
+    """The empty-palette case. Nothing to be nearest to, so nothing to apply,
+    and the fixer must not invent one."""
+    pytest.importorskip("pptx")
+    from pptx import Presentation
+    from pptx.dml.color import RGBColor
+    from pptx.util import Inches
+
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    box = slide.shapes.add_textbox(Inches(1), Inches(1), Inches(6), Inches(1))
+    box.name = "Title"
+    box.text_frame.text = "a red heading"
+    box.text_frame.paragraphs[0].runs[0].font.color.rgb = RGBColor.from_string(RED)
+    deck = tmp_path / "messy.pptx"
+    prs.save(str(deck))
+
+    issue = _issue(
+        "color.text.off_palette", slide=1, shape="Title", shape_id=box.shape_id,
+        found=f"#{RED}", expected="brand palette",
+    )
+    out = tmp_path / "fixed.pptx"
+
+    result = apply_fixes(deck, [issue], out)
+
+    assert result.applied == []
+    assert "design call" in result.skipped[0].detail
+    unchanged = (Presentation(str(out)).slides[0].shapes[0]
+                 .text_frame.paragraphs[0].runs[0])
+    assert str(unchanged.font.color.rgb) == RED

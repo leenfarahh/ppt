@@ -263,3 +263,76 @@ def _hue_gap(a: Optional[float], b: Optional[float]) -> float:
         return 360.0
     gap = abs(a - b) % 360.0
     return 360.0 - gap if gap > 180.0 else gap
+
+
+# --------------------------------------------------------------------------- #
+# Contrast
+# --------------------------------------------------------------------------- #
+#
+# Delta-E answers "do these read as the same colour", which is the question
+# the palette rules ask. It does not answer "can text in one be read on top of
+# the other": a mid grey and a mid blue-grey sit far apart in Lab and are both
+# unreadable under white text. That is a luminance question and WCAG's formula
+# is the one every design system already uses, so it is the one used here.
+
+def relative_luminance(hex_value: str) -> Optional[float]:
+    """WCAG relative luminance, 0 for black and 1 for white."""
+    rgb = hex_to_rgb(hex_value)
+    if rgb is None:
+        return None
+    channels = []
+    for raw in rgb:
+        c = raw / 255.0
+        channels.append(c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4)
+    r, g, b = channels
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def contrast_ratio(hex_a: str, hex_b: str) -> Optional[float]:
+    """WCAG contrast ratio between two colours, 1.0 to 21.0.
+
+    Order does not matter. 4.5 is the AA floor for body text, 3.0 for large
+    text and for the boundary of a graphical object.
+    """
+    lum_a, lum_b = relative_luminance(hex_a), relative_luminance(hex_b)
+    if lum_a is None or lum_b is None:
+        return None
+    lighter, darker = max(lum_a, lum_b), min(lum_a, lum_b)
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+def plausible_palette_entries(
+    value: str,
+    palette: dict[str, str],
+    limit: float,
+) -> list[tuple[str, float]]:
+    """Every entry this colour could defensibly become, nearest first.
+
+    The same three disqualifications `intended_palette_entry` applies, which
+    is deliberate: that function is the first element of this list, and the
+    rest are what a colour falls back to when its first choice has been taken
+    by another colour it must stay distinguishable from. Ranking them here
+    rather than at the call site keeps one definition of "defensible".
+    """
+    source_chroma = chroma_of(value)
+    if source_chroma is None:
+        return []
+    source_neutral = source_chroma < NEUTRAL_CHROMA
+    source_hue = hue_of(value)
+
+    out: list[tuple[str, float]] = []
+    for label, palette_hex in palette.items():
+        distance = delta_e(value, palette_hex)
+        if distance is None or distance > limit:
+            continue
+        entry_chroma = chroma_of(palette_hex)
+        if entry_chroma is None:
+            continue
+        if (entry_chroma < NEUTRAL_CHROMA) != source_neutral:
+            continue
+        if not source_neutral:
+            entry_hue = hue_of(palette_hex)
+            if entry_hue is None or _hue_gap(source_hue, entry_hue) > HUE_TOLERANCE:
+                continue
+        out.append((label, distance))
+    return sorted(out, key=lambda pair: (pair[1], pair[0]))

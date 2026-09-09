@@ -20,6 +20,10 @@
   --error: #B4531A;
   --warning: #8A6A12;
   --info: #5A6472;
+  /* The change highlight. Deliberately not a brand or a severity colour: it
+     is drawn on top of a client's slide and has to read as the tool's mark
+     rather than as part of the design. */
+  --hl: #00A3B4;
   --mono: ui-monospace, "Cascadia Mono", "SF Mono", Menlo, Consolas, monospace;
 }
 @media (prefers-color-scheme: dark) {
@@ -38,6 +42,7 @@
     --error: #F0975A;
     --warning: #DCB53F;
     --info: #93A0B1;
+    --hl: #22C7D8;
   }
 }
 
@@ -152,6 +157,8 @@ details.advanced[open] summary::before { content: "\2212  "; }
   border-radius: 50%; animation: spin .7s linear infinite; vertical-align: -1px;
 }
 @keyframes spin { to { transform: rotate(360deg); } }
+/* Tabular figures so the line does not jog sideways at 10s and 100s. */
+.status .elapsed { font-variant-numeric: tabular-nums; }
 
 /* ---------- summary ---------- */
 .summary {
@@ -241,6 +248,18 @@ details.advanced[open] summary::before { content: "\2212  "; }
 .applied-head .grow { flex: 1; }
 .applied-list { margin: 10px 0 0; padding-left: 18px; font-size: 12px; line-height: 1.7; }
 .applied-list .dim { color: var(--faint); }
+/* Numbered rows carry their own marker, so the list's own one would double it. */
+.applied-list .numbered { list-style: none; margin-left: -18px; }
+.applied-list .num {
+  display: inline-block; min-width: 15px; text-align: center;
+  background: var(--hl); color: #fff;
+  font: 600 9px/1.6 var(--mono); border-radius: 3px;
+  padding: 0 3px; margin-right: 7px; vertical-align: 1px;
+}
+.applied-list code { color: var(--faint); margin-left: 6px; }
+/* Long enough to find the row after the page has scrolled to it. */
+@keyframes found { from { background: var(--tint); } to { background: transparent; } }
+.applied-list li.found { animation: found 1.6s ease-out; }
 .applied a.dl { font-size: 12px; }
 
 .preview { margin: 18px 0; }
@@ -248,6 +267,61 @@ details.advanced[open] summary::before { content: "\2212  "; }
 .shot span { display: block; font-size: 11px; font-family: var(--mono); color: var(--faint); margin-bottom: 5px; }
 .shot img { width: 100%; border: 1px solid var(--line); border-radius: 4px; display: block; }
 @media (max-width: 860px) { .shots { grid-template-columns: 1fr; } }
+
+/* One slide: its two renders and what changed on it, as a single block, so a
+   long run does not interleave one slide's list with the next slide's shots. */
+.slide-block { margin-top: 20px; padding-bottom: 18px; border-bottom: 1px solid var(--line); }
+.slide-block:last-child { border-bottom: 0; padding-bottom: 0; }
+.slide-changes { margin: 10px 0 0; padding: 0; list-style: none; font-size: 12px; }
+.slide-changes li {
+  display: flex; gap: 7px; align-items: baseline;
+  padding: 3px 0; line-height: 1.6;
+}
+.slide-changes li b { font-weight: 600; white-space: nowrap; }
+.slide-changes .num { flex: none; }
+.slide-changes li.found { background: var(--tint); border-radius: 3px; }
+.slide-changes.empty { color: var(--faint); font-size: 12px; margin: 10px 0 0; }
+/* Shares the badge with the full list, and the flash that answers a click. */
+.slide-changes .num {
+  display: inline-block; min-width: 15px; text-align: center;
+  background: var(--hl); color: #fff;
+  font: 600 9px/1.6 var(--mono); border-radius: 3px;
+  padding: 0 3px; vertical-align: 1px;
+}
+.slide-changes li.found { animation: found 1.6s ease-out; }
+
+/* ---------- change highlights ---------- */
+/* The box is positioned against the image, so the wrapper has to be exactly
+   the image's size: inline-block and a block img, no line-box slack. */
+.frame { position: relative; display: block; }
+.hl {
+  position: absolute;
+  border: 2px solid var(--hl);
+  border-radius: 2px;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.55);
+  pointer-events: none;
+}
+/* Above the border, so it never covers the shape it is pointing at. Small:
+   it is an index into the list below, not a caption. */
+.hl b {
+  position: absolute; left: -2px; bottom: 100%;
+  background: var(--hl); color: #fff;
+  font: 600 7.5px/1.35 var(--mono);
+  min-width: 11px; text-align: center;
+  padding: 0 2px; border-radius: 2px 2px 0 0;
+  white-space: nowrap;
+  pointer-events: auto; cursor: pointer;
+}
+.hl b:hover { filter: brightness(1.15); }
+/* Except on a shape at the very top of the slide, where there is no room
+   above and the label would sit over the caption instead. */
+.hl.high b { bottom: auto; top: 0; border-radius: 0 0 2px 0; }
+.hl.gone { border-style: dashed; }
+.shot.stale .hl { display: none; }
+.hl-legend { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+.hl-legend .swatch {
+  width: 22px; height: 0; border-top: 2px solid var(--hl); display: inline-block;
+}
 .finding .sev {
   display: flex; align-items: center; gap: 6px;
   /* Grid items stretch by default, which would centre the label against the
@@ -289,6 +363,11 @@ details.advanced[open] summary::before { content: "\2212  "; }
 }
 .runlog summary { cursor: pointer; color: var(--faint); list-style: none; width: fit-content; }
 .runlog summary::-webkit-details-marker { display: none; }
+/* Folded by default, so it needs to look like something that opens. */
+.changes { margin-top: 10px; }
+.changes summary::before { content: "+ "; }
+.changes[open] summary::before { content: "2  "; }
+.changes summary:hover { color: var(--muted); }
 .aidebug .batch { margin-top: 12px; }
 .aidebug .batch-head {
   font-size: 11px; font-family: var(--mono); color: var(--faint); margin-bottom: 5px;
@@ -388,6 +467,12 @@ const state = {
   applied: null,       // the last apply result
   preview: null,       // before/after renders
   busy: false,
+  // The list of what was applied is long on a real deck and is the evidence
+  // for a decision already taken, so it starts folded away; the renders are
+  // what a designer actually reads. Held here rather than left to <details>
+  // because every tick re-renders the section and would fold it back.
+  changesOpen: false,
+  highlight: true,     // draw the boxes over the before/after renders
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -424,7 +509,6 @@ async function boot() {
   if (!ctx.api_key) notes.push("No <code>GEMINI_API_KEY</code> in the environment, so the AI layer will fail.");
   $("#ai-note").innerHTML = notes.join(" ");
 
-  setStatus(`Guidelines from ${esc(ctx.guidelines_dir)}`);
 }
 
 /* ---------------- file inputs ---------------- */
@@ -507,6 +591,32 @@ function setStatus(html, cls = "") {
   el.innerHTML = html;
 }
 
+/* A status line that counts up without restarting its own spinner.
+ *
+ * setStatus assigns innerHTML, which throws the spinner element away and
+ * builds a new one, and a new element starts its animation at zero. Called
+ * from a 200ms tick against a 0.7s rotation, the spinner got 103 degrees
+ * round -- just past a quarter turn -- and snapped back to the top, forever.
+ * It was never the animation: it was a new spinner, four times a second.
+ *
+ * So the line is written once and only the seconds are rewritten, through
+ * textContent on a node the spinner is not inside. Returns the function that
+ * stops it.
+ */
+function startTicking(label) {
+  const started = Date.now();
+  setStatus(`<span class="spinner"></span>${label}&hellip; ` +
+            `<span class="elapsed">0s</span>`);
+  const tick = setInterval(() => {
+    const elapsed = $("#status .elapsed");
+    // Gone means something else has claimed the status line -- an error, or
+    // the run finishing -- and there is nothing left to count into.
+    if (!elapsed) return;
+    elapsed.textContent = `${((Date.now() - started) / 1000).toFixed(0)}s`;
+  }, 200);
+  return () => clearInterval(tick);
+}
+
 async function runCheck() {
   if (!state.master || !state.decks.length) return;
 
@@ -528,12 +638,10 @@ async function runCheck() {
   state.applied = null;
   state.preview = null;
 
-  const started = Date.now();
-  const tick = setInterval(() => {
-    const secs = ((Date.now() - started) / 1000).toFixed(0);
-    setStatus(`<span class="spinner"></span>Reading ${state.decks.length} deck(s)` +
-              `${state.useAI ? " and asking the model" : ""}… ${secs}s`);
-  }, 200);
+  const stopTicking = startTicking(
+    `Reading ${state.decks.length} deck(s)` +
+    `${state.useAI ? " and asking the model" : ""}`
+  );
 
   try {
     const response = await fetch("/api/validate", { method: "POST", body: form });
@@ -547,7 +655,7 @@ async function runCheck() {
   } catch (err) {
     setStatus(`<b>Run failed.</b> ${esc(err.message)}`, "err");
   } finally {
-    clearInterval(tick);
+    stopTicking();
     $("#run").disabled = false;
   }
 }
@@ -732,10 +840,19 @@ function applyBarHTML(issues) {
 function appliedHTML() {
   const r = state.applied;
   if (!r) return "";
-  const rows = r.applied.map((a) => `<li><code>${esc(a.id)}</code>
-    ${a.slide ? `slide ${a.slide}` : "deck"} &mdash; ${esc(a.detail)}</li>`).join("");
+  // The same numbering the boxes on the renders carry, so a box and its line
+  // are one thing addressed two ways. Numbered rows get an id to jump to.
+  const rows = changeRows().map((a) => `<li id="chg-${a.n}" class="numbered">
+    <span class="num">${a.n}</span>
+    ${a.slide ? `slide ${a.slide}` : "deck"}${a.shape ? ` &middot; ${esc(a.shape)}` : ""}
+    &mdash; ${esc(a.detail)}${a.round === 2
+      ? ` <span class="meta">(second pass)</span>` : ""}
+    <code>${esc(a.id)}</code></li>`).join("");
+  // Not numbered: nothing was changed, so there is nothing on a render to
+  // point at.
   const skipped = r.skipped.map((a) => `<li class="dim"><code>${esc(a.id)}</code>
     ${esc(a.detail)}</li>`).join("");
+  const n = changeRows().length + r.skipped.length;
   return `<section class="applied">
     <div class="applied-head">
       <b>${r.applied.length} fix${r.applied.length === 1 ? "" : "es"} applied</b>
@@ -745,7 +862,10 @@ function appliedHTML() {
       <button class="linkish" id="do-preview">Render before / after</button>
       <a class="dl" href="${esc(r.download)}" download>Download the corrected deck</a>
     </div>
-    <ul class="applied-list">${rows}${skipped}</ul>
+    <details class="runlog changes" ${state.changesOpen ? "open" : ""}>
+      <summary>${n} change${n === 1 ? "" : "s"} in detail</summary>
+      <ul class="applied-list">${rows}${skipped}</ul>
+    </details>
   </section>`;
 }
 
@@ -757,17 +877,116 @@ function previewHTML() {
       <p>Rendering needs PowerPoint and pywin32 on Windows
       (<code>pip install pywin32</code>).</p></div></div>`;
   }
+  const marks = changeMarks();
+  const rebuilt = !!(state.applied && state.applied.rebuilt);
+  const total = [...marks.values()].reduce((n, m) => n + m.length, 0);
   return `<section class="preview">
     <div class="applied-head"><b>Before and after</b>
-      <span class="meta">&middot; rendered by PowerPoint</span></div>
-    ${p.slides.map((s) => `
-      <div class="shots">
-        <div class="shot"><span>Slide ${s.slide} &mdash; before</span>
-          ${s.before ? `<img src="${esc(s.before)}" loading="lazy" alt="slide ${s.slide} before">` : "<i>not rendered</i>"}</div>
-        <div class="shot"><span>Slide ${s.slide} &mdash; after</span>
-          ${s.after ? `<img src="${esc(s.after)}" loading="lazy" alt="slide ${s.slide} after">` : "<i>not rendered</i>"}</div>
-      </div>`).join("")}
+      <span class="meta">&middot; rendered by PowerPoint</span>
+      <span class="grow"></span>
+      ${total ? `<label class="hl-legend"><input type="checkbox" id="hl-toggle"
+        ${state.highlight ? "checked" : ""}> <span class="swatch"></span>
+        Highlight the ${total} change${total === 1 ? "" : "s"}</label>` : ""}
+    </div>
+    ${rebuilt && total ? `<p class="note">The deck was also rebuilt onto the
+      master, which re-places every shape on the slide. The boxes mark what
+      this run corrected; on the after render they show where each shape stood
+      before the rebuild moved it.</p>` : ""}
+    ${p.slides.map((s) => {
+      const mine = marks.get(s.slide) || [];
+      return `
+      <div class="slide-block">
+        <div class="shots">
+          <div class="shot"><span>Slide ${s.slide} &mdash; before</span>
+            ${shotHTML(s.before, s.slide, "before", mine, false)}</div>
+          <div class="shot ${rebuilt ? "stale" : ""}"><span>Slide ${s.slide} &mdash; after</span>
+            ${shotHTML(s.after, s.slide, "after", mine, true)}</div>
+        </div>
+        ${slideChangesHTML(mine)}
+      </div>`;
+    }).join("")}
   </section>`;
+}
+
+/* Everything that changed something, in one order, numbered from 1.
+ *
+ * One list feeding both the boxes and the detail lines is what lets a number
+ * on a slide mean something: 7 on the render is line 7 below. Numbering them
+ * separately, which is what per-slide indices did, gave two shapes on two
+ * slides the same 1 and pointed neither at anything.
+ *
+ * Both rounds count. The second round corrected what the first round caused,
+ * on the same file the after image renders, so a designer looking for what
+ * moved has no reason to care which round moved it. */
+function changeRows() {
+  const r = state.applied;
+  if (!r) return [];
+  const rows = [
+    ...(r.applied || []).map((o) => ({ ...o, round: 1 })),
+    ...((r.recheck && r.recheck.second_round) || [])
+      .filter((o) => o.applied).map((o) => ({ ...o, round: 2 })),
+  ];
+  return rows.map((row, i) => ({ ...row, n: i + 1 }));
+}
+
+/* Those of them that can be drawn, grouped by the slide they are on. */
+function changeMarks() {
+  const marks = new Map();
+  for (const row of changeRows()) {
+    if (!row.slide || (!row.box_before && !row.box_after)) continue;
+    if (!marks.has(row.slide)) marks.set(row.slide, []);
+    marks.get(row.slide).push(row);
+  }
+  return marks;
+}
+
+/* What changed on this slide, under the two pictures of it.
+ *
+ * The same numbers the boxes carry. A number on a render is only useful if
+ * what it stands for is within reading distance, and it was not: it was in
+ * one folded list below every slide in the run, so checking box 7 meant
+ * opening the list, finding line 7 and scrolling back. Here it is beside the
+ * thing it describes, which is where a designer is already looking.
+ *
+ * The full list stays where it is. It holds the deck-level changes, which
+ * belong to no slide, and everything that was skipped, which has no box. */
+function slideChangesHTML(marks) {
+  if (!marks.length) {
+    return `<p class="slide-changes empty">Nothing on this slide changed.
+      It is shown for context.</p>`;
+  }
+  return `<ul class="slide-changes">
+    ${marks.map((m) => `<li id="chg-slide-${m.n}">
+      <span class="num">${m.n}</span>
+      ${m.shape ? `<b>${esc(m.shape)}</b> &mdash; ` : ""}${esc(m.detail)}
+      ${m.round === 2 ? `<span class="meta">(second pass)</span>` : ""}
+    </li>`).join("")}
+  </ul>`;
+}
+
+function shotHTML(src, slide, which, marks, isAfter) {
+  if (!src) return "<i>not rendered</i>";
+  const img = `<img src="${esc(src)}" loading="lazy" alt="slide ${slide} ${which}">`;
+  if (!state.highlight || !marks.length) return img;
+  const boxes = marks.map((m) => {
+    // On the after image a shape that was removed has no box, so the one it
+    // used to occupy is drawn instead, dashed: the change is the gap, and a
+    // gap is the one edit with nothing left to point at.
+    const box = (isAfter ? m.box_after : m.box_before) || m.box_before;
+    const gone = isAfter && !m.box_after;
+    if (!box) return "";
+    const [x, y, w, h] = box;
+    // The number and nothing else. Shape names on the boxes read as a wall of
+    // text over the very slide they are describing, and on a table of pills
+    // they covered it completely; the name belongs on the line the number
+    // points at, where there is room for it.
+    return `<span class="hl ${gone ? "gone" : ""} ${y < 0.06 ? "high" : ""}"
+      style="left:${(x * 100).toFixed(3)}%;top:${(y * 100).toFixed(3)}%;
+             width:${(w * 100).toFixed(3)}%;height:${(h * 100).toFixed(3)}%"
+      title="${esc(m.shape ? m.shape + " — " + m.detail : m.detail)}"><b
+      data-jump="${m.n}" role="button" tabindex="0">${m.n}</b></span>`;
+  }).join("");
+  return `<span class="frame">${img}${boxes}</span>`;
 }
 
 async function applyTicked() {
@@ -903,6 +1122,65 @@ function wireResults() {
 
   const preview = $("#do-preview");
   if (preview) preview.addEventListener("click", loadPreview);
+
+  const changes = document.querySelector("details.changes");
+  if (changes) changes.addEventListener("toggle", () => {
+    state.changesOpen = changes.open;
+  });
+
+  wirePreview();
+}
+
+function wirePreview() {
+  // Redraws the preview alone, and re-wires only itself. A full render would
+  // scroll the reader back to the top, away from the very slide they were
+  // comparing; re-running wireResults would bind a second listener to every
+  // chip and checkbox still on the page.
+  const hl = $("#hl-toggle");
+  if (hl) hl.addEventListener("change", () => {
+    state.highlight = hl.checked;
+    const section = document.querySelector(".preview");
+    if (!section) return;
+    section.outerHTML = previewHTML();
+    wirePreview();
+  });
+
+  for (const badge of document.querySelectorAll(".hl b[data-jump]")) {
+    badge.addEventListener("click", () => jumpToChange(badge.dataset.jump));
+    badge.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        jumpToChange(badge.dataset.jump);
+      }
+    });
+  }
+}
+
+/* Show the line a box's number stands for.
+ *
+ * The list is folded by default, so an anchor alone would scroll to something
+ * display:none and land nowhere. Opening it first is the whole trick, and the
+ * flash is what stops a jump into forty near-identical lines from leaving the
+ * reader hunting for which one moved. */
+function jumpToChange(n) {
+  // The row under the slide first: it is already on screen, so nothing has to
+  // be unfolded and nothing scrolls away from the render being compared.
+  let row = document.getElementById(`chg-slide-${n}`);
+  if (!row) {
+    const details = document.querySelector("details.changes");
+    if (details && !details.open) {
+      details.open = true;
+      state.changesOpen = true;
+    }
+    row = document.getElementById(`chg-${n}`);
+  }
+  if (!row) return;
+  row.scrollIntoView({ behavior: "smooth", block: "center" });
+  row.classList.remove("found");
+  // Reading offsetWidth restarts the animation; without it a second click on
+  // the same number does nothing visible.
+  void row.offsetWidth;
+  row.classList.add("found");
 }
 
 function wireApplyBar() {

@@ -1,0 +1,323 @@
+"""Keeping distinct colours distinct when several are snapped at once.
+
+The failure these exist for came off a real slide: a table of pills coloured
+for High, Medium and Low, checked against a master whose palette holds one
+warm mid-tone. Each pill's nearest entry was that tone, each fix was correct
+on its own, and the corrected deck had a three-step legend drawn in one
+colour.
+
+Nothing here detects a legend. What it enforces is the one property every
+encoding shares -- distinct colours stay distinct -- which preserves a legend,
+a heatmap, a RAG column and a chart's series without knowing which it is
+looking at.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from formatting_tool.apply import apply_fixes
+from formatting_tool.apply.colorplan import build_color_plan
+from formatting_tool.colorutil import contrast_ratio, delta_e, relative_luminance
+from formatting_tool.models import Category, Issue, Severity, Source
+
+# The three pill fills, near the ones off the slide this was found on.
+HIGH, MEDIUM, LOW = "A8C8A0", "C8B48C", "C4C4C4"
+# A palette with a single warm mid-tone: the trap, because all three pills
+# measure closest to it.
+ONE_WARM = {"tan": "C1A87C", "navy": "1F2A44", "white": "FFFFFF", "black": "000000"}
+TOL = 3.0
+LIMIT = 12.0
+
+
+def _plan(selected, everything=None, palette=None):
+    return build_color_plan(
+        selected=selected,
+        everything=everything if everything is not None else selected,
+        palette=palette if palette is not None else ONE_WARM,
+        tolerance=TOL,
+        limit=LIMIT,
+    )
+
+
+def _issue(rule_id: str, **kwargs) -> Issue:
+    issue = Issue(
+        category=kwargs.pop("category", Category.COLOR),
+        severity=kwargs.pop("severity", Severity.ERROR),
+        message=kwargs.pop("message", f"{rule_id} finding"),
+        source=Source.RULE,
+        rule_id=rule_id,
+        deck="messy.pptx",
+        **kwargs,
+    )
+    issue.id = issue.fingerprint()
+    return issue
+
+
+# --------------------------------------------------------------------------- #
+# The headline
+# --------------------------------------------------------------------------- #
+
+def test_three_colours_do_not_become_one() -> None:
+    """All three pills are nearest the same tan. At most one may have it."""
+    plan = _plan([HIGH, MEDIUM, LOW])
+
+    finals = {
+        name: (plan.choice_for(src).target or src)
+        for name, src in (("high", HIGH), ("medium", MEDIUM), ("low", LOW))
+    }
+    pairs = [("high", "medium"), ("high", "low"), ("medium", "low")]
+    for a, b in pairs:
+        assert delta_e(finals[a], finals[b]) > TOL, (
+            f"{a} and {b} both ended up {finals[a]}"
+        )
+
+
+def test_the_closest_match_is_the_one_that_keeps_the_entry() -> None:
+    """Medium is 3.6 from the tan and the others are 13 and 19 away. The
+    colour that most clearly IS the entry keeps it; the ones merely near it
+    look elsewhere or stand down."""
+    plan = _plan([HIGH, MEDIUM, LOW])
+
+    assert plan.choice_for(MEDIUM).label == "tan"
+    assert plan.choice_for(HIGH).target != ONE_WARM["tan"]
+
+
+def test_a_colour_left_alone_says_which_colour_took_its_entry() -> None:
+    """A designer reading the skipped line needs to know it was not an
+    oversight: the set is why."""
+    plan = _plan([HIGH, MEDIUM, LOW])
+    choice = plan.choice_for(HIGH)
+
+    assert not choice.applies
+    assert MEDIUM in choice.reason or "tan" in choice.reason
+    assert choice in plan.declined
+
+
+# --------------------------------------------------------------------------- #
+# What is NOT being fixed still constrains what is
+# --------------------------------------------------------------------------- #
+
+def test_a_colour_nobody_ticked_still_reserves_its_own_colour() -> None:
+    """The case the selection alone would miss. Only Medium is ticked, and it
+    happens to sit close to a palette entry; the untouched High pill beside it
+    must not end up the same colour as the fixed one."""
+    palette = {"almost-high": "A9C9A1", "navy": "1F2A44"}
+
+    plan = build_color_plan(
+        selected=[MEDIUM], everything=[MEDIUM, HIGH],
+        palette=palette, tolerance=TOL, limit=60.0,
+    )
+    choice = plan.choice_for(MEDIUM)
+
+    # `almost-high` is 0.6 from the untouched High pill, so taking it would
+    # make the two pills the same colour. Whether that ends in another entry
+    # or in nothing at all is the plan's business; what must hold either way
+    # is that the two pills still read as two.
+    final = choice.target or MEDIUM
+    assert delta_e(final, HIGH) > TOL
+    assert final != palette["almost-high"]
+
+
+def test_two_near_identical_palette_entries_are_not_both_used() -> None:
+    """Distinct labels are not enough. A palette holding two tints a hair
+    apart would satisfy a one-entry-each rule and still collapse the set, so
+    the constraint is on the colours, not the names."""
+    palette = {"tan-a": "C1A87C", "tan-b": "C2A97D", "navy": "1F2A44"}
+
+    plan = build_color_plan(
+        selected=[MEDIUM, "C6AE82"], everything=[MEDIUM, "C6AE82"],
+        palette=palette, tolerance=TOL, limit=LIMIT,
+    )
+    finals = [
+        plan.choice_for(src).target or src for src in (MEDIUM, "C6AE82")
+    ]
+
+    assert delta_e(finals[0], finals[1]) > TOL
+
+
+# --------------------------------------------------------------------------- #
+# Ordinary cases still work
+# --------------------------------------------------------------------------- #
+
+def test_one_colour_on_its_own_just_snaps() -> None:
+    plan = _plan([MEDIUM])
+
+    assert plan.choice_for(MEDIUM).target == "C1A87C"
+    assert plan.choice_for(MEDIUM).fallback is False
+
+
+def test_a_colour_with_no_defensible_entry_still_falls_back() -> None:
+    """The fallback is kept: nearest, marked as such."""
+    plan = _plan([LOW])
+    choice = plan.choice_for(LOW)
+
+    assert choice.applies
+    assert choice.fallback is True
+    assert "nearest" in choice.reason
+
+
+def test_no_palette_means_no_plan() -> None:
+    assert len(_plan([MEDIUM], palette={})) == 0
+    assert _plan([MEDIUM], palette={}).choice_for(MEDIUM) is None
+
+
+def test_the_plan_is_deterministic() -> None:
+    """Two runs over one deck must produce one answer, or a designer's second
+    look at the same file disagrees with their first."""
+    first = _plan([HIGH, MEDIUM, LOW])
+    second = _plan([LOW, HIGH, MEDIUM])       # a different order in
+
+    for src in (HIGH, MEDIUM, LOW):
+        assert first.choice_for(src).target == second.choice_for(src).target
+
+
+def test_a_colour_is_allowed_to_land_on_the_entry_it_almost_is() -> None:
+    """The separation rule must not fire on the colour being placed itself,
+    or nothing would ever be snapped: every source is within tolerance of the
+    entry it is nearly identical to."""
+    plan = _plan(["C1A87D"])          # a hair off the tan
+
+    assert plan.choice_for("C1A87D").target == "C1A87C"
+
+
+# --------------------------------------------------------------------------- #
+# Contrast, in the other sense: text on top of a recoloured fill
+# --------------------------------------------------------------------------- #
+
+def test_the_wcag_formula_matches_its_reference_values() -> None:
+    assert contrast_ratio("FFFFFF", "000000") == pytest.approx(21.0, abs=0.01)
+    assert contrast_ratio("777777", "777777") == pytest.approx(1.0, abs=0.01)
+    # The canonical AA boundary: #767676 is the darkest grey that passes 4.5
+    # on white.
+    assert contrast_ratio("767676", "FFFFFF") == pytest.approx(4.54, abs=0.01)
+    assert relative_luminance("000000") == 0.0
+    assert relative_luminance("FFFFFF") == pytest.approx(1.0)
+
+
+def test_a_fill_is_not_snapped_to_a_colour_its_text_vanishes_into(
+    tmp_path: Path,
+) -> None:
+    """A pale pill with dark text, and a palette whose nearest entry is a
+    navy. Snapping it satisfies the palette rule and leaves the label
+    unreadable, which is the worse of the two defects and the one a client
+    sees first."""
+    pytest.importorskip("pptx")
+    from pptx import Presentation
+    from pptx.dml.color import RGBColor
+    from pptx.enum.shapes import MSO_SHAPE
+    from pptx.util import Inches
+
+    pale, ink = "D8DCE0", "1A1A1A"
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    pill = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(1),
+                                  Inches(1), Inches(2), Inches(0.5))
+    pill.name = "Pill"
+    pill.fill.solid()
+    pill.fill.fore_color.rgb = RGBColor.from_string(pale)
+    pill.text_frame.text = "Balanced"
+    pill.text_frame.paragraphs[0].runs[0].font.color.rgb = \
+        RGBColor.from_string(ink)
+    deck = tmp_path / "messy.pptx"
+    prs.save(str(deck))
+
+    spec = SimpleNamespace(palette={"navy": "1F2A44"})
+    issue = _issue(
+        "color.shape.off_palette", slide=1, shape="Pill",
+        shape_id=pill.shape_id,
+        message=f"Shape fill #{pale} is off-palette.",
+        found=f"#{pale}", expected="nearest navy #1F2A44",
+    )
+    out = tmp_path / "fixed.pptx"
+
+    result = apply_fixes(deck, [issue], out, spec=spec)
+
+    assert result.applied == []
+    assert "contrast" in result.skipped[0].detail
+    kept = Presentation(str(out)).slides[0].shapes[0]
+    assert str(kept.fill.fore_color.rgb) == pale
+
+
+def test_text_that_was_already_unreadable_does_not_veto_the_recolour(
+    tmp_path: Path,
+) -> None:
+    """Only what this fix would BREAK. A pill whose label was already
+    invisible has a finding of its own, and holding the colour hostage to it
+    would leave the deck wrong twice over."""
+    pytest.importorskip("pptx")
+    from pptx import Presentation
+    from pptx.dml.color import RGBColor
+    from pptx.enum.shapes import MSO_SHAPE
+    from pptx.util import Inches
+
+    dark, nearly_dark = "202020", "262626"
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    pill = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(1),
+                                  Inches(1), Inches(2), Inches(0.5))
+    pill.name = "Pill"
+    pill.fill.solid()
+    pill.fill.fore_color.rgb = RGBColor.from_string(dark)
+    pill.text_frame.text = "invisible already"
+    pill.text_frame.paragraphs[0].runs[0].font.color.rgb = \
+        RGBColor.from_string(nearly_dark)
+    deck = tmp_path / "messy.pptx"
+    prs.save(str(deck))
+
+    spec = SimpleNamespace(palette={"black": "000000"})
+    issue = _issue(
+        "color.shape.off_palette", slide=1, shape="Pill",
+        shape_id=pill.shape_id,
+        message=f"Shape fill #{dark} is off-palette.",
+        found=f"#{dark}", expected="black #000000",
+    )
+    out = tmp_path / "fixed.pptx"
+
+    result = apply_fixes(deck, [issue], out, spec=spec)
+
+    assert len(result.applied) == 1
+    fixed = Presentation(str(out)).slides[0].shapes[0]
+    assert str(fixed.fill.fore_color.rgb) == "000000"
+
+
+def test_an_outline_is_not_held_to_the_text_contrast(tmp_path: Path) -> None:
+    """An outline is not behind the text, so moving it cannot make the text
+    unreadable."""
+    pytest.importorskip("pptx")
+    from pptx import Presentation
+    from pptx.dml.color import RGBColor
+    from pptx.enum.shapes import MSO_SHAPE
+    from pptx.util import Inches
+
+    pale, ink = "D8DCE0", "1A1A1A"
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    pill = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(1),
+                                  Inches(1), Inches(2), Inches(0.5))
+    pill.name = "Pill"
+    pill.fill.solid()
+    pill.fill.fore_color.rgb = RGBColor.from_string("FFFFFF")
+    pill.line.color.rgb = RGBColor.from_string(pale)
+    pill.text_frame.text = "Balanced"
+    pill.text_frame.paragraphs[0].runs[0].font.color.rgb = \
+        RGBColor.from_string(ink)
+    deck = tmp_path / "messy.pptx"
+    prs.save(str(deck))
+
+    spec = SimpleNamespace(palette={"navy": "1F2A44"})
+    issue = _issue(
+        "color.shape.off_palette", slide=1, shape="Pill",
+        shape_id=pill.shape_id,
+        message=f"Shape outline #{pale} is off-palette.",
+        found=f"#{pale}", expected="nearest navy #1F2A44",
+    )
+    out = tmp_path / "fixed.pptx"
+
+    result = apply_fixes(deck, [issue], out, spec=spec)
+
+    assert len(result.applied) == 1
+    assert "outline" in result.applied[0].detail

@@ -21,6 +21,7 @@ import logging
 import re
 from typing import Any, Callable, Optional
 
+from ..colorutil import contrast_ratio
 from ..models import Issue
 from ..rules.space import DECLARED_GRID
 
@@ -122,6 +123,9 @@ _THEME_BOUND = re.compile(r"^theme:\w+\s+#", re.IGNORECASE)
 # "graphic #A32020" -- a colour inside an icon's SVG rather than a fill on the
 # shape, which changes how it is written and not just what it is set to.
 _GRAPHIC = re.compile(r"^graphic\s+#", re.IGNORECASE)
+# The rule's mark for "this target is the nearest entry, not the one the
+# colour was meant to be". See rules.colors._target.
+_FALLBACK = re.compile(r"^nearest\s", re.IGNORECASE)
 
 
 # --------------------------------------------------------------------------- #
@@ -603,24 +607,114 @@ def _refuse_theme_bound(issue: Issue) -> None:
 
 
 def _refuse_untargeted(issue: Issue) -> None:
-    """Stand down on a finding that names no colour to move to.
+    """Stand down on a finding that names no colour at all to move to.
 
-    The rule sets `expected` to a palette entry only when one is close enough,
-    the same hue family, and neutral or chromatic to match. When nothing
-    qualifies it says "brand palette" and means it: the palette holds no
-    version of this colour, and which entry replaces it is a design decision.
+    Which is now only the empty-palette case: with nothing to measure
+    against, `expected` is the bare words "brand palette" and there is no hex
+    in it to apply.
 
-    Before this, `expected` always named the nearest entry however far away it
-    was, and this fixer applied it. That recoloured a red to an orange 33
-    delta-E away and a page of blue headings to a neutral -- targets the rule
-    itself had already declined to recommend.
+    A colour the rule found no INTENDED entry for is no longer refused here.
+    The rule falls back to the nearest entry and marks it, and this applies
+    it. See `_target` for why that fallback is wanted and `_is_fallback` for
+    what the marker buys.
     """
     if _hex_of(issue.expected) is None:
         raise LeaveAlone(
-            "no palette entry is this colour, so which one replaces it is a "
-            "design call; the finding says which is nearest and how far off "
-            "it is"
+            "the palette names no colour to move this to, so which entry "
+            "replaces it is a design call"
         )
+
+
+def _is_fallback(issue: Issue) -> bool:
+    """Whether the target is the nearest entry rather than the intended one.
+
+    The rule prefixes the fallback with `nearest`. It matters in the outcome
+    line and nowhere else: a designer scanning forty applied fixes needs the
+    two that changed a colour's hue to stand out from the thirty-eight that
+    snapped a near-miss into place.
+    """
+    return bool(_FALLBACK.search(issue.expected or ""))
+
+
+def _target_phrase(issue: Issue, target: str, plan_note: str = "") -> str:
+    """How the outcome line describes the colour it moved to."""
+    if plan_note:
+        return f"#{target} ({plan_note})"
+    if _is_fallback(issue):
+        return (
+            f"#{target}, the nearest palette entry -- it reads as a different "
+            "colour, so check it"
+        )
+    return f"the palette entry #{target}"
+
+
+# WCAG AA: 4.5 for body text, 3.0 for large text. Pills, table cells and
+# labels on a slide are mostly large, and holding slide text to the body
+# figure declined recolours a designer would wave through, so 3.0 it is.
+_CONTRAST_FLOOR = 3.0
+
+
+def _planned_target(issue: Issue, ctx: "FixContext") -> tuple[Optional[str], str]:
+    """The colour to move to, and a note for the outcome line.
+
+    The plan is consulted before the finding, because the finding was written
+    one shape at a time and the plan is the only thing that saw the whole
+    deck. Where there is no plan -- no palette, or a caller assembling issues
+    by hand -- the finding's own target stands, which is what the CLI and the
+    tests do.
+
+    A plan that declines this colour raises rather than returning None. It is
+    a decision, not a missing value, and the reason belongs in front of the
+    designer: their three-step legend is why this shape was left alone.
+    """
+    plan = getattr(ctx, "color_plan", None)
+    if plan is None:
+        return _hex_of(issue.expected), ""
+    choice = plan.choice_for(_hex_of(issue.found))
+    if choice is None:
+        return _hex_of(issue.expected), ""
+    if not choice.applies:
+        raise LeaveAlone(choice.reason)
+    return choice.target, choice.reason
+
+
+def _refuse_illegible(shape: Any, target: str, issue: Issue) -> None:
+    """Stand down on a fill that would leave the text on it unreadable.
+
+    Delta-E says whether two colours read as the same colour. It says nothing
+    about whether text in one can be read on the other: a mid grey pill and a
+    navy pill are far apart in Lab, and dark text is legible on one and
+    invisible on the other. Snapping a pale fill to a dark palette entry is
+    exactly the move that does this, and it is a defect a client sees before
+    they see anything else the tool corrected.
+
+    Only measured against text the shape actually carries and that carries its
+    own colour. An inherited or theme-bound run is not something this fix is
+    in a position to judge, and guessing at it would decline good fixes.
+    """
+    if not _has_text(shape):
+        return
+    for paragraph in shape.text_frame.paragraphs:
+        for run in paragraph.runs:
+            if not run.text.strip():
+                continue
+            ink = _run_hex(run)
+            if not ink:
+                continue
+            after = contrast_ratio(target, ink)
+            if after is None or after >= _CONTRAST_FLOOR:
+                continue
+            before = contrast_ratio(_hex_of(issue.found) or ink, ink)
+            # Only refuse what this fix would BREAK. A shape whose text was
+            # already unreadable is a finding of its own, and holding the
+            # recolour hostage to it would leave the colour wrong as well.
+            if before is not None and before < _CONTRAST_FLOOR:
+                continue
+            raise LeaveAlone(
+                f"recolouring the fill to #{target} would leave its text "
+                f"(#{ink}) at {after:.1f}:1 contrast, under the {_CONTRAST_FLOOR}:1 "
+                f"floor, where it reads {before:.1f}:1 now"
+            )
 
 
 def fix_off_palette_text(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[str]:
@@ -632,7 +726,7 @@ def fix_off_palette_text(shape: Any, issue: Issue, ctx: "FixContext") -> Optiona
     """
     _refuse_theme_bound(issue)
     _refuse_untargeted(issue)
-    target = _hex_of(issue.expected)
+    target, note = _planned_target(issue, ctx)
     current = _hex_of(issue.found)
     if not target or not current or not _has_text(shape):
         return None
@@ -649,8 +743,8 @@ def fix_off_palette_text(shape: Any, issue: Issue, ctx: "FixContext") -> Optiona
     if not changed:
         return None
     return (
-        f"recoloured {changed} run(s) from #{current} to the nearest palette "
-        f"entry #{target}"
+        f"recoloured {changed} run(s) from #{current} to "
+        f"{_target_phrase(issue, target, note)}"
     )
 
 
@@ -658,27 +752,32 @@ def fix_off_palette_shape(shape: Any, issue: Issue, ctx: "FixContext") -> Option
     """Recolour a shape's fill, its outline, or the SVG an icon draws from."""
     _refuse_theme_bound(issue)
     _refuse_untargeted(issue)
-    target = _hex_of(issue.expected)
+    target, note = _planned_target(issue, ctx)
     if not target:
         return None
     if _GRAPHIC.search(issue.found or ""):
-        return _recolor_icon(shape, issue, target)
+        return _recolor_icon(shape, issue, target, note)
     wants_outline = "outline" in (issue.message or "").lower()
 
     from pptx.dml.color import RGBColor  # noqa: PLC0415 - lazy heavy dependency
 
     colour = RGBColor.from_string(target)
     if wants_outline:
+        # An outline carries no text, so nothing on the shape becomes
+        # unreadable by moving it.
         shape.line.color.rgb = colour
-        return f"recoloured the outline to the nearest palette entry #{target}"
+        return f"recoloured the outline to {_target_phrase(issue, target, note)}"
+    _refuse_illegible(shape, target, issue)
     # solid() first: a shape whose fill is inherited or themed has no fore
     # colour to set until it has been made a solid fill of its own.
     shape.fill.solid()
     shape.fill.fore_color.rgb = colour
-    return f"recoloured the fill to the nearest palette entry #{target}"
+    return f"recoloured the fill to {_target_phrase(issue, target, note)}"
 
 
-def _recolor_icon(shape: Any, issue: Issue, target: str) -> Optional[str]:
+def _recolor_icon(
+    shape: Any, issue: Issue, target: str, note: str = ""
+) -> Optional[str]:
     """Rewrite the colour inside an icon's SVG.
 
     An icon is a `p:pic`, so it has no fill to set: PowerPoint calls this a
@@ -711,10 +810,15 @@ def _recolor_icon(shape: Any, issue: Issue, target: str) -> Optional[str]:
         part._blob = rewritten.encode("utf-8")
     except Exception as exc:
         raise LeaveAlone(f"the icon's drawing could not be rewritten: {exc}") from exc
+    warning = (
+        f" -- {note}" if note else
+        " -- the nearest entry, which reads as a different colour, so check it"
+        if _is_fallback(issue) else ""
+    )
     return (
         f"recoloured the icon from #{current} to #{target} "
         f"({changed} statement(s) in its drawing, which every copy of this "
-        "icon shares)"
+        f"icon shares){warning}"
     )
 
 

@@ -21,7 +21,7 @@ import logging
 import re
 from typing import Any, Callable, Optional
 
-from ..colorutil import contrast_ratio
+from ..colorutil import TEXT_CONTRAST_FLOOR, contrast_ratio
 from ..models import Issue
 from ..rules.space import DECLARED_GRID
 
@@ -648,10 +648,9 @@ def _target_phrase(issue: Issue, target: str, plan_note: str = "") -> str:
     return f"the palette entry #{target}"
 
 
-# WCAG AA: 4.5 for body text, 3.0 for large text. Pills, table cells and
-# labels on a slide are mostly large, and holding slide text to the body
-# figure declined recolours a designer would wave through, so 3.0 it is.
-_CONTRAST_FLOOR = 3.0
+# Defined in colorutil so the plan that CHOOSES a colour and the fixer that
+# APPLIES it cannot drift apart on what counts as legible.
+_CONTRAST_FLOOR = TEXT_CONTRAST_FLOOR
 
 
 def _planned_target(issue: Issue, ctx: "FixContext") -> tuple[Optional[str], str]:
@@ -675,7 +674,28 @@ def _planned_target(issue: Issue, ctx: "FixContext") -> tuple[Optional[str], str
         return _hex_of(issue.expected), ""
     if not choice.applies:
         raise LeaveAlone(choice.reason)
+    _PLANNED[id(issue)] = choice
     return choice.target, choice.reason
+
+
+# The plan's choice for the finding currently being fixed, so the fill fixer
+# can tell a colour the plan picked KNOWING it costs legibility from one it
+# picked without looking. Keyed by the issue's identity and read once,
+# immediately, on the same call: the alternative was widening every fixer's
+# signature to carry a value only two of them use.
+_PLANNED: dict[int, Any] = {}
+
+
+def _plan_accepted_the_risk(issue: Issue) -> bool:
+    """Whether the plan chose this colour knowing the text would suffer.
+
+    When it did, the fill fixer must not overrule it. The plan searched the
+    whole palette for a legible entry and there was none, so vetoing here
+    would put the colour back off-palette -- trading a defect a designer is
+    told about for one the brand check exists to remove.
+    """
+    choice = _PLANNED.pop(id(issue), None)
+    return bool(choice is not None and getattr(choice, "text_at_risk", False))
 
 
 def _refuse_illegible(shape: Any, target: str, issue: Issue) -> None:
@@ -767,7 +787,8 @@ def fix_off_palette_shape(shape: Any, issue: Issue, ctx: "FixContext") -> Option
         # unreadable by moving it.
         shape.line.color.rgb = colour
         return f"recoloured the outline to {_target_phrase(issue, target, note)}"
-    _refuse_illegible(shape, target, issue)
+    if not _plan_accepted_the_risk(issue):
+        _refuse_illegible(shape, target, issue)
     # solid() first: a shape whose fill is inherited or themed has no fore
     # colour to set until it has been made a solid fill of its own.
     shape.fill.solid()

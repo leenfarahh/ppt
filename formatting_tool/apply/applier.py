@@ -250,7 +250,9 @@ def apply_fixes(
         margins=_margins_of(spec),
         # Built from `wanted` and `issues` both: what to recolour, and what
         # stays as it is and therefore constrains the recolouring.
-        color_plan=_color_plan_for(wanted, issues, spec, tuning, tolerances),
+        color_plan=_color_plan_for(
+            wanted, issues, spec, tuning, tolerances, presentation
+        ),
     )
     result = ApplyResult(deck=deck.name, output=out)
 
@@ -625,12 +627,79 @@ _NEEDS_NEIGHBOURS = frozenset({"space.series_crowded"})
 _PALETTE_RULES = ("color.text.off_palette", "color.shape.off_palette")
 
 
+def _inks_on_fills(presentation: Any) -> dict[str, set[str]]:
+    """Fill colour -> the text colours found sitting on it, deck-wide.
+
+    So the colour plan can rule out an entry that would make a shape's own
+    label unreadable before it picks one, rather than the applier refusing the
+    choice afterwards and leaving the colour off-palette.
+
+    Deck-wide and by colour, not by shape, because the plan decides by colour:
+    one fill colour used on forty pills gets one answer, and it has to be
+    readable on all forty. Erring towards caution is right here -- a colour
+    that works on thirty-nine of them and buries the fortieth is still a
+    defect somebody has to find.
+    """
+    inks: dict[str, set[str]] = {}
+    try:
+        slides = list(presentation.slides)
+    except Exception:                       # not a deck we can walk
+        return inks
+
+    for slide in slides:
+        for shape in _walk(slide.shapes):
+            fill = _shape_fill_hex(shape)
+            if not fill:
+                continue
+            for ink in _text_hexes(shape):
+                inks.setdefault(fill, set()).add(ink)
+    return inks
+
+
+def _shape_fill_hex(shape: Any) -> Optional[str]:
+    """A shape's own solid fill as six hex digits, or None.
+
+    None for an inherited or theme-bound fill: those are not what the palette
+    fixers touch, so they have nothing to contribute here either.
+    """
+    try:
+        fill = shape.fill
+        if fill is None or fill.type is None:
+            return None
+        colour = fill.fore_color
+        if colour is None or colour.type is None or colour.rgb is None:
+            return None
+        return str(colour.rgb).upper()
+    except Exception:
+        return None
+
+
+def _text_hexes(shape: Any) -> set[str]:
+    """The explicit colours of a shape's non-empty runs."""
+    out: set[str] = set()
+    try:
+        if not shape.has_text_frame:
+            return out
+        for paragraph in shape.text_frame.paragraphs:
+            for run in paragraph.runs:
+                if not run.text.strip():
+                    continue
+                colour = run.font.color
+                if colour is None or colour.type is None or colour.rgb is None:
+                    continue
+                out.add(str(colour.rgb).upper())
+    except Exception:
+        return out
+    return out
+
+
 def _color_plan_for(
     wanted: Sequence[Issue],
     issues: Sequence[Issue],
     spec: Optional[Any],
     tuning: Optional[RuleTuning],
     tolerances: Optional[Tolerances],
+    presentation: Any = None,
 ) -> Optional[Any]:
     """Plan every off-palette colour together, or None with no palette to plan.
 
@@ -663,6 +732,7 @@ def _color_plan_for(
         palette=dict(palette),
         tolerance=tol,
         limit=tol * (tuning or RuleTuning()).suggestion_factor,
+        inks=_inks_on_fills(presentation),
     )
 
 

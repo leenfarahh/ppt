@@ -275,6 +275,12 @@ def _hue_gap(a: Optional[float], b: Optional[float]) -> float:
 # unreadable under white text. That is a luminance question and WCAG's formula
 # is the one every design system already uses, so it is the one used here.
 
+# WCAG AA: 4.5 for body text, 3.0 for large text. Slide text is mostly large
+# -- pills, table cells, labels -- and holding it to the body figure declined
+# recolours a designer would wave through, so 3.0 is the floor here.
+TEXT_CONTRAST_FLOOR = 3.0
+
+
 def relative_luminance(hex_value: str) -> Optional[float]:
     """WCAG relative luminance, 0 for black and 1 for white."""
     rgb = hex_to_rgb(hex_value)

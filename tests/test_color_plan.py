@@ -10,6 +10,13 @@ Nothing here detects a legend. What it enforces is the one property every
 encoding shares -- distinct colours stay distinct -- which preserves a legend,
 a heatmap, a RAG column and a chart's series without knowing which it is
 looking at.
+
+The second half is what a displaced colour becomes. Leaving it alone kept the
+set apart and left an off-palette colour in the deck, which is the one thing
+the tool exists to remove. So the colour is matched on its RELATIONSHIP
+instead: the contrast it had with the colour that displaced it, reproduced
+against that colour's new value, with distance deciding between entries that
+score alike.
 """
 
 from __future__ import annotations
@@ -86,15 +93,45 @@ def test_the_closest_match_is_the_one_that_keeps_the_entry() -> None:
     assert plan.choice_for(HIGH).target != ONE_WARM["tan"]
 
 
-def test_a_colour_left_alone_says_which_colour_took_its_entry() -> None:
-    """A designer reading the skipped line needs to know it was not an
-    oversight: the set is why."""
+def test_every_colour_ends_up_on_the_palette() -> None:
+    """The point of the exercise. A colour whose entry was taken does not stay
+    off-palette: it takes another entry, chosen by contrast."""
     plan = _plan([HIGH, MEDIUM, LOW])
-    choice = plan.choice_for(HIGH)
+    on_palette = {v.upper() for v in ONE_WARM.values()}
 
-    assert not choice.applies
-    assert MEDIUM in choice.reason or "tan" in choice.reason
-    assert choice in plan.declined
+    for src in (HIGH, MEDIUM, LOW):
+        choice = plan.choice_for(src)
+        assert choice.applies, f"#{src} was left off-palette"
+        assert choice.target in on_palette
+    assert plan.declined == []
+
+
+def test_a_displaced_colour_keeps_its_contrast_to_the_one_that_displaced_it(
+) -> None:
+    """The rule this was built for. High is nearest the tan, Medium is nearer
+    still and takes it, and High then picks the free entry whose contrast
+    against the tan comes closest to the contrast High and Medium had between
+    them to begin with."""
+    plan = _plan([HIGH, MEDIUM])
+    high, medium = plan.choice_for(HIGH), plan.choice_for(MEDIUM)
+
+    assert medium.label == "tan"              # the closer match keeps it
+    assert high.applies and high.label != "tan"
+
+    want = contrast_ratio(HIGH, MEDIUM)       # the original relationship
+    got = contrast_ratio(high.target, medium.target)
+    # Nothing in a four-entry palette can hold a 1.1:1 relationship, so what
+    # is asserted is that it was CHOSEN for it: no free entry does better.
+    best = min(
+        abs(contrast_ratio(entry, medium.target) - want)
+        for label, entry in ONE_WARM.items()
+        if label != "tan"
+    )
+    assert abs(got - want) == pytest.approx(best, abs=0.01)
+    # And the reason shows the designer both numbers, since a relationship
+    # that could not be held is a thing they have to be able to see.
+    assert "contrast" in high.reason
+    assert f"{want:.1f}:1" in high.reason
 
 
 # --------------------------------------------------------------------------- #
@@ -198,13 +235,17 @@ def test_the_wcag_formula_matches_its_reference_values() -> None:
     assert relative_luminance("FFFFFF") == pytest.approx(1.0)
 
 
-def test_a_fill_is_not_snapped_to_a_colour_its_text_vanishes_into(
+def test_the_palette_wins_when_no_entry_keeps_the_text_readable(
     tmp_path: Path,
 ) -> None:
-    """A pale pill with dark text, and a palette whose nearest entry is a
-    navy. Snapping it satisfies the palette rule and leaves the label
-    unreadable, which is the worse of the two defects and the one a client
-    sees first."""
+    """The over-constrained case, and a deliberate trade-off rather than a bug.
+
+    A pale pill with dark text and a palette holding one dark entry: there is
+    no colour that is both on the palette and readable under that text. Being
+    on the palette is the requirement, so the colour is applied and the label
+    is reported as needing a person. Leaving it off-palette -- which is what
+    this did first -- fails the one thing the brand check is for.
+    """
     pytest.importorskip("pptx")
     from pptx import Presentation
     from pptx.dml.color import RGBColor
@@ -236,10 +277,102 @@ def test_a_fill_is_not_snapped_to_a_colour_its_text_vanishes_into(
 
     result = apply_fixes(deck, [issue], out, spec=spec)
 
+    assert len(result.applied) == 1
+    detail = result.applied[0].detail
+    assert "readable" in detail and "by hand" in detail
+    fixed = Presentation(str(out)).slides[0].shapes[0]
+    assert str(fixed.fill.fore_color.rgb) == "1F2A44"
+    # The trade-off is real, and the test says so out loud: the label really
+    # is now under the floor, and the outcome line is what carries that.
+    assert contrast_ratio("1F2A44", ink) < 3.0
+
+
+def test_without_a_plan_the_fixer_still_refuses_an_illegible_fill(
+    tmp_path: Path,
+) -> None:
+    """The no-palette path, which the CLI and any hand-built finding take.
+
+    With no plan there is no whole-palette search behind the target, so a
+    colour that buries the text is not a considered trade-off -- it is just
+    the nearest entry, and the veto is the only thing standing between it and
+    an unreadable pill.
+    """
+    pytest.importorskip("pptx")
+    from pptx import Presentation
+    from pptx.dml.color import RGBColor
+    from pptx.enum.shapes import MSO_SHAPE
+    from pptx.util import Inches
+
+    pale, ink = "D8DCE0", "1A1A1A"
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    pill = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(1),
+                                  Inches(1), Inches(2), Inches(0.5))
+    pill.name = "Pill"
+    pill.fill.solid()
+    pill.fill.fore_color.rgb = RGBColor.from_string(pale)
+    pill.text_frame.text = "Balanced"
+    pill.text_frame.paragraphs[0].runs[0].font.color.rgb =         RGBColor.from_string(ink)
+    deck = tmp_path / "messy.pptx"
+    prs.save(str(deck))
+
+    issue = _issue(
+        "color.shape.off_palette", slide=1, shape="Pill",
+        shape_id=pill.shape_id,
+        message=f"Shape fill #{pale} is off-palette.",
+        found=f"#{pale}", expected="nearest navy #1F2A44",
+    )
+    out = tmp_path / "fixed.pptx"
+
+    result = apply_fixes(deck, [issue], out)      # no spec, so no plan
+
     assert result.applied == []
     assert "contrast" in result.skipped[0].detail
     kept = Presentation(str(out)).slides[0].shapes[0]
     assert str(kept.fill.fore_color.rgb) == pale
+
+
+def test_a_legible_entry_is_chosen_over_an_illegible_nearer_one(
+    tmp_path: Path,
+) -> None:
+    """The reason legibility is a filter and not a veto. The navy is nearest
+    and would bury the label; a paler entry is further away and readable. The
+    plan takes the paler one, so the colour still ends up on the palette --
+    which vetoing after the choice could never do."""
+    pytest.importorskip("pptx")
+    from pptx import Presentation
+    from pptx.dml.color import RGBColor
+    from pptx.enum.shapes import MSO_SHAPE
+    from pptx.util import Inches
+
+    pale, ink = "D8DCE0", "1A1A1A"
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    pill = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(1),
+                                  Inches(1), Inches(2), Inches(0.5))
+    pill.name = "Pill"
+    pill.fill.solid()
+    pill.fill.fore_color.rgb = RGBColor.from_string(pale)
+    pill.text_frame.text = "Balanced"
+    pill.text_frame.paragraphs[0].runs[0].font.color.rgb =         RGBColor.from_string(ink)
+    deck = tmp_path / "messy.pptx"
+    prs.save(str(deck))
+
+    spec = SimpleNamespace(palette={"navy": "1F2A44", "stone": "D8D4CC"})
+    issue = _issue(
+        "color.shape.off_palette", slide=1, shape="Pill",
+        shape_id=pill.shape_id,
+        message=f"Shape fill #{pale} is off-palette.",
+        found=f"#{pale}", expected="nearest navy #1F2A44",
+    )
+    out = tmp_path / "fixed.pptx"
+
+    result = apply_fixes(deck, [issue], out, spec=spec)
+
+    assert len(result.applied) == 1
+    fixed = Presentation(str(out)).slides[0].shapes[0]
+    assert str(fixed.fill.fore_color.rgb) == "D8D4CC"
+    assert contrast_ratio("D8D4CC", ink) >= 3.0
 
 
 def test_text_that_was_already_unreadable_does_not_veto_the_recolour(

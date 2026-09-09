@@ -202,6 +202,18 @@ details.advanced[open] summary::before { content: "\2212  "; }
 .notice.warn { border-left: 3px solid var(--warning); }
 .notice.bad  { border-left: 3px solid var(--blocker); }
 .notice p { margin: 3px 0 0; color: var(--muted); font-size: 12.5px; }
+.notes-list { margin: 9px 0 0; padding: 0; list-style: none; font-size: 12px; }
+.notes-list li {
+  display: flex; gap: 9px; align-items: baseline; flex-wrap: wrap;
+  padding: 4px 0; border-top: 1px solid var(--line);
+}
+.notes-list .slide {
+  font-family: var(--mono); font-size: 11px; color: var(--faint); flex: none;
+}
+/* The note verbatim, which is the part a designer is actually reading. */
+.notes-list q { color: var(--ink); flex: 1 1 260px; }
+.notes-list .where { font-size: 11px; color: var(--muted); flex: none; }
+.notes-list li.kept .where { color: var(--blocker); font-weight: 600; }
 
 /* ---------- findings ---------- */
 .deck-group { margin-top: 30px; }
@@ -676,6 +688,7 @@ function render() {
     summaryHTML(report, issues, counts, visible, elapsed),
     noticesHTML(logs, ai, report),
     applyBarHTML(issues),
+    notesHTML(),
     appliedHTML(),
     previewHTML(),
     visible.length ? groupsHTML(visible) : emptyHTML(issues.length),
@@ -835,6 +848,44 @@ function applyBarHTML(issues) {
       <button id="apply" ${n ? "" : "disabled"}>Apply ${n || ""}</button>
     </div>
   </section>`;
+}
+
+/* Production notes this run moved off the slides.
+ *
+ * Always shown, never folded, and shown whatever happened to the note. A note
+ * is a message a person wrote to another person on purpose, so every one of
+ * them wants a human decision: the ones that became comments are waiting in
+ * PowerPoint's Comments pane, the ones on a notes page are off the slide but
+ * nobody has been told about them, and the ones that could not be moved are
+ * still on the slide and must not be sent. Deleting them quietly, which is
+ * what this used to do, made all three invisible. */
+function notesHTML() {
+  const notes = (state.applied && state.applied.notes) || [];
+  if (!notes.length) return "";
+  const kept = notes.filter((n) => n.where === "kept");
+  const label = {
+    comment: "in a PowerPoint comment",
+    notes: "on the slide's notes page",
+    kept: "STILL ON THE SLIDE",
+  };
+  return `<div class="notice ${kept.length ? "bad" : "warn"} notes"><div>
+    <b>${notes.length} production note${notes.length === 1 ? "" : "s"}
+      moved off the slide${notes.length === 1 ? "" : "s"}.</b>
+    <p>${kept.length
+      ? `${kept.length} could not be moved and ${kept.length === 1
+          ? "is" : "are"} still on the deck. Take ${kept.length === 1
+          ? "it" : "them"} off before this goes out.`
+      : "Nothing was deleted: each note was copied out before its shape came "
+        + "off, so every one is still readable somewhere."}
+      Re-check each of these.</p>
+    <ul class="notes-list">
+      ${notes.map((n) => `<li class="${esc(n.where)}">
+        <span class="slide">slide ${esc(n.slide)}</span>
+        <q>${esc(n.text)}</q>
+        <span class="where">${label[n.where] || esc(n.where)}</span>
+      </li>`).join("")}
+    </ul>
+  </div></div>`;
 }
 
 function appliedHTML() {

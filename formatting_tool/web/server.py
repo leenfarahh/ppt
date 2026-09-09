@@ -311,6 +311,15 @@ class _Handler(BaseHTTPRequestHandler):
                  "box_before": o.box_before, "box_after": o.box_after}
                 for o in result.removed
             ],
+            # Every production note this run touched and what became of it.
+            # Kept apart from `removed` because a note that could not be moved
+            # is not an applied fix, and it is the one a designer most needs to
+            # see: it is still on the slide.
+            "notes": [
+                {"slide": r.lift.slide, "shape": r.lift.shape,
+                 "text": r.lift.text, "where": r.where, "detail": r.detail}
+                for r in result.notes_lifted
+            ],
             # The second pass. The report the page ticked describes the deck
             # as it arrived; this describes the one it is about to download.
             "recheck": {

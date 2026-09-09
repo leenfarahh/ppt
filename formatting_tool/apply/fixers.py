@@ -1442,7 +1442,14 @@ def _ai_remove_note(shape: Any, action: Any, ctx: "FixContext") -> Optional[str]
     and taking a caption out of a client deck is a defect nobody sees until
     the client does.
 
-    What was removed is put back into the outcome verbatim. A report that says
+    And it is no longer a removal. The note is copied into a PowerPoint
+    comment first and the shape comes off only once the copy exists, so a
+    designer keeps the message and the client does not see it. That happens in
+    one pass at the end of the run -- see apply.notes -- because it needs the
+    written file and the desktop application, so all this does is record the
+    note and leave the shape where it is.
+
+    What was moved is put back into the outcome verbatim. A report that says
     "removed a shape" is not enough to check; one that quotes what it said is.
     """
     try:
@@ -1464,12 +1471,35 @@ def _ai_remove_note(shape: Any, action: Any, ctx: "FixContext") -> Optional[str]
             "and cannot read is not one to delete"
         )
 
-    element = getattr(shape, "_element", None)
-    parent = element.getparent() if element is not None else None
-    if parent is None:
-        return None
-    parent.remove(element)
-    return f"removed the production note {_shorten(text)}"
+    from .notes import NoteLift, emu_to_points   # noqa: PLC0415 - avoids a cycle
+
+    lifts = getattr(ctx, "lifted_notes", None)
+    if lifts is None:
+        # No collector, so nobody is going to move this note anywhere and the
+        # only remaining option would be to destroy it. Which is the one thing
+        # this must not do.
+        raise LeaveAlone(
+            "this note can only be taken off the slide by copying it into a "
+            "comment first, and there is nowhere to record that here"
+        )
+
+    lifts.append(NoteLift(
+        slide=getattr(ctx, "slide", None) or 0,
+        shape_id=action.shape_id if action.shape_id is not None else (
+            getattr(shape, "shape_id", None)
+        ),
+        shape=action.shape,
+        text=text.strip(),
+        left_pt=emu_to_points(getattr(shape, "left", None)),
+        top_pt=emu_to_points(getattr(shape, "top", None)),
+    ))
+    # Deliberately provisional. The final pass rewrites this line with what
+    # actually became of the note, and if that pass never runs the wording is
+    # still true: the note is on the slide and the report is flagging it.
+    return (
+        f"production note {_shorten(text)} is being moved off the slide; "
+        "check the report for where it went"
+    )
 
 
 def _text_of(shape: Any) -> str:

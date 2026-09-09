@@ -126,6 +126,15 @@ class FixContext:
     # the row, and going back to the file for it would re-read a deck the
     # applier already has open.
     neighbours: list = field(default_factory=list)
+    # Which slide the finding being fixed is on, filled in per finding beside
+    # `neighbours`. The AI ops are handed the proposal rather than the finding
+    # and a proposal names a shape but not a slide, which the note lift needs.
+    slide: Optional[int] = None
+    # Production notes to move into comments once the file is written, and the
+    # shapes to take off the slides after each copy exists. Collected here
+    # rather than acted on in place because both halves need the saved file and
+    # the desktop application. See apply.notes.
+    lifted_notes: list = field(default_factory=list)
 
 
 @dataclass
@@ -169,6 +178,9 @@ class ApplyResult:
     # afterwards. See `_second_round`.
     second_round: list[FixOutcome] = field(default_factory=list)
     settled: list[Issue] = field(default_factory=list)
+    # What became of each production note: moved into a PowerPoint comment,
+    # moved to a notes page, or left on the slide. See apply.notes.
+    notes_lifted: list[Any] = field(default_factory=list)
 
     @property
     def changed(self) -> int:
@@ -176,11 +188,12 @@ class ApplyResult:
 
     @property
     def removed(self) -> list[FixOutcome]:
-        """Shapes taken off the deck, which is the one change with no evidence.
+        """Production notes taken off a slide, which always need a second look.
 
         Everything else this does leaves something on the slide to look at. A
-        removal leaves a gap, so it is listed on its own rather than being one
-        line among forty, and each outcome quotes what the shape said.
+        note that has been moved leaves a gap, so it is listed on its own
+        rather than being one line among forty, each outcome quotes what the
+        note said, and `notes_lifted` says where it went.
         """
         return [
             outcome for outcome in self.applied
@@ -296,7 +309,59 @@ def apply_fixes(
     result.before = list(issues)
     _recheck(result, spec)
     _second_round(result, context, spec)
+    _lift_notes(result, context)
     return result
+
+
+def _lift_notes(result: ApplyResult, context: FixContext) -> None:
+    """Move the run's production notes into comments, last of all.
+
+    Last because both halves need the file as it will be sent: a comment is
+    added by the desktop application, and the second round re-saves the deck
+    through python-pptx, so doing this earlier would mean writing a comment
+    into a file that is about to be rewritten.
+
+    The outcome lines are rewritten here rather than at removal time for the
+    same reason. The fixer could only say what it intended; this can say what
+    happened, and "moved into a PowerPoint comment" and "still on the slide,
+    take it off by hand" are not the same news.
+    """
+    lifts = list(getattr(context, "lifted_notes", []) or [])
+    if not lifts:
+        return
+
+    from .fixers import _shorten  # noqa: PLC0415 - one quoting rule, not two
+    from .notes import lift_notes  # noqa: PLC0415 - Windows-only COM underneath
+
+    result.notes_lifted = lift_notes(result.output, lifts)
+
+    by_key = {r.lift.key: r for r in result.notes_lifted}
+    for outcome in result.applied:
+        action = outcome.issue.fix
+        if action is None or action.op != "remove_note":
+            continue
+        found = by_key.get((outcome.issue.slide or 0, action.shape_id))
+        if found is None:
+            continue
+        # Quoted from the note itself, not scraped back out of the fixer's
+        # provisional sentence. The text is on the lift; parsing prose to
+        # recover a value that was never lost is how the quote went missing.
+        outcome.detail = (
+            f"production note {_shorten(found.lift.text)} {found.detail}"
+        )
+        # A note that could not be moved was not corrected, whatever the
+        # fixer reported: the shape is still on the slide.
+        if not found.moved:
+            outcome.applied = False
+            result.skipped.append(outcome)
+    result.applied = [o for o in result.applied if o.applied]
+
+    kept = [r for r in result.notes_lifted if not r.moved]
+    if kept:
+        log.warning(
+            "%d production note(s) could not be moved off the slides and are "
+            "still on the deck", len(kept),
+        )
 
 
 def _second_round(
@@ -530,6 +595,7 @@ def _apply_one_uninstrumented(
     )
 
     context.neighbours = neighbours
+    context.slide = issue.slide
     try:
         detail = fixer(shape, issue, context)
     except LeaveAlone as reason:

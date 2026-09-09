@@ -242,6 +242,12 @@ def test_the_component_is_re_spaced_onto_the_smaller_gutter(
     result = apply_fixes(deck, found, out, selected=[i.id for i in found])
 
     assert len(result.applied) == 1
+    # The report names both gutters as they were. The change is a few
+    # hundredths of an inch, which is under two pixels at preview size, so a
+    # line that gave only the target would be indistinguishable from a fix
+    # that did nothing.
+    assert "onto one 0.060in gutter" in result.applied[0].detail
+    assert "0.060in across and 0.100in down" in result.applied[0].detail
     across, down = _gutters(out)
     assert across == [0.06]
     assert down == [0.06, 0.06], f"still two gutters: {down}"

@@ -384,7 +384,7 @@ def fix_matrix_gutter(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[s
     four came to be spread two at a time for as long as `_row_with` compared
     sizes to the EMU while the rules rounded to a hundredth.
     """
-    from ..rules.space import Cell, matrix_components  # noqa: PLC0415
+    from ..rules.space import Cell, _median, matrix_components  # noqa: PLC0415
 
     target = _gutter_of(issue.expected)
     if target is None:
@@ -423,10 +423,16 @@ def fix_matrix_gutter(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[s
 
     if not moved:
         return None
+    # Both gutters as they were, because this fix is a few hundredths of an
+    # inch and at preview size that is under two pixels. Reading only the
+    # target, there is no way to tell whether the change was small or whether
+    # nothing happened.
     return (
         f"re-spaced {len(matrix.cells)} cells of a "
-        f"{len(matrix.rows)}x{len(matrix.rows[0])} component on a "
-        f"{target:.2f}in gutter, moving {moved} of them"
+        f"{len(matrix.rows)}x{len(matrix.rows[0])} component onto one "
+        f"{target:.3f}in gutter, moving {moved} of them; it was "
+        f"{_median(matrix.across):.3f}in across and "
+        f"{_median(matrix.down):.3f}in down"
     )
 
 

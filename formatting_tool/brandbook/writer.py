@@ -308,6 +308,9 @@ class _Writer:
         self.out(f"  near_miss_factor: {tuning.near_miss_factor}")
         self.out(f"  suggestion_factor: {tuning.suggestion_factor}")
         self.out(f"  strict_size_roles: {_yaml_inline_list(tuning.strict_size_roles)}")
+        self.out(f"  series_fit_min_affected: {tuning.series_fit_min_affected}")
+        self.out(f"  series_fit_max_shrink: {tuning.series_fit_max_shrink}")
+        self.out(f"  min_legible_pt: {tuning.min_legible_pt}")
 
     def _notes(self) -> None:
         self.out()

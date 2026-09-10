@@ -22,7 +22,8 @@ import re
 from typing import Any, Callable, Optional
 
 from ..colorutil import TEXT_CONTRAST_FLOOR, contrast_ratio
-from ..models import Issue
+from ..models import Issue, RuleTuning
+from ..rules.series import half_point
 from ..rules.space import DECLARED_GRID
 
 log = logging.getLogger(__name__)
@@ -618,6 +619,224 @@ def fix_text_overflow(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[s
         grew.append(f"{(height - shape.height) / EMU_PER_INCH:+.2f}in taller")
     shape.width, shape.height = width, height
     return f"grew the box {' and '.join(grew)}, to the size its copy needs"
+
+
+# The plan a `space.series_type_fit` finding carries, in the two shapes it
+# comes in, and the set it applies to. Read off the finding rather than
+# re-derived here for the reason every other measured fix is: the arithmetic
+# belongs where the measurement is, and the fixer's view of the slide is the
+# top-level shapes while the rule has looked at all of them.
+_SET_SCALE = re.compile(r"at\s+([0-9.]+)x\s+type")
+_SET_TIGHTEN = re.compile(
+    r"tightened to\s+([0-9.]+)in insets and\s+([0-9.]+)\s+line spacing"
+)
+_SET_MEMBERS = re.compile(r"across shapes\s+([\d,\s]+)")
+_SET_CLEARS = re.compile(r"clearing shapes\s+([\d,\s]+)")
+
+# Nothing is shrunk below this, whatever the finding asks for. The rule
+# checks it too, against the brand system as well; this is the second check,
+# on the same terms as `_ai_set_font_size`'s -- a size written into a client
+# deck is checked where it is written.
+_MIN_LEGIBLE_PT = RuleTuning().min_legible_pt
+
+
+def series_members(issue: Issue) -> set[int]:
+    """The shape ids a set-wide finding is applied TO, empty when it has no plan."""
+    return _ids_after(_SET_MEMBERS, issue)
+
+
+def series_obstacles(issue: Issue) -> set[int]:
+    """The shapes the copy is landing on, which the plan clears rather than edits.
+
+    Kept apart from the members for the reason the fix keeps them apart: a
+    progress bar has no type to scale. What they share is that a measurement
+    of either is spent the moment the fix applies, which is what the applier
+    needs both lists for.
+    """
+    return _ids_after(_SET_CLEARS, issue)
+
+
+def _ids_after(pattern: "re.Pattern[str]", issue: Issue) -> set[int]:
+    found = pattern.search(issue.expected or "")
+    if not found:
+        return set()
+    return {
+        int(part) for part in found.group(1).replace(" ", "").split(",") if part
+    }
+
+
+def fix_series_type_fit(
+    shape: Any, issue: Issue, ctx: "FixContext"
+) -> Optional[str]:
+    """Fit a repeated set's copy by changing the set, never one card of it.
+
+    The remedy a designer reached for on the slide this was written from, and
+    the one the tool had no way to express: four status columns, two of them
+    with copy drawn across their progress bar, no box able to grow and no bar
+    able to move. They took the type in all four cards down together.
+
+    What makes that safe here is that it is applied to the SET. Every card
+    gets the same treatment, so the cards stay identical to each other; every
+    run scales by the same factor, so the hierarchy inside a card is
+    preserved; and nothing moves, so every alignment on the slide survives --
+    including the row of bars, which is what the alternative would have
+    broken.
+
+    All of it or none of it. A set half applied is worse than one untouched,
+    so a member the deck no longer has stops the whole fix rather than
+    leaving three cards at one size and one at another.
+    """
+    wanted = series_members(issue)
+    if not wanted:
+        # The rule withholds the plan when no size it could write would be
+        # legible, in range, or a small enough change. Its reason is on the
+        # finding, and it is the answer a designer needs.
+        raise LeaveAlone(
+            issue.suggestion
+            or "this set has no fit the tool can apply without a design call"
+        )
+
+    shapes = _members_of(shape, wanted, ctx)
+    tighten = _SET_TIGHTEN.search(issue.expected or "")
+    if tighten is not None:
+        return _tighten_set(shapes, float(tighten.group(1)),
+                            float(tighten.group(2)))
+
+    scale = _SET_SCALE.search(issue.expected or "")
+    if scale is None:
+        return None
+    return _scale_set(shapes, float(scale.group(1)), ctx)
+
+
+def _members_of(shape: Any, wanted: set[int], ctx: "FixContext") -> list[Any]:
+    """Every shape in the set, or nothing at all."""
+    by_id = {_shape_id(shape): shape}
+    for other in getattr(ctx, "neighbours", None) or []:
+        by_id[_shape_id(other)] = other
+    missing = sorted(wanted - set(by_id))
+    if missing:
+        raise LeaveAlone(
+            f"shape(s) {', '.join(str(i) for i in missing)} are not on this "
+            "slide any more, and a set half corrected reads worse than one "
+            "left alone; re-run the check against the deck as it is now"
+        )
+    return [by_id[i] for i in sorted(wanted)]
+
+
+def _shape_id(shape: Any) -> Optional[int]:
+    try:
+        return int(shape.shape_id)
+    except Exception:
+        return None
+
+
+def _tighten_set(shapes: list[Any], inset_in: float, spacing: float) -> Optional[str]:
+    """Rung one: take back the padding, leave the type alone.
+
+    The cheapest room on a slide. A text box carries 0.05in of inset above
+    and below its text by default and a line of copy carries its leading, and
+    a set that is a few hundredths short of fitting can have those without
+    anybody noticing. The words and the sizes are untouched, so it is the
+    change to try before the one that needs a floor under it.
+    """
+    from pptx.util import Inches, Length  # noqa: PLC0415 - lazy heavy dependency
+
+    inset = Inches(inset_in)
+    boxes = spaced = 0
+    for shape in shapes:
+        if not _has_text(shape):
+            continue
+        frame = shape.text_frame
+        touched = False
+        for side in ("margin_top", "margin_bottom"):
+            if (getattr(frame, side, None) or 0) > inset:
+                setattr(frame, side, inset)
+                touched = True
+        for paragraph in frame.paragraphs:
+            if not paragraph.text.strip():
+                continue
+            current = paragraph.line_spacing
+            # Only a multiple, and only a loose one. An absolute leading is a
+            # designer stating a grid and is left alone -- and it has to be
+            # tested for by type, because python-pptx returns it as a Length,
+            # which is an int, so a paragraph set to 14pt of leading would
+            # otherwise read as a multiple of 177800 and be "loosened" to 0.9.
+            # A paragraph already tighter than this has been dealt with.
+            if isinstance(current, Length):
+                continue
+            if current is None or current >= 1.0:
+                paragraph.line_spacing = spacing
+                spaced += 1
+                touched = True
+        boxes += 1 if touched else 0
+    if not boxes:
+        return None
+    return (
+        f"tightened {boxes} box(es) across the set to {inset_in:.2f}in insets"
+        + (f" and {spaced} paragraph(s) to {spacing:.2f} line spacing" if spaced
+           else "")
+        + ", so the copy fits without the type or the words changing"
+    )
+
+
+def _scale_set(shapes: list[Any], scale: float, ctx: "FixContext") -> Optional[str]:
+    """Rung two: one factor, every run in the set, nothing else touched."""
+    if scale >= 1:
+        return None
+    from pptx.util import Pt  # noqa: PLC0415 - lazy heavy dependency
+
+    plan: list[tuple[Any, Any, float]] = []
+    for shape in shapes:
+        if not _has_text(shape):
+            continue
+        for paragraph in shape.text_frame.paragraphs:
+            for run in paragraph.runs:
+                if not run.text.strip():
+                    continue
+                size = run.font.size
+                if size is None:
+                    # The rule refuses a set with an inherited size in it, so
+                    # this is the deck having changed under the finding. Half
+                    # a set scaled is the outcome worth refusing.
+                    raise LeaveAlone(
+                        f"a run in {shape.name!r} takes its size from the "
+                        "layout rather than stating one, so the set cannot "
+                        "be scaled as one; re-run the check"
+                    )
+                plan.append((shape, run, half_point(size.pt * scale)))
+
+    if not plan:
+        return None
+    low = min(size for _, _, size in plan)
+    if low < _MIN_LEGIBLE_PT:
+        raise LeaveAlone(
+            f"this would put type at {low:g}pt, below the {_MIN_LEGIBLE_PT:g}pt "
+            "floor; the copy is too long for the space rather than the type "
+            "being too big"
+        )
+    for shape, _run, size in plan:
+        role_low, _ = (
+            ctx.brand.size_range(_role_of(shape)) if ctx.brand else (None, None)
+        )
+        if role_low is not None and size < role_low:
+            raise LeaveAlone(
+                f"this would put type at {size:g}pt, below the {role_low:g}pt "
+                "the brand system sets for this role"
+            )
+
+    changed = 0
+    for _shape, run, size in plan:
+        if size < run.font.size.pt:
+            run.font.size = Pt(size)
+            changed += 1
+    if not changed:
+        return None
+    return (
+        f"took the type in the set down to {scale:.2f}x -- {changed} run(s) "
+        f"across {len(shapes)} shape(s), every card by the same factor -- so "
+        "the copy fits with nothing moved and no word changed"
+    )
+
 
 
 def _anchor_of(shape: Any) -> Optional[str]:
@@ -2229,6 +2448,7 @@ FIXERS: dict[str, Fixer] = {
     "space.band_width": fix_band_width,
     "space.matrix_gutter": fix_matrix_gutter,
     "space.text_overflow": fix_text_overflow,
+    "space.series_type_fit": fix_series_type_fit,
     "space.series_crowded": fix_series_crowded,
     # The same remedy, one step earlier: an uneven row and a collapsed
     # one are both distributed across the span they occupy, and the
@@ -2271,6 +2491,11 @@ FIX_ORDER: dict[str, int] = {
     "space.series_uneven": 16,
     "space.repeat_out_of_line": 20,
     "space.row_out_of_line": 20,
+    # Before the three that answer the same collision by moving something.
+    # This one changes what is drawn, so every measurement they were computed
+    # from is stale the moment it applies -- and the applier stands those
+    # down rather than letting them act on it. See `_STALE_AFTER`.
+    "space.series_type_fit": 28,
     "space.overlap": 30,
     "space.text_collision": 32,
     # After the collision fixes and before the margin ones: squaring a band up

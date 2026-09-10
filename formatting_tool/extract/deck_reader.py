@@ -227,8 +227,6 @@ def _read_shape(shape: Any, frame: Optional[_Frame] = None) -> ShapeProfile:
         profile.text = _safe(lambda: frame.text) or ""
         profile.word_wrap = _safe(lambda: frame.word_wrap)
         profile.autofit = _stringify(_safe(lambda: frame.auto_size))
-        profile.inset_top_in = _inches(_safe(lambda: frame.margin_top))
-        profile.inset_bottom_in = _inches(_safe(lambda: frame.margin_bottom))
         for paragraph in frame.paragraphs:
             profile.paragraphs.append(_read_paragraph(paragraph))
 

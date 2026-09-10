@@ -394,14 +394,6 @@ class ShapeProfile:
     image_sha1: Optional[str] = None    # identifies a logo asset across decks
     autofit: Optional[str] = None
     word_wrap: Optional[bool] = None
-    # The gap PowerPoint leaves between the text frame's edge and its text,
-    # in inches. Carried because it is the cheapest room on a slide: a box
-    # 0.06in short of fitting its copy has 0.10in of default inset top and
-    # bottom, and taking a little of it back costs nobody anything, where
-    # resizing the type is a decision. None means the shape says nothing and
-    # PowerPoint's own default applies. See `space.series_type_fit`.
-    inset_top_in: Optional[float] = None
-    inset_bottom_in: Optional[float] = None
     # cNvPr/@descr. Carried because a designer can put a machine-readable mark
     # in it, and one convention depends on that: a rectangle described "PS"
     # marks out the presentation space (see PRESENTATION_SPACE_ALT).
@@ -697,33 +689,6 @@ class RuleTuning:
     # partner's diagonal. Keeps pairing local: two repeated things at opposite
     # ends of a slide are not a component.
     satellite_reach: float = 2.5
-
-    # -- fitting a repeated set's copy by resizing its type ---------------- #
-    #
-    # The remedy `space.series_type_fit` owns: where a box cannot grow and its
-    # neighbour cannot move, the type in the whole set comes down together.
-    # These decide when that is the right answer rather than a way of hiding
-    # copy that is simply too long.
-    #
-    # Members of the set that have to be overflowing before the set's type is
-    # touched at all. One card of four running long is a copy problem on that
-    # card, and shrinking the other three to accommodate it is a worse trade
-    # than saying so. Two is a pattern.
-    series_fit_min_affected: int = 2
-    # The most the type may come down, as a fraction. Past this the copy is
-    # too long for the design rather than the design being a shade too tight,
-    # and the finding says that instead of applying anything.
-    series_fit_max_shrink: float = 0.25
-    # Nothing is shrunk below this, whatever the brand system does or does
-    # not say about the role. A size that fits by being unreadable has not
-    # fixed anything.
-    #
-    # A backstop rather than a preference: a consulting deck runs footnotes
-    # and status lines at 8pt on purpose, and a floor set where body copy
-    # belongs would refuse every fix on the slides that need one. What the
-    # brand system says about a role is checked separately and wins where it
-    # is stricter.
-    min_legible_pt: float = 7.0
 
 
 @dataclass

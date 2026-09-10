@@ -39,8 +39,6 @@ from .fixers import (
     LeaveAlone,
     fix_order,
     fixer_for,
-    series_members,
-    series_obstacles,
     why_not_fixable,
 )
 
@@ -132,28 +130,6 @@ class FixContext:
     # `neighbours`. The AI ops are handed the proposal rather than the finding,
     # and a proposal names a shape but not a slide.
     slide: Optional[int] = None
-    # Shapes a type fit has redrawn or cleared -- the set whose type it
-    # scaled, and the shapes that set was landing on. Scratch, like
-    # `neighbours`, and filled in as the run goes.
-    #
-    # What it is for: every measured finding on one of these was computed
-    # from a rendering that no longer exists. A collision between a status
-    # line and the bar under it is the case, and the whole point of the type
-    # fix is that the line no longer reaches the bar -- so moving the bar
-    # afterwards, on the strength of the old measurement, would undo the fix
-    # in the name of finishing it. See `_STALE_ONCE_REDRAWN`.
-    restaged: set = field(default_factory=set)
-    # Findings this run POSTPONED rather than declined, as
-    # (rule id, slide, shape id). A finding stood down because the text it
-    # was measured against has since been redrawn has not been answered; it
-    # has been deferred to a measurement that does not exist yet. The second
-    # round is where that measurement arrives, and without this list the
-    # finding would fall through the gap between the two -- refused in the
-    # first round for being stale, and skipped in the second for not being
-    # something this run introduced. On a real slide that left two bars of
-    # four moved and the row in pieces, which is the defect the refit exists
-    # to avoid.
-    deferred: set = field(default_factory=set)
     # Notes this run has deleted, recorded as they went, so their text can be
     # put into PowerPoint comments once the file is written. Collecting rather
     # than acting in place because a comment needs the saved file and the
@@ -312,15 +288,6 @@ def apply_fixes(
         (result.applied if result_line.applied else result.skipped).append(result_line)
         if result_line.applied and (issue.rule_id or "") in GEOMETRIC:
             moved.add((issue.slide, issue.shape_id))
-        if result_line.applied and (issue.rule_id or "") in _REDRAWS_TEXT:
-            # The set AND what it was landing on. A collision finding is
-            # reported on the shape that has to move, which is the obstacle,
-            # so recording only the boxes whose type changed would leave the
-            # one finding this most needs to stand down still standing.
-            context.restaged |= {
-                (issue.slide, shape_id)
-                for shape_id in series_members(issue) | series_obstacles(issue)
-            }
 
     try:
         presentation.save(str(out))
@@ -334,8 +301,6 @@ def apply_fixes(
         len(result.skipped),
         out,
     )
-
-    _verify_redrawn(result)
 
     if master is not None:
         result.rebuilt = _rebuild_in_place(master, out, tuning)
@@ -385,9 +350,7 @@ def _copy_notes(result: ApplyResult, context: FixContext) -> None:
 
 # Fixes whose result the recheck can only judge with a renderer, because a
 # rule that would otherwise object to them tells them apart by line count.
-_MEASURED_AFTER = frozenset(
-    {"typography.heading_balance", "space.series_type_fit"}
-)
+_MEASURED_AFTER = frozenset({"typography.heading_balance"})
 
 
 def _needs_measuring(result: ApplyResult) -> bool:
@@ -438,18 +401,12 @@ def _second_round(
     """
     if not result.rechecked:
         return
-    # Everything the second round acts on was measured on the file that was
-    # just written, refit and all. So the staleness the first round records
-    # is spent: a collision the re-check still reports is a fact about the
-    # deck as it stands, and standing it down here would be refusing the
-    # fallback on the strength of the fix that failed to make it unnecessary.
-    context.restaged = set()
     already: dict = {}
     for outcome in result.applied:
         key = (outcome.issue.slide, outcome.issue.shape_id)
         already.setdefault(key, set()).add(outcome.issue.rule_id or "")
     todo = [
-        issue for issue in fixable(_introduced_or_deferred(result, context))
+        issue for issue in fixable(result.introduced)
         if not _reverses_a_fix(issue, already)
     ]
     if not todo:
@@ -478,36 +435,6 @@ def _second_round(
     # Measure once more, so what is reported is the file as it now stands.
     _recheck(result, spec)
     result.settled = list(result.recheck)
-
-
-def _introduced_or_deferred(
-    result: ApplyResult, context: FixContext
-) -> list[Issue]:
-    """What the second round may act on: this run's mess, and its unfinished
-    business.
-
-    `introduced` is the rule: a finding the deck already had and the designer
-    did not tick is one they chose to leave, and picking it up here would
-    apply something nobody asked for.
-
-    The exception is a finding they DID tick and this run postponed. It is
-    not pre-existing from the designer's point of view -- they asked for it,
-    and the only reason it did not happen is that a fix earlier in the same
-    run made its measurement obsolete. So the version of it that comes back
-    from the re-check, measured on the file as written, is taken up here.
-    The stale copy is never used: what goes through is the fresh finding, or
-    nothing, because the re-check no longer reports it and the refit
-    therefore answered it.
-    """
-    introduced = list(result.introduced)
-    seen = {
-        (issue.rule_id, issue.slide, issue.shape_id) for issue in introduced
-    }
-    return introduced + [
-        issue for issue in result.recheck
-        if (issue.rule_id or "", issue.slide, issue.shape_id) in context.deferred
-        and (issue.rule_id, issue.slide, issue.shape_id) not in seen
-    ]
 
 
 def _recheck(result: ApplyResult, spec: Optional[Any]) -> None:
@@ -685,25 +612,6 @@ def _apply_one_uninstrumented(
             "see whether anything is still out of line",
         )
 
-    if (issue.rule_id or "") in _STALE_ONCE_REDRAWN and (
-        issue.slide, issue.shape_id
-    ) in getattr(context, "restaged", set()):
-        # Arithmetic again rather than caution, the same call `RELATIVE`
-        # makes. This finding was computed from where the renderer drew the
-        # text, and the text has since been redrawn at a different size. Its
-        # target is a fact about a file that no longer exists.
-        context.deferred.add(
-            ((issue.rule_id or ""), issue.slide, issue.shape_id)
-        )
-        return FixOutcome(
-            issue,
-            False,
-            "left alone for now: the type in this set was refitted earlier "
-            "in this run, so the text this was measured against is not the "
-            "text on the slide any more. It is re-measured after the save "
-            "and applied then if it still stands",
-        )
-
     geometric = is_geometric(issue)
     before = (shape.left, shape.top) if geometric else None
     neighbours = (
@@ -827,161 +735,8 @@ _NEEDS_NEIGHBOURS = frozenset(
         "space.text_overflow",
         "space.band_width",
         "space.matrix_gutter",
-        # This one EDITS them: the finding names one box and the fix is to
-        # the whole repeated set, which it reaches through the neighbours.
-        "space.series_type_fit",
     }
 )
-
-# Fixes that change what the renderer will draw, as opposed to where it draws
-# it. Only one so far, and it is the only kind there can be: nothing else here
-# touches type or copy.
-_REDRAWS_TEXT = frozenset({"space.series_type_fit"})
-
-# And the findings that are only true of a rendering, so a redraw invalidates
-# them. Both of these carry a measured target -- a height to grow to, a
-# position to move to -- and both were measured before the redraw.
-_STALE_ONCE_REDRAWN = frozenset(
-    {"space.text_collision", "space.text_overflow"}
-)
-
-
-def _verify_redrawn(result: ApplyResult) -> None:
-    """Ask the renderer whether the refitted copy actually clears now.
-
-    The one fix here whose arithmetic is a model rather than a measurement.
-    Growing a box by 0.28in grows it by 0.28in; taking type to 0.87x changes
-    where every line breaks, and how much shorter the block comes out is the
-    renderer's business. The estimate is good -- height goes as the square of
-    the size and that is what the rule solves -- but good is not measured,
-    and a fix reported as applied should be a fix that worked.
-
-    Only the shapes the fix touched, through `LineMetricsProvider.refresh`,
-    which is why that seam exists. Measuring a deck costs seconds; measuring
-    four boxes on one slide costs a fraction of that, and this runs on any
-    apply that refitted a set, including the ones with no master and so no
-    re-check to fall back on.
-
-    What it tests is the defect, not the model: is any of this text still
-    drawn onto another shape. Never fatal, and never a revert -- the deck is
-    written by the time this runs and the fix is in it. What this changes is
-    what the outcome line says, which on a bad day is that the copy is too
-    long for the space rather than the type being too big.
-    """
-    outcomes = [
-        outcome for outcome in result.applied
-        if (outcome.issue.rule_id or "") in _REDRAWS_TEXT
-    ]
-    if not outcomes:
-        return
-    try:
-        from pptx import Presentation  # noqa: PLC0415 - lazy heavy dependency
-
-        from ..linemetrics import PowerPointComMetrics, ShapeKey  # noqa: PLC0415
-
-        keys = {
-            ShapeKey(outcome.issue.slide, shape_id)
-            for outcome in outcomes
-            for shape_id in series_members(outcome.issue)
-        }
-        metrics = PowerPointComMetrics(result.output)
-        if not metrics.refresh(keys):
-            return
-        boxes = _boxes_on(Presentation(str(result.output)),
-                          {key.slide for key in keys})
-        for outcome in outcomes:
-            landed = [
-                (name, on)
-                for name, on in (
-                    _landed_on(
-                        boxes,
-                        outcome.issue.slide,
-                        shape_id,
-                        metrics.bounds(ShapeKey(outcome.issue.slide, shape_id)),
-                    )
-                    for shape_id in sorted(series_members(outcome.issue))
-                )
-                if on
-            ]
-            outcome.detail += (
-                ", and nothing in the set is drawn over anything now"
-                if not landed else
-                ", but " + ", ".join(
-                    f"{name} is still drawn over {on}" for name, on in landed[:2]
-                ) + " -- the copy is too long for the space, not just the type"
-            )
-    except Exception:
-        log.debug("could not verify the refitted set", exc_info=True)
-
-
-def _boxes_on(presentation: Any, numbers: set) -> dict:
-    """Every shape on the named slides, in z-order, as boxes in inches."""
-    found: dict = {}
-    slides = list(presentation.slides)
-    for number in numbers:
-        if not number or not 1 <= number <= len(slides):
-            continue
-        found[number] = [
-            (
-                _attr(shape, "shape_id"),
-                str(_attr(shape, "name") or ""),
-                (_attr(shape, "left") or 0) / EMU_PER_INCH,
-                (_attr(shape, "top") or 0) / EMU_PER_INCH,
-                (_attr(shape, "width") or 0) / EMU_PER_INCH,
-                (_attr(shape, "height") or 0) / EMU_PER_INCH,
-            )
-            for shape in _walk(slides[number - 1].shapes)
-        ]
-    return found
-
-
-def _landed_on(boxes: dict, slide, shape_id: int, bounds) -> tuple:
-    """This shape's name, and what its text is still drawn over, if anything.
-
-    The same test `space.text_collision` makes and for the same reason: text
-    over a panel is ordinary layout when the shape's own box is doing it --
-    a caption on a photo -- so only the part of the ink OUTSIDE its own box
-    counts as having gone somewhere nobody put it.
-    """
-    on_slide = boxes.get(slide) or []
-    own = next((box for box in on_slide if box[0] == shape_id), None)
-    if own is None or bounds is None:
-        return ("", "")
-    for other in on_slide:
-        if other[0] == shape_id or not (other[4] and other[5]):
-            continue
-        hit = _shared(bounds, other[2], other[3], other[4], other[5])
-        if hit is None or _inside(hit, own[2], own[3], own[4], own[5]):
-            continue
-        return (repr(own[1]), repr(other[1]))
-    return (repr(own[1]), "")
-
-
-def _shared(bounds, left: float, top: float, width: float, height: float):
-    """The rectangle a measured ink block shares with a box, or None."""
-    x0 = max(bounds.left_in, left)
-    y0 = max(bounds.top_in, top)
-    x1 = min(bounds.right_in, left + width)
-    y1 = min(bounds.bottom_in, top + height)
-    if x1 - x0 <= _REFIT_SLACK_IN or y1 - y0 <= _REFIT_SLACK_IN:
-        return None
-    return (x0, y0, x1, y1)
-
-
-def _inside(rect, left: float, top: float, width: float, height: float) -> bool:
-    x0, y0, x1, y1 = rect
-    return (
-        x0 >= left - _REFIT_SLACK_IN
-        and y0 >= top - _REFIT_SLACK_IN
-        and x1 <= left + width + _REFIT_SLACK_IN
-        and y1 <= top + height + _REFIT_SLACK_IN
-    )
-
-
-# The slack the verification allows, matching the rules' own tolerance for a
-# measured overflow: enough to swallow the rounding in a value PowerPoint
-# reports to a tenth of a point, not enough to hide a line of type.
-_REFIT_SLACK_IN = 0.03
 
 
 _PALETTE_RULES = ("color.text.off_palette", "color.shape.off_palette")

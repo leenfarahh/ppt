@@ -35,7 +35,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional, Protocol
+from typing import Any, Iterable, Optional, Protocol
 
 log = logging.getLogger(__name__)
 
@@ -89,6 +89,29 @@ class LineMetricsProvider(Protocol):
         """Where the text was actually drawn, or None if unknown."""
         ...
 
+    def refresh(
+        self, keys: Iterable[ShapeKey], deck_path: Optional[str | Path] = None
+    ) -> bool:
+        """Measure these shapes again, on the deck as it now stands.
+
+        The seam a fix that changes TYPE needs. Everything else this module
+        supplies is read once, up front, because the rules are asking about a
+        file nobody is editing. A fix that resizes type is different: how much
+        copy fits changes with the size, so the plan is an estimate until the
+        renderer has been asked again, and the applier has to be able to ask
+        about the four boxes it touched without paying for a re-read of every
+        shape on every slide.
+
+        `deck_path` points the provider at a different file, which is the
+        normal case here: the fixes were planned against the input deck and
+        have to be verified against the output.
+
+        Returns False when nothing could be measured, which a caller treats
+        the way it treats an unavailable provider: it says nothing rather
+        than guessing.
+        """
+        ...
+
 
 class NullLineMetrics:
     """The default: knows nothing, admits it."""
@@ -104,6 +127,11 @@ class NullLineMetrics:
 
     def bounds(self, key: ShapeKey) -> Optional[TextBounds]:
         return None
+
+    def refresh(
+        self, keys: Iterable[ShapeKey], deck_path: Optional[str | Path] = None
+    ) -> bool:
+        return False
 
 
 class PowerPointComMetrics:
@@ -145,6 +173,85 @@ class PowerPointComMetrics:
             self._load()
         return self._bounds.get(key)
 
+    def refresh(
+        self, keys: Iterable[ShapeKey], deck_path: Optional[str | Path] = None
+    ) -> bool:
+        """Re-read just these shapes, from `deck_path` if one is given.
+
+        Only the slides the keys name are opened for, and only the shapes on
+        them whose id is asked for. On a forty-slide deck with four shapes to
+        check that is one slide walked instead of forty, and the saving is
+        the whole reason this exists: verifying a type fix must not cost what
+        measuring the deck costs.
+
+        A provider that had not loaded counts as loaded afterwards, knowing
+        these keys and nothing else, so asking whether it is `available` does
+        not then trigger the full read this call exists to avoid. That is a
+        working state rather than a half-broken one -- `bounds` already
+        answers None for a shape the renderer said nothing about, and every
+        rule treats that as unknown -- but it is why this is `refresh` rather
+        than `load`: it is for a caller that knows which shapes it cares
+        about.
+        """
+        wanted: dict[int, set[int]] = {}
+        for key in keys:
+            wanted.setdefault(key.slide, set()).add(key.shape_id)
+        if not wanted:
+            return False
+
+        path = Path(deck_path) if deck_path is not None else self.deck_path
+        from . import powerpoint      # noqa: PLC0415 - lazy, Windows only
+
+        if not powerpoint.available():
+            return False
+        try:
+            powerpoint.run(lambda app: self._read_some(app, path, wanted))
+        except Exception:
+            log.warning(
+                "could not re-measure %d shape(s) in %s",
+                sum(len(ids) for ids in wanted.values()), path.name,
+                exc_info=True,
+            )
+            return False
+        # Whatever it found, it found on `path`, so a provider that was
+        # holding measurements of another file is no longer describing one
+        # deck. Say which, so a caller reading `deck_path` is not misled.
+        self.deck_path = path
+        self._loaded = True
+        self._ok = True
+        return any(
+            ShapeKey(slide, shape_id) in self._bounds
+            for slide, ids in wanted.items()
+            for shape_id in ids
+        )
+
+    def _read_some(self, app: Any, path: Path, wanted: dict[int, set[int]]) -> None:
+        from . import powerpoint      # noqa: PLC0415
+
+        presentation = None
+        try:
+            presentation = app.Presentations.Open(
+                str(path.resolve()), True, False, False
+            )
+            for slide in _com_each(presentation.Slides):
+                number = int(slide.SlideNumber)
+                ids = wanted.get(number)
+                if not ids:
+                    continue
+                # Stale first. A shape the renderer will not talk about this
+                # time must not answer with what it said last time, which
+                # would be a measurement of the file before the fix.
+                for shape_id in ids:
+                    self._bounds.pop(ShapeKey(number, shape_id), None)
+                    self._lines.pop(ShapeKey(number, shape_id), None)
+                for shape in _com_each(slide.Shapes):
+                    self._read(number, shape, only=ids)
+            presentation.Close()
+            presentation = None
+        finally:
+            if presentation is not None:
+                powerpoint.quietly(presentation.Close)
+
     def _load(self) -> None:
         self._loaded = True
         from . import powerpoint      # noqa: PLC0415 - lazy, Windows only
@@ -183,17 +290,25 @@ class PowerPointComMetrics:
             if presentation is not None:
                 powerpoint.quietly(presentation.Close)
 
-    def _read(self, slide: int, shape: Any) -> None:
+    def _read(
+        self, slide: int, shape: Any, only: Optional[set[int]] = None
+    ) -> None:
         """One shape's rendered lines, descending into groups.
 
         Groups are walked because that is where a messy deck keeps its text,
         and `ShapeProfile.shape_id` is assigned the same way, so the keys line
         up without either side knowing about the other.
+
+        `only` narrows this to a set of shape ids, for `refresh`. Groups are
+        still descended into: a wanted shape can be inside one, and the group
+        itself carries a different id.
         """
         try:
             if int(shape.Type) == _MSO_GROUP:
                 for child in _com_each(shape.GroupItems):
-                    self._read(slide, child)
+                    self._read(slide, child, only)
+                return
+            if only is not None and int(shape.Id) not in only:
                 return
             if not int(shape.HasTextFrame):
                 return

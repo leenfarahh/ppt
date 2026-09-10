@@ -22,7 +22,11 @@ from ..models import Category, Geometry, Issue, Margins, Severity, SlideProfile,
 # that would silently disable or silently enable the fix.
 DECLARED_GRID = "the master declares"
 from .base import Rule, RuleContext
-from .repeats import _series as _series_of
+from .series import (
+    half_point as _half_point,
+    series_of as _series_of,
+    units_of as _units_of,
+)
 
 
 class OffCanvasRule(Rule):
@@ -493,6 +497,13 @@ class TextCollisionRule(Rule):
     against the shapes around it and reverts one that lands on a neighbour or
     breaks an alignment, so a shape with nowhere to go stays where it is and
     the report says so.
+
+    Where the shape with nowhere to go is one of a repeated row -- which on
+    that slide it was, four bars on one line -- `space.series_type_fit`
+    answers the same collision without moving anything, by taking the type in
+    the whole set down. It runs first, and this stands down behind it: both
+    findings describe one defect, and once the text has been redrawn the
+    position this one carries is a fact about a file that no longer exists.
     """
 
     id = "space.text_collision"
@@ -1427,9 +1438,12 @@ class TextOverflowRule(Rule):
             # Where the text already runs over something, growing the box
             # reaches straight into the shape it is colliding with, so no
             # target is offered and `space.text_collision` -- which moves the
-            # other shape -- is left to answer it. Withheld here rather than
-            # refused in the fixer because the fixer's view of the slide is
-            # the top-level shapes, and this rule has looked at all of them.
+            # other shape -- is left to answer it, or where the shape is one
+            # of a repeated row and cannot move either,
+            # `space.series_type_fit`, which takes the set's type down
+            # instead. Withheld here rather than refused in the fixer because
+            # the fixer's view of the slide is the top-level shapes, and this
+            # rule has looked at all of them.
             expected=(
                 (
                     f"a box its copy fits, at {needed.left_in:.2f}, "
@@ -1501,6 +1515,388 @@ class TextOverflowRule(Rule):
                 "Resizing type changes how much fits, so it is not done here."
             ),
         )
+
+
+class SeriesTypeFitRule(Rule):
+    """A repeated set whose copy only fits if the type comes down.
+
+    The case both of the other measured rules hand off, and until now nobody
+    caught it. Four status columns, each a line of copy over a thin bar. Two
+    of them run long and are drawn across their bar:
+
+    - `space.text_overflow` would grow the box, and offers no box to grow
+      into, because growing reaches straight into the bar.
+    - `space.text_collision` would move the bar, and the bar is one of four
+      on a shared line. Moving it alone breaks the row, and moving the row
+      down puts it over whatever is under THAT.
+
+    So the tool reported the defect twice and applied nothing, which was the
+    honest answer to a question it was asking the wrong way. What a designer
+    did with the same slide was neither: they took the type in all four cards
+    down together until the longest one fit, and every bar stayed on its line.
+
+    That is a decision the tool can make, and the reason it can is the SET.
+    Resizing type in one box is a judgement about that box -- how much copy
+    belongs there is somebody's call, and `space.text_overflow` is right to
+    refuse it. In a repeated set the size is a shared property, so taking it
+    down across the set changes no relationship on the slide: the cards stay
+    identical to each other, the hierarchy inside each card is preserved
+    because everything scales by the same factor, and nothing moves. The copy
+    is untouched. It is arithmetic, in the way that growing a box into free
+    space is arithmetic.
+
+    What it solves for is CLEARING THE COLLISION, not fitting the stored box,
+    and the difference is the whole reason this can be applied to a real
+    deck. A hand-built deck is full of text boxes drawn smaller than the copy
+    in them -- the box off that slide is 0.22in tall and holds three lines --
+    and no legible size fits three lines into 0.22in. Nothing is wrong with
+    that until the spill lands on something. So the target is the top of the
+    shape being hit, which is a defect with a number on it, rather than the
+    bottom of a box that was never honest about its contents. Where the box
+    itself is the problem, `space.text_overflow` still says so.
+
+    The arithmetic is pessimistic on purpose -- see `_scale_for`. It assumes
+    the copy keeps the number of lines it has, because for a small shrink it
+    usually does, and a fix that is applied and does not work is worse than
+    one that declines.
+
+    Two rungs, cheapest first.
+
+    Tightening comes before shrinking. A box 0.06in short of fitting has
+    0.10in of default inset above and below its text and nobody would miss a
+    little of it, so where the insets and the line spacing can cover the gap
+    on their own the type is not touched at all. Only taken when they cover
+    it comfortably -- the recovery is estimated and the shrink is not, so a
+    marginal call goes to the one that can be measured.
+
+    And a floor under both. The type does not go below what the brand system
+    allows the role, below what is legible, or further down than
+    `series_fit_max_shrink` whatever those say. Past any of those the copy is
+    genuinely too long for the design, and the finding says so with the
+    numbers rather than applying something that fits by being unreadable.
+    """
+
+    id = "space.series_type_fit"
+    category = Category.SPACE
+    description = (
+        "Copy in a repeated set is drawn outside its box, and only the type "
+        "can give."
+    )
+    default_severity = Severity.ERROR
+
+    def __init__(self, metrics: Optional[LineMetricsProvider] = None) -> None:
+        self.metrics = metrics or NullLineMetrics()
+
+    def check(self, ctx: RuleContext) -> Iterable[Issue]:
+        if not self.metrics.available:
+            return
+        for slide in ctx.deck.slides:
+            if slide.hidden:
+                continue
+            claimed: set[int] = set()
+            for series in _series_of(slide, ctx.tuning.repeat_min_members):
+                finding = self._series(ctx, slide, series, claimed)
+                if finding is not None:
+                    yield finding
+
+    def _series(self, ctx, slide, series, claimed) -> Optional[Issue]:
+        blocked = [
+            (shape, bounds, hit)
+            for shape, bounds, hit in (
+                (shape, bounds, _first_shape_under(slide, shape, bounds))
+                for shape, bounds in self._measured(slide, series)
+            )
+            if hit is not None and _scale_for(shape, bounds, hit) < 1
+        ]
+        if len(blocked) < ctx.tuning.series_fit_min_affected:
+            return None
+
+        cards = _units_of(slide, series, ctx.tuning.majority_fraction)
+        cohort = [
+            shape for card in cards for shape in card
+            if shape.paragraphs and shape.text.strip()
+        ]
+        ids = {shape.shape_id for shape in cohort}
+        if not ids.issuperset(shape.shape_id for shape, _, _ in blocked):
+            # The cards did not come out as cards: the overflowing box is not
+            # in the repeated unit its own series defines, which means the
+            # unit was not found rather than that it is empty. Nothing to act
+            # on as a set, and the two existing findings still describe it.
+            return None
+        if ids & claimed:
+            return None            # another series on this slide has them
+        claimed |= ids
+
+        hit = blocked[0][2]
+        # The shapes the copy is landing on, carried alongside the set. They
+        # are not scaled -- a progress bar has no type -- but a fix applied
+        # to this finding invalidates every measurement of them too, and the
+        # applier has to be told which those are. See `_STALE_ONCE_REDRAWN`.
+        clears = {shape.shape_id for _s, _b, shape in blocked}
+        plan_set = (
+            f"across shapes {_id_list(ids)}, clearing shapes "
+            f"{_id_list(clears)}"
+        )
+        message = (
+            f"Copy in {len(blocked)} of {len(series)} repeated boxes is drawn "
+            f"outside the box and over {hit.name!r}. The box cannot grow into "
+            f"what it is already over, and {hit.name!r} is one of a row, so "
+            "the type in the set is what has room to give."
+        )
+        common = dict(
+            slide=slide,
+            shape=blocked[0][0],
+            found=", ".join(
+                f"{shape.name!r} drawn {bounds.height_in:.2f}in in a "
+                f"{shape.geometry.height_in:.2f}in box, "
+                f"{bounds.bottom_in - hit.geometry.top_in:.2f}in over "
+                f"{hit.name!r}"
+                for shape, bounds, hit in blocked[:3]
+            ),
+        )
+
+        # Rung one: the room already on the slide, which costs nothing.
+        if all(
+            _recovers(
+                shape, bounds, hit,
+                self.metrics.lines(ShapeKey(slide.number, shape.shape_id)),
+            )
+            for shape, bounds, hit in blocked
+        ):
+            return self.issue(
+                message,
+                expected=(
+                    f"the set tightened to {_TIGHT_INSET_IN:.2f}in insets and "
+                    f"{_TIGHT_SPACING:.2f} line spacing, " + plan_set
+                ),
+                suggestion=(
+                    "Take the padding inside these boxes down and close the "
+                    "line spacing a little, across the whole set so the cards "
+                    "stay identical. The type and the copy are untouched."
+                ),
+                **common,
+            )
+
+        # Rung two: the type, across the set, by one factor.
+        # Down to two places before anything is decided on it, because two
+        # places is what the finding carries and the fixer reads back. A
+        # plan checked at 0.8898 and applied at 0.89 is a plan applied a
+        # shade weaker than the one that was proved to work.
+        scale = int(100 * min(
+            _scale_for(shape, bounds, hit) for shape, bounds, hit in blocked
+        )) / 100
+        refusal = _too_far(scale, cohort, ctx)
+        if refusal is not None:
+            return self.issue(
+                message,
+                expected="copy that fits the boxes the design gives it",
+                suggestion=refusal,
+                **common,
+            )
+        return self.issue(
+            message,
+            expected=f"the set at {scale:.2f}x type, " + plan_set,
+            suggestion=(
+                f"Take the type in all {len(cards)} cards down to "
+                f"{scale:.2f}x together, which is what makes the longest copy "
+                "fit while every card stays identical to the others and "
+                "nothing moves."
+            ),
+            **common,
+        )
+
+    def _measured(self, slide, series):
+        """The members whose text the renderer drew outside their box."""
+        for shape in series:
+            if shape.is_group or not shape.text.strip() or not shape.paragraphs:
+                continue
+            box = shape.geometry
+            if box.width_in <= 0 or box.height_in <= 0:
+                continue
+            bounds = self.metrics.bounds(ShapeKey(slide.number, shape.shape_id))
+            if bounds is None:
+                continue
+            if _overhang(bounds, box)[0] <= _MEASURED_SLACK_IN:
+                continue
+            yield shape, bounds
+
+
+# What a tightened box keeps between its edge and its text, in inches, and the
+# line spacing a tightened paragraph gets. Both are the smallest values that
+# still read as deliberate padding rather than as text jammed against a border.
+_TIGHT_INSET_IN = 0.02
+_TIGHT_SPACING = 0.9
+
+# How much more than the gap the tightening has to recover before it is taken
+# instead of the shrink. The recovery is estimated -- leading acts on the gaps
+# between lines, and how many lines there are after the change is the
+# renderer's business -- so a marginal call goes to the remedy whose
+# arithmetic is exact.
+_TIGHTEN_MARGIN = 1.5
+
+# PowerPoint's own inset above and below text, for a shape that says nothing.
+_DEFAULT_INSET_IN = 0.05
+
+
+def _insets_of(shape) -> tuple[float, float]:
+    top, bottom = shape.inset_top_in, shape.inset_bottom_in
+    return (
+        _DEFAULT_INSET_IN if top is None else top,
+        _DEFAULT_INSET_IN if bottom is None else bottom,
+    )
+
+
+def _clearance_for(shape, bounds, hit) -> float:
+    """How much shorter the drawn text has to be to clear what it is over.
+
+    Measured against the obstacle, not the box. The ink starts where it
+    starts -- shrinking type does not move the top of a top-anchored block --
+    so the room it has is from there down to the top of the thing it is
+    landing on, less a hair so the two are not left touching.
+    """
+    return bounds.bottom_in - (hit.geometry.top_in - _CLEARANCE_IN)
+
+
+# The gap left between the refitted text and the shape it was drawn over.
+# Small: the point is that they no longer touch, not to open a margin
+# somebody has to justify.
+_CLEARANCE_IN = 0.02
+
+
+def _recovers(shape, bounds, hit, lines) -> bool:
+    """Whether tightening alone comfortably closes this box's gap.
+
+    Two sources, both of them padding rather than content: the inset above
+    and below the text, and the leading between its lines. Neither touches
+    the type or the words.
+
+    The inset at the TOP counts twice over: taking it back lifts the whole
+    block, so every hundredth of an inch off it is a hundredth the text no
+    longer reaches down to. The inset at the bottom does nothing for a
+    collision below the box -- the text is already past it -- so it is not
+    counted at all, which is the difference between this and asking whether
+    the copy fits its box.
+    """
+    gap = _clearance_for(shape, bounds, hit)
+    if gap <= 0:
+        return True                # this one clears already; not the problem
+    top, _bottom = _insets_of(shape)
+    recovered = max(0.0, top - _TIGHT_INSET_IN)
+
+    # Leading is the space BETWEEN lines, so a single line has none to give
+    # and a three-line block has two gaps out of three line heights.
+    count = len(lines) if lines else 0
+    spacings = [p.line_spacing for p in shape.paragraphs if p.text.strip()]
+    if count >= 2 and all(s is None or s >= 1.0 for s in spacings):
+        recovered += bounds.height_in * (1 - _TIGHT_SPACING) * (count - 1) / count
+    return recovered >= _TIGHTEN_MARGIN * gap
+
+
+def _scale_for(shape, bounds, hit) -> float:
+    """The factor this box's type has to come down by to clear what it hits.
+
+    Linear in the size, and deliberately pessimistic. The tempting model is
+    that height goes as the SQUARE of the size, because smaller type makes
+    each line shorter AND fits more words on a line, so the line height and
+    the line count come down together. That is true across a continuum and
+    false at the granularity this works at: the line count is an integer, and
+    for the small shrinks this applies it usually does not change at all. Hold
+    the line count and the height is just n line-heights, which is linear.
+
+    The difference is not academic, it decides whether the fix works. Under
+    the square model the text lands exactly on the room it was given, and if
+    the wrap does not oblige by dropping a line it lands on the obstacle
+    instead -- an applied fix that fixed nothing, which is the one outcome
+    worse than declining.
+
+    So: linear, plus `_FIT_MARGIN` of headroom, and the copy comes out a
+    little smaller than it strictly had to where the wrap does oblige. That
+    is the right way round. A hair small is invisible; still on the bar is
+    the thing a client sees.
+
+    With wrapping off there is no line count to argue about -- one paragraph
+    is one line however long -- and the width was always linear in the size.
+
+    1.0 when no shrink would help: an obstacle ABOVE where the ink starts is
+    not something the ink can be pulled up out of, and the answer there is to
+    move something rather than to resize anything.
+    """
+    scales = [1.0]
+    rect = hit.geometry
+    room = (rect.top_in - _CLEARANCE_IN) - bounds.top_in
+    if room > 0 and bounds.height_in > room:
+        scales.append((1 - _FIT_MARGIN) * room / bounds.height_in)
+    if shape.word_wrap is False:
+        wide = (rect.left_in - _CLEARANCE_IN) - bounds.left_in
+        if wide > 0 and bounds.width_in > wide:
+            scales.append((1 - _FIT_MARGIN) * wide / bounds.width_in)
+    return min(scales)
+
+
+# Headroom on the refitted text, as a fraction of the room it has. Without
+# it the arithmetic lands the copy exactly on the edge of the space it was
+# given, and a point of rounding either way decides whether the fix worked.
+_FIT_MARGIN = 0.05
+
+
+def _too_far(scale: float, cohort, ctx) -> Optional[str]:
+    """Why this shrink must not be applied, or None when it may be.
+
+    Three floors, and the one that bites is named with its number, because
+    "the copy is too long" is only actionable if a writer can see by how much.
+    """
+    if scale < 1 - ctx.tuning.series_fit_max_shrink:
+        return (
+            f"Fitting this copy would take the type to {scale:.2f}x, more "
+            f"than the {ctx.tuning.series_fit_max_shrink:.0%} this is allowed "
+            "to take off a set. The copy is too long for the space the design "
+            "gives it: shorten it, or give the cards more height."
+        )
+
+    silent = sorted(
+        shape.name for shape in cohort
+        if not any(
+            run.size_pt for paragraph in shape.paragraphs
+            for run in paragraph.runs if run.text.strip()
+        )
+    )
+    if silent:
+        return (
+            f"{', '.join(repr(name) for name in silent[:3])} inherits its "
+            "type size rather than stating one, so the set cannot be scaled "
+            "as one without that box drifting away from the others. Set the "
+            "sizes explicitly, or shorten the copy."
+        )
+
+    # The WORST of them, not the first. Any one violation is enough to refuse
+    # the fix, but the number a writer needs is the one furthest under its
+    # floor: that is the box the copy has to come out of.
+    worst = None
+    for shape in cohort:
+        role = ctx.spec.roles.get(shape.role.value)
+        floor = max(
+            ctx.tuning.min_legible_pt,
+            (role.min_size_pt if role and role.min_size_pt else 0.0),
+        )
+        for paragraph in shape.paragraphs:
+            for run in paragraph.runs:
+                if not (run.text.strip() and run.size_pt):
+                    continue
+                after = _half_point(run.size_pt * scale)
+                if after < floor and (worst is None or floor - after > worst[0]):
+                    worst = (floor - after, shape, after, floor)
+    if worst is None:
+        return None
+    _, shape, after, floor = worst
+    return (
+        f"Fitting this copy needs {shape.name!r} at {after:g}pt, below the "
+        f"{floor:g}pt floor for {shape.role.value} text. Shorten the copy, "
+        "or give the cards more height."
+    )
+
+
+def _id_list(ids) -> str:
+    return ", ".join(str(i) for i in sorted(ids))
 
 
 # How far past the box the estimate has to reach before it is reported. About

@@ -51,6 +51,7 @@ from ..models import (
     walk_shapes,
 )
 from .base import Rule, RuleContext
+from .series import series_of as _series
 
 
 class RepeatedElementRule(Rule):
@@ -371,33 +372,6 @@ def _mirrored_pairs(
 # --------------------------------------------------------------------------- #
 # Finding the series
 # --------------------------------------------------------------------------- #
-
-def _series(slide: SlideProfile, minimum: int) -> Iterable[list[ShapeProfile]]:
-    """Groups of shapes that are the same thing repeated.
-
-    Grouped on rounded size and shape type together. Size alone would put a
-    row of icons and a row of same-sized text boxes in one series; type alone
-    would group every rectangle on a busy slide, whatever its dimensions.
-
-    Only top-level shapes. A grouped diagram is placed as one object, and its
-    parts are positioned relative to each other by whoever drew it, so holding
-    them to a shared edge would report the drawing rather than a defect.
-    """
-    buckets: dict[tuple, list[ShapeProfile]] = defaultdict(list)
-    for shape in slide.shapes:
-        if shape.is_group or not shape.geometry.width_in:
-            continue
-        key = (
-            round(shape.geometry.width_in, 2),
-            round(shape.geometry.height_in, 2),
-            shape.shape_type,
-        )
-        buckets[key].append(shape)
-
-    for members in buckets.values():
-        if len(members) >= minimum:
-            yield members
-
 
 # --------------------------------------------------------------------------- #
 # Satellites: a repeated shape measured against the partner it travels with

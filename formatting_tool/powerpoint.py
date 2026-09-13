@@ -77,17 +77,25 @@ class _PowerPointHost:
         self._lock = threading.Lock()
         self._broken: Optional[Exception] = None
 
-    def call(self, work):
-        """Run `work(app)` on the PowerPoint thread; raise or return as it did."""
+    def call(self, work, timeout: Optional[float] = None):
+        """Run `work(app)` on the PowerPoint thread; raise or return as it did.
+
+        `timeout` is how long this particular caller is prepared to wait. The
+        default is the half hour a batch job can afford; something with a
+        person watching it should say so and get an error it can show them
+        instead of a page that never comes back.
+        """
         self._start()
         if self._broken is not None:
             raise self._broken
         done = threading.Event()
         box: dict = {}
         self._requests.put((work, box, done))
-        if not done.wait(self.TIMEOUT_S):
+        waited = self.TIMEOUT_S if timeout is None else timeout
+        if not done.wait(waited):
             raise TimeoutError(
-                f"PowerPoint did not answer within {self.TIMEOUT_S}s"
+                f"PowerPoint did not answer within {waited:.0f}s. It may be "
+                "showing a dialog, or busy with another deck"
             )
         if "error" in box:
             raise box["error"]
@@ -174,9 +182,9 @@ def quietly(call) -> None:
 
 
 
-def run(work):
+def run(work, timeout: Optional[float] = None):
     """Run `work(app)` on the PowerPoint thread; raise or return as it did."""
-    return _HOST.call(work)
+    return _HOST.call(work, timeout)
 
 
 _HOST = _PowerPointHost()

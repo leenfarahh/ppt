@@ -1,4 +1,12 @@
-"""Font family rules."""
+"""Typeface rules: which face the copy is set in.
+
+Direction is not here. `typography.rtl_not_set` used to sit beside the
+Arabic font rule because both read Arabic copy, and the two answer
+different questions off it: whether the face can DRAW the script, and
+which way the paragraph RUNS. The direction rules live together in
+`rules.direction`, where the alignment and the shape-side checks they
+share their evidence with are.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +14,7 @@ from collections import defaultdict
 from typing import Iterable
 
 from ..models import Category, Issue, Severity
-from ..script import has_arabic, is_rtl
+from ..script import has_arabic
 from .base import Rule, RuleContext
 
 
@@ -85,52 +93,6 @@ class ArabicFontRule(Rule):
                 suggestion=(
                     f"Set the Arabic runs in {approved[0]!r}. A Latin face has "
                     "no Arabic glyphs, so this renders as fallback shapes."
-                ),
-            )
-
-
-class RightToLeftRule(Rule):
-    """Arabic copy in a paragraph that was never marked right-to-left.
-
-    `a:pPr/@rtl` is what tells the renderer which way the paragraph runs, and
-    a paragraph that does not set it inherits left-to-right. The Arabic
-    letters still shape and join correctly -- that part is the font's job --
-    so the slide looks almost right, which is what makes this easy to ship.
-    What lands in the wrong place is everything that is not a letter: the full
-    stop at the end of the sentence, a bracketed aside, a number, a Latin
-    product name inside an Arabic line.
-
-    Reported per paragraph, because that is the thing that carries the
-    property and the thing a fix sets.
-    """
-
-    id = "typography.rtl_not_set"
-    category = Category.TYPOGRAPHY
-    description = "Arabic text sits in a paragraph not marked right-to-left."
-    default_severity = Severity.ERROR
-
-    def check(self, ctx: RuleContext) -> Iterable[Issue]:
-        for slide, shape in ctx.text_shapes():
-            unset = [
-                paragraph for paragraph in shape.paragraphs
-                if paragraph.rtl is not True and is_rtl(paragraph.text)
-            ]
-            if not unset:
-                continue
-            yield self.issue(
-                f"{len(unset)} Arabic paragraph(s) are not marked "
-                "right-to-left, so their punctuation and numbers are placed as "
-                "though the copy were English.",
-                slide=slide,
-                shape=shape,
-                expected="right-to-left set on every Arabic paragraph",
-                found=(
-                    f"{len(unset)} of {len(shape.paragraphs)} paragraph(s) "
-                    "unmarked"
-                ),
-                suggestion=(
-                    "Set the paragraph direction to right-to-left. It changes "
-                    "no words and no typeface."
                 ),
             )
 

@@ -66,7 +66,9 @@ class RepeatedElementRule(Rule):
         for slide in ctx.deck.slides:
             if slide.hidden:
                 continue
-            for series in _series(slide, tuning.repeat_min_members):
+            for series in _series(
+                slide, tuning.repeat_min_members, ctx.spec.tolerances.position_in
+            ):
                 yield from self._check_series(ctx, slide, series)
 
     def _check_series(
@@ -148,6 +150,11 @@ class RepeatedElementRule(Rule):
 #                        which of them moved, so both are named and a designer
 #                        decides. This is the ring case, where every pair is a
 #                        pair.
+#   alone                further out than the clustering window, so it joins no
+#                        row at all. The rows that remain are the intent and it
+#                        is measured against the nearest of them. See `_adrift`:
+#                        without it the rule caught small misalignments and went
+#                        quiet on large ones, which is backwards.
 #
 # The clustering window is wider than the reporting tolerance on purpose.
 # Shapes within `near_miss_factor` of each other are one row -- that is what
@@ -167,7 +174,11 @@ class SeriesRowRule(Rule):
         for slide in ctx.deck.slides:
             if slide.hidden:
                 continue
-            for series in _series(slide, ctx.tuning.repeat_min_members):
+            for series in _series(
+                slide,
+                ctx.tuning.repeat_min_members,
+                ctx.spec.tolerances.position_in,
+            ):
                 yield from self._lines(ctx, slide, series, "y")
                 yield from self._lines(ctx, slide, series, "x")
 
@@ -196,6 +207,88 @@ class SeriesRowRule(Rule):
             if len(group) == len(series):
                 continue
             yield from self._off_line(ctx, slide, series, centres, group, axis)
+        yield from self._adrift(ctx, slide, series, centres, groups, settled, axis)
+
+    def _adrift(
+        self,
+        ctx: RuleContext,
+        slide: SlideProfile,
+        series: list[ShapeProfile],
+        centres: list[float],
+        groups: list[list[int]],
+        settled: list[list[int]],
+        axis: str,
+    ) -> Iterable[Issue]:
+        """Members that cluster with nobody, against the line they left.
+
+        `_off_line` only ever reads shapes that are already INSIDE a settled
+        cluster, so the worse the defect the more certainly it escaped: one
+        clustering window out and a shape is a cluster of one, and a cluster
+        of one is dropped before anything is measured. That inverted the rule.
+        A pill 0.15in low was reported, and the same pill 0.40in low -- sitting
+        clear of its row with the rest of that row still in place -- was not.
+
+        Measured against the nearest line the series still holds. TWO members
+        make that line here. Three are needed only to arbitrate which member of
+        a cluster moved, and there is nothing to arbitrate: this shape is
+        alone, so whatever the others still agree on is the row it left.
+        Requiring three would have left the case this was written for with no
+        line to measure against at all, because the row it fell out of held
+        three pills and now holds two.
+
+        Three things keep it quiet. The drift ceiling every repeat rule uses,
+        past which a shape was put where it is on purpose rather than nudged
+        there. A majority: the settled clusters have to account for most of the
+        series, so this speaks where a set has a clear arrangement and a member
+        outside it, and says nothing to a scatter -- a scatter has no
+        arrangement to have departed from. And the line the shape left has to
+        be one that MOST of the series does not share, because a series whose
+        members nearly all sit on one line is a single row, and a single row
+        with one member adrift is `space.repeat_out_of_line`'s finding, which
+        it makes on the shared top edge. Saying it again here would be two
+        findings and two fixes for one shape.
+        """
+        tolerance = ctx.spec.tolerances.position_in
+        held = sum(len(group) for group in settled)
+        if held < ctx.tuning.majority_fraction * len(series):
+            return
+
+        # Paired with their size, because how many members a line holds is
+        # what decides whether it is this rule's business or the other's.
+        lines = [
+            (median([centres[index] for index in group]), len(group))
+            for group in groups if len(group) >= 2
+        ]
+        alone = [group[0] for group in groups if len(group) == 1]
+        if not lines or not alone:
+            return
+
+        # The same test `_shared_edge` applies, so the two rules divide the
+        # cases between them instead of both taking one.
+        owned = max(_MAJORITY_NEEDS, ctx.tuning.majority_fraction * len(series))
+        word = "column" if axis == "x" else "row"
+        edge = "centre x" if axis == "x" else "centre y"
+        for index in alone:
+            line, members = min(
+                lines, key=lambda pair: abs(centres[index] - pair[0])
+            )
+            drift = abs(centres[index] - line)
+            if drift <= tolerance or drift > ctx.tuning.repeat_max_drift_in:
+                continue
+            if members >= owned:
+                continue        # `space.repeat_out_of_line` reports this one
+            yield self.issue(
+                f"One of {len(series)} identical shapes sits {drift:.2f}in "
+                f"clear of the nearest {word}, on no {word} of its own.",
+                slide=slide,
+                shape=series[index],
+                expected=f"{edge} {line:.2f}in, as the nearest {word}",
+                found=f"{edge} {centres[index]:.2f}in",
+                suggestion=(
+                    f"Select this shape and the {word} it belongs to and align "
+                    f"them{' vertically' if axis == 'x' else ' horizontally'}."
+                ),
+            )
 
     def _off_line(
         self,
@@ -260,7 +353,11 @@ class MirroredPairRule(Rule):
         for slide in ctx.deck.slides:
             if slide.hidden:
                 continue
-            for series in _series(slide, ctx.tuning.repeat_min_members):
+            for series in _series(
+                slide,
+                ctx.tuning.repeat_min_members,
+                ctx.spec.tolerances.position_in,
+            ):
                 if len(series) < _MIRROR_NEEDS:
                     continue
                 yield from self._pairs(ctx, slide, series)
@@ -372,31 +469,64 @@ def _mirrored_pairs(
 # Finding the series
 # --------------------------------------------------------------------------- #
 
-def _series(slide: SlideProfile, minimum: int) -> Iterable[list[ShapeProfile]]:
+def _series(
+    slide: SlideProfile, minimum: int, tolerance: float
+) -> Iterable[list[ShapeProfile]]:
     """Groups of shapes that are the same thing repeated.
 
-    Grouped on rounded size and shape type together. Size alone would put a
-    row of icons and a row of same-sized text boxes in one series; type alone
-    would group every rectangle on a busy slide, whatever its dimensions.
+    Grouped on size and shape type together. Size alone would put a row of
+    icons and a row of same-sized text boxes in one series; type alone would
+    group every rectangle on a busy slide, whatever its dimensions.
+
+    Sizes are clustered at the tool's own position tolerance rather than
+    rounded to a hundredth. Rounding is a bucket and a bucket has edges: two
+    pills drawn 0.006in apart in width fall either side of one, stop being a
+    series, and the member that drifted is then measured against nothing. That
+    is not a rare shape of accident either, because the gesture that knocks a
+    shape out of line is a dragged corner handle, and it changes the size as
+    well as the position -- so the old key threw out exactly the shape the set
+    would have convicted.
+
+    Clustered against each bucket's ANCHOR rather than its previous member,
+    which is how `_rows_of` reads rows and for the same reason. Single link
+    chains, and a slide carrying a bar chart drawn as shapes offers a ladder
+    of sizes to chain along until every bar is one series. Anchoring caps a
+    bucket's spread at one tolerance however many members it takes.
 
     Only top-level shapes. A grouped diagram is placed as one object, and its
     parts are positioned relative to each other by whoever drew it, so holding
     them to a shared edge would report the drawing rather than a defect.
     """
-    buckets: dict[tuple, list[ShapeProfile]] = defaultdict(list)
+    by_type: dict[str, list[ShapeProfile]] = defaultdict(list)
     for shape in slide.shapes:
         if shape.is_group or not shape.geometry.width_in:
             continue
-        key = (
-            round(shape.geometry.width_in, 2),
-            round(shape.geometry.height_in, 2),
-            shape.shape_type,
-        )
-        buckets[key].append(shape)
+        by_type[shape.shape_type].append(shape)
 
-    for members in buckets.values():
-        if len(members) >= minimum:
-            yield members
+    for shapes in by_type.values():
+        for members in _by_size(shapes, tolerance):
+            if len(members) >= minimum:
+                yield members
+
+
+def _by_size(
+    shapes: list[ShapeProfile], tolerance: float
+) -> list[list[ShapeProfile]]:
+    """Shapes of one type split into the groups that are the same size."""
+    buckets: list[list[ShapeProfile]] = []
+    for shape in sorted(
+        shapes, key=lambda s: (s.geometry.width_in, s.geometry.height_in)
+    ):
+        box = shape.geometry
+        for bucket in buckets:
+            anchor = bucket[0].geometry
+            if (abs(box.width_in - anchor.width_in) <= tolerance
+                    and abs(box.height_in - anchor.height_in) <= tolerance):
+                bucket.append(shape)
+                break
+        else:
+            buckets.append([shape])
+    return buckets
 
 
 # --------------------------------------------------------------------------- #

@@ -287,6 +287,65 @@ there is one way to reach the target:
 | `color.text.off_palette` | recolours the runs carrying the off-palette colour to the nearest palette entry |
 | `color.shape.off_palette` | recolours the fill, the outline, or the SVG an icon draws from |
 | `typography.terminal_punctuation` | takes the full stop off the end of a title |
+| `font.family.arabic` | sets the Arabic runs in the brand's Arabic face, when it declares one |
+| `typography.rtl_not_set` | marks the Arabic paragraphs right-to-left |
+| `typography.rtl_alignment` | sets the Arabic paragraphs right aligned in the box they are in |
+| `space.rtl_leading_edge` | moves a shape onto the mirrored column, so it leads from the side the deck reads from |
+
+**Undo, one change at a time.** A designer applies forty corrections, looks at
+the renders, and wants one of them back. `--undo ID` holds that finding back;
+repeat it for each one, and everything else is applied exactly as before. In
+the browser it is an Undo beside every change in the list and under every
+render, with the held-back ones listed underneath and a Restore on each.
+
+```powershell
+# everything mechanical except one change that was not wanted
+python -m formatting_tool apply --deck messy.pptx --report review.json `
+    --out out/fixed.pptx --all --undo bb8e6162
+```
+
+UNDO IS A REPLAY, NOT A REVERSE. The deck is written again from the original
+upload without the changes on the undo list, rather than the corrected file
+being edited to drag one shape back. That is not a detail of the
+implementation, it is the only version of this that is correct: a fix is not
+an independent edit. The colour plan is decided across the whole deck at once
+so that colours which are distinct stay distinct, a cohort move carries shapes
+no finding named because a column moves whole or not at all, and the second
+round exists only to clear up what the first round caused. Put one shape back
+by hand and everything derived from it stays behind, which is a file in a
+state no run of this tool would ever produce.
+
+Because the input deck is never modified, the original is always still there
+to replay from, and the result is not an approximation of the file the
+designer would have had if they had never ticked that fix: it is that file.
+Second-round fixes undo on the same terms as first-round ones, because the
+list a designer reads does not distinguish them.
+
+**What an undo costs, and what that paid for.** An undo is an apply, so it
+takes as long as the apply did -- which on a 105-slide deck with 1086
+mechanical fixes was long enough to be the first thing anyone said about the
+feature. Two things came out of profiling it, and both make every apply faster,
+not just the undos:
+
+| | Before | After |
+| --- | --- | --- |
+| The fixes, on 105 slides / 1086 fixes | 47.4s | 20.9s |
+| Preview render, three slides of that deck | 10.6s | 2.2s |
+
+The fix loop was reading the same slide over and over through python-pptx,
+where every geometry read is an XPath: `_cohort_move` rebuilt the list of
+shapes not coming along once per member and re-read all their boxes each time,
+and `_find_shape` walked the whole slide comparing ids for every finding. The
+shapes of a slide are now indexed once per run and dropped only when a fix
+removes one, and the cohort path works out what it is measuring against once.
+The output is identical -- same 1086 fixes, same details, checked against a
+fingerprint of the run.
+
+The preview used to render the whole deck whatever the page was going to show.
+It now asks PowerPoint for the slides it needs, falling back to the whole deck
+when that is cheaper (above a fifth of it) or when per-slide export fails,
+which it does on some paths. The rest of an undo is the recheck and the second
+round, which measure the written deck the same way `validate` does.
 
 **A set is read as rows and columns, not as one shared edge.** Every space
 rule modelled a set as shapes sharing ONE edge, which meant two columns of
@@ -316,11 +375,12 @@ tolerance of the edge are put on it first -- moving a ragged set only
 relocates the raggedness. That deck went from 1 applied to 10, with no
 alignment refusals left.
 
-Only the hard constraints may do this: `space.safe_margin` and
-`space.off_canvas`. A deck cannot ship with content outside the frame, so the
-column moves whole. A grid snap is a preference, and dragging a neighbour to
-satisfy one is the failure that got `space.alignment_grid` disabled once
-already. Every shape that moves is checked against its own neighbours, and the
+Only the hard constraints may do this: `space.safe_margin`,
+`space.off_canvas`, `space.text_collision` and `space.rtl_leading_edge`. A deck
+cannot ship with content outside the frame, with copy drawn across a shape, or
+reading from the side it does not read from, so the column moves whole. A grid
+snap is a preference, and dragging a neighbour to satisfy one is the failure
+that got `space.alignment_grid` disabled once already. Every shape that moves is checked against its own neighbours, and the
 whole set goes back if any of them lands on something.
 
 **Arabic decks are measured as Arabic decks.** The scaffolding was there and
@@ -337,6 +397,31 @@ was, but because the rules could not see it.
   The letters still shape and join, so the slide looks almost right -- what
   lands wrong is the punctuation, the numbers and any Latin inside the line.
   The fix is one attribute and changes no words.
+- `typography.rtl_alignment` reports Arabic paragraphs explicitly set flush
+  left. A different defect from the one above and not fixed by it: `algn="l"`
+  names an EDGE of the box, not a leading edge, so a paragraph can read right
+  to left and still sit against the left margin with its rag on the side the
+  reader starts from. Only an explicit "left" is reported -- an unstated
+  alignment inherits flush right, and centred and justified copy have no side.
+  Table cells count, minus the header row, which `table.header_alignment`
+  already reports.
+- `space.rtl_leading_edge` reports a SHAPE that still starts at the English
+  column: its left edge on a column the master declares and its right edge on
+  none. Copy set flush right inside a box placed against a left-hand frame
+  still reads from the wrong side of the page. Pictures are the case nothing
+  else could see -- they hold no text, and the alignment grid reads copy --
+  and the miss is far too large for that rule's near-miss window anyway. The
+  fix moves the shape onto the MIRROR of the column it sits on, and only when
+  the master declares that mirrored column too: an asymmetric master states no
+  mirror, and there this says nothing rather than inventing a position. Footer,
+  page-number and date placeholders are exempt, living where the master puts
+  them.
+
+  The columns are read off the master's layouts as the designer drew them,
+  per slide, from the layout that slide is built on. Nothing is added to the
+  master and nothing in it is changed: unlike `space.alignment_grid`, this
+  does not wait for a PS mark, because an unannotated master is the ordinary
+  case and a check that stayed silent on one would be no check at all.
 - The alignment grid measures the LEADING edge, which is the right one in a
   deck that reads right to left. A column of Arabic shapes of different widths
   shares a right edge and nothing else, and the snap moves that edge rather
@@ -659,6 +744,33 @@ changed before downloading the corrected deck.
 - **Render before / after** draws the affected slides through PowerPoint, side
   by side. "moved 0.65in back onto the canvas" is a claim; two pictures are
   the evidence, and you can reject the result before it reaches a client.
+- **Undo** sits beside every change, in the detail list and under each render,
+  and rejecting one is a click rather than a re-tick. It posts to `/api/undo`,
+  which replays the same run without that change; the held-back ones are
+  listed under the changes with a **Restore** on each, and they accumulate, so
+  taking back a second change keeps the first one taken back. Pressing Apply
+  again starts a fresh run: the tick list you just sent is what you want.
+- **The change list is grouped by what kind of change it is** -- layout,
+  titles, logo, typefaces, colour, position and spacing, tables, typography --
+  each group folded on its own, and each fold remembered. Forty lines read as
+  six groups, and skipped findings get a group of their own rather than a tail.
+- **An undone change says what it did**, in the words it was described in when
+  it was made: "slide 12 &middot; Picture 3 -- moved it +2.31in across". The
+  server cannot supply that, because on the run that holds a change back the
+  change is never made and has no outcome; the page keeps it from the run that
+  did make it. The status line names the change as well, so an undo is never
+  just something disappearing from a list.
+- **Re-render** sits over each pair of renders and renders that slide again,
+  ignoring what is cached. The cache is right nearly always -- the upload never
+  changes, and a run that rewrites the corrected deck drops the after images
+  itself -- but "nearly always" is not something a designer can check from the
+  outside, and the renders are what they accept the result on.
+- **An undo re-renders the slide it happened on**, when renders are already up.
+  The file has just been written again, so every after image on the page is of
+  a deck that no longer exists; the server drops its cache of them and the page
+  asks for the slide again, keeping it in view even though it now carries no
+  change. That cache was stale after a second apply too, which nothing had
+  noticed because nothing had looked.
 
 The uploaded deck is kept for four hours so the ticking and the applying can be
 minutes apart. Nothing leaves the machine except the AI call, if it is on.

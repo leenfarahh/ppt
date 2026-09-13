@@ -268,6 +268,7 @@ def _cmd_apply(args: argparse.Namespace) -> int:
         tuning=guidelines.tuning,
         tolerances=guidelines.tolerances,
         spec=_spec_for_apply(args.master, guidelines),
+        undone=list(args.undo or []),
     )
     _report_apply(result)
     return 1 if result.skipped and args.strict else 0
@@ -338,6 +339,18 @@ def _report_apply(result) -> None:
         print("\n  Skipped:", file=out)
         for outcome in result.skipped:
             print(f"    {outcome}", file=out)
+    if result.undone:
+        print(
+            f"\n  {len(result.undone)} fix(es) held back: "
+            f"{', '.join(result.undone)}",
+            file=out,
+        )
+        for key in result.undone_unknown:
+            print(
+                f"    {key}: nothing to undo -- no finding with that id was "
+                "going to be applied",
+                file=out,
+            )
     if result.removed:
         print(
             f"\n  {len(result.removed)} production note(s) taken off the deck. "
@@ -781,6 +794,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "--all",
         action="store_true",
         help="apply every finding that has a fixer, without picking",
+    )
+    apply_cmd.add_argument(
+        "--undo",
+        action="append",
+        metavar="ID",
+        help=(
+            "hold this finding back; repeat for each one to take back. The "
+            "deck is written again from the original without it, so undoing "
+            "one fix leaves every other fix exactly as it was"
+        ),
     )
     apply_cmd.add_argument(
         "--master",

@@ -24,6 +24,8 @@ from ..models import (
     RunProfile,
     ShapeProfile,
     SlideProfile,
+    TableCell,
+    TableProfile,
     TextRole,
     placeholder_token,
 )
@@ -230,12 +232,96 @@ def _read_shape(shape: Any, frame: Optional[_Frame] = None) -> ShapeProfile:
         for paragraph in frame.paragraphs:
             profile.paragraphs.append(_read_paragraph(paragraph))
 
+    if _safe(lambda: shape.has_table):
+        profile.table = _read_table(shape, profile.geometry)
+
     if profile.is_group:
         inner = frame.descend(shape)
         for child in _safe(lambda: list(shape.shapes)) or []:
             profile.children.append(_read_shape(child, inner))
 
     return profile
+
+
+def _read_table(shape: Any, box: Geometry) -> Optional[TableProfile]:
+    """A table graphic frame as rows of cells.
+
+    Until this existed a table was one opaque rectangle to the whole tool. A
+    seven-column table of forty-two cells came back as a single 12.27 x 5.23in
+    box, so no rule could see a heading, a column or a row inside one, and a
+    deck built on real tables was checked only around its tables.
+
+    Cell boxes are derived from the column widths and row heights rather than
+    read: a cell has no position of its own in the file, only its place in the
+    grid, and the grid is laid out from the frame's top-left corner.
+    """
+    table = _safe(lambda: shape.table)
+    if table is None:
+        return None
+
+    columns = _safe(lambda: list(table.columns)) or []
+    rows = _safe(lambda: list(table.rows)) or []
+    widths = [_inches(_safe(lambda: column.width) or 0) for column in columns]
+    heights = [_inches(_safe(lambda: row.height) or 0) for row in rows]
+
+    profile = TableProfile(
+        rows=len(rows),
+        columns=len(columns),
+        row_heights_in=heights,
+        column_widths_in=widths,
+        first_row_header=bool(_safe(lambda: table.first_row)),
+    )
+
+    lefts = _running(box.left_in, widths)
+    tops = _running(box.top_in, heights)
+    for r in range(profile.rows):
+        for c in range(profile.columns):
+            cell = _safe(lambda: table.cell(r, c))
+            if cell is None:
+                continue
+            profile.cells.append(
+                _read_cell(cell, r, c, lefts[c], tops[r], widths[c], heights[r])
+            )
+    return profile
+
+
+def _read_cell(
+    cell: Any,
+    row: int,
+    column: int,
+    left: float,
+    top: float,
+    width: float,
+    height: float,
+) -> TableCell:
+    fill_hex, fill_theme = _fill_hex(cell)
+    profile = TableCell(
+        row=row,
+        column=column,
+        geometry=Geometry(
+            left_in=left, top_in=top, width_in=width, height_in=height
+        ),
+        fill_hex=fill_hex,
+        fill_theme=fill_theme,
+        row_span=int(_safe(lambda: cell.span_height) or 1),
+        column_span=int(_safe(lambda: cell.span_width) or 1),
+        spanned=bool(_safe(lambda: cell.is_spanned)),
+    )
+    frame = _safe(lambda: cell.text_frame)
+    if frame is not None:
+        profile.text = _safe(lambda: frame.text) or ""
+        for paragraph in _safe(lambda: frame.paragraphs) or []:
+            profile.paragraphs.append(_read_paragraph(paragraph))
+    return profile
+
+
+def _running(start: float, sizes: list[float]) -> list[float]:
+    """The leading edge of each track: start, start+w0, start+w0+w1, ..."""
+    edges, position = [], start
+    for size in sizes:
+        edges.append(position)
+        position += size
+    return edges
 
 
 def _alt_text(shape: Any) -> str:

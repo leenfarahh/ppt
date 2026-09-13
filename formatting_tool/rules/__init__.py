@@ -19,10 +19,14 @@ from .colors import (
     ThemeMismatchRule,
     OffPaletteTextRule,
 )
+from .direction import (
+    RightToLeftRule,
+    RtlAlignmentRule,
+    RtlLeadingEdgeRule,
+)
 from .fonts import (
     ArabicFontRule,
     MixedFontsInShapeRule,
-    RightToLeftRule,
     ThemeFontDriftRule,
     UnapprovedFontRule,
 )
@@ -35,6 +39,7 @@ from .repeats import (
     SeriesRowRule,
 )
 from .sizes import AutofitShrinkRule, InconsistentRoleSizeRule, RoleFontSizeRule
+from .tables import TableHeaderAlignmentRule, TableHeaderRowsRule
 from .space import (
     AlignmentGridRule,
     OffCanvasRule,
@@ -126,6 +131,7 @@ def build_default_rules(
         UnapprovedFontRule(),
         ArabicFontRule(),
         RightToLeftRule(),
+        RtlAlignmentRule(),
         MixedFontsInShapeRule(),
         ThemeFontDriftRule(),
         ThemeMismatchRule(),
@@ -152,6 +158,13 @@ def build_default_rules(
         BandWidthRule(),
         UnevenSeriesRule(),
         MatrixGutterRule(),
+        # After the grid rule and before the tables: a shape on the wrong side
+        # of the page is the largest of these moves, and the report reads
+        # better with it beside the other edge findings than filed under
+        # direction with the paragraph ones.
+        RtlLeadingEdgeRule(),
+        TableHeaderRowsRule(),
+        TableHeaderAlignmentRule(),
         AutofitShrinkRule(),
         # Typography
         OrphanWidowRule(metrics=metrics),

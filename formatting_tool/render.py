@@ -71,7 +71,9 @@ class Renderer(Protocol):
     @property
     def available(self) -> bool: ...
 
-    def render(self, deck: Path, out: Path) -> dict[int, Path]: ...
+    def render(
+        self, deck: Path, out: Path, slides: Optional[list[int]] = None
+    ) -> dict[int, Path]: ...
 
 
 # --------------------------------------------------------------------------- #
@@ -84,13 +86,32 @@ class Renderer(Protocol):
 
 
 
+# Above this share of a deck, exporting slide by slide costs more than
+# exporting the lot. Measured on a real 105-slide deck: the whole deck goes in
+# 11.1s, 0.106s a slide, and one slide on its own takes 0.52s -- five times the
+# per-slide cost, because each call reopens the export path. So a handful of
+# slides is much cheaper one at a time and a third of the deck is not.
+_PER_SLIDE_SHARE = 0.2
+
+
 class PowerPointRenderer:
-    """Export every slide as PNG by driving PowerPoint. Windows only.
+    """Export slides as PNG by driving PowerPoint. Windows only.
 
     `Presentation.Export` writes the whole deck in one call and names the files
-    itself (Slide1.PNG, Slide2.PNG, ...), which is both faster and more robust
-    than exporting slide by slide: per-slide `Slide.Export` fails on some paths
-    with an unhelpful "can't save ^0 to ^1".
+    itself (Slide1.PNG, Slide2.PNG, ...). For the whole deck that is both
+    faster and more robust than going slide by slide -- per-slide
+    `Slide.Export` fails on some paths with an unhelpful "can't save ^0 to ^1".
+
+    ASKED FOR A FEW SLIDES, it exports those instead, and that is the case the
+    UI is nearly always in: a designer applied eleven fixes across three slides
+    and wants to see three slides. Rendering the other hundred to answer that
+    is most of what "the preview takes forever" was, and all of what an undo
+    added, since an undo writes the deck again and every image of it is then of
+    a file that no longer exists.
+
+    Per-slide export is the fragile one, so it is the one that falls back: any
+    failure drops through to the whole-deck export, which is what this did
+    before and still does for everything else.
     """
 
     name = "powerpoint"
@@ -99,20 +120,32 @@ class PowerPointRenderer:
     def available(self) -> bool:
         return powerpoint.available()
 
-    def render(self, deck: Path, out: Path) -> dict[int, Path]:
+    # A person is watching a render, so it does not get the half hour a batch
+    # job can afford. Five minutes is far longer than any deck measured here
+    # takes -- a 31-slide, 31MB deck exports in 5.7s -- so reaching this means
+    # PowerPoint is wedged or showing a dialog, and saying so beats a page that
+    # never answers.
+    TIMEOUT_S = 300
+
+    def render(
+        self, deck: Path, out: Path, slides: Optional[list[int]] = None
+    ) -> dict[int, Path]:
         out.mkdir(parents=True, exist_ok=True)
-        powerpoint.run(lambda app: _export(app, deck, out))
+        powerpoint.run(
+            lambda app: _export(app, deck, out, slides), timeout=self.TIMEOUT_S
+        )
         return _collect(out)
 
 
-def _export(app, deck: Path, out: Path) -> None:
+def _export(app, deck: Path, out: Path, slides: Optional[list[int]] = None) -> None:
     # A backslash path: PowerPoint reads a forward-slash path containing spaces
     # as a URL and cannot find it. `resolve` gives the native form.
     presentation = app.Presentations.Open(
         str(deck.resolve()), ReadOnly=True, WithWindow=False
     )
     try:
-        presentation.Export(str(out), "PNG", DEFAULT_WIDTH, DEFAULT_HEIGHT)
+        if not _export_some(presentation, out, slides):
+            presentation.Export(str(out), "PNG", DEFAULT_WIDTH, DEFAULT_HEIGHT)
     except Exception:
         powerpoint.quietly(presentation.Close)  # the export failure is the interesting one
         raise
@@ -121,6 +154,52 @@ def _export(app, deck: Path, out: Path) -> None:
     # the instance must not be reused, and the raise is what says so.
     presentation.Close()
 
+
+def _export_some(presentation, out: Path, slides: Optional[list[int]]) -> bool:
+    """Export just these slides, or say it did not.
+
+    False rather than an exception, because the caller's answer to both "not
+    worth it" and "PowerPoint would not" is the same: export the whole deck.
+    A half-written set is cleaned up first, so the fallback cannot leave one
+    slide from this attempt sitting beside the full export.
+    """
+    if not slides:
+        return False
+    try:
+        count = int(presentation.Slides.Count)
+    except Exception:
+        return False
+    wanted = sorted({n for n in slides if 1 <= n <= count})
+    if not wanted or len(wanted) > max(1, int(count * _PER_SLIDE_SHARE)):
+        return False
+
+    written: list[Path] = []
+    try:
+        for number in wanted:
+            target = out / f"Slide{number}.PNG"
+            presentation.Slides(number).Export(
+                str(target), "PNG", DEFAULT_WIDTH, DEFAULT_HEIGHT
+            )
+            written.append(target)
+    except Exception:
+        for path in written:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        log.debug("per-slide export failed; exporting the whole deck", exc_info=True)
+        return False
+    return True
+
+
+def _rendered(
+    renderer: Renderer, deck: Path, directory: Path, slides: Optional[list[int]]
+) -> dict[int, Path]:
+    """Ask for the slides wanted, and accept a renderer that cannot narrow."""
+    try:
+        return renderer.render(deck, directory, slides)      # type: ignore[call-arg]
+    except TypeError:
+        return renderer.render(deck, directory)
 
 def _collect(out: Path) -> dict[int, Path]:
     """Map the exported files back onto slide numbers.
@@ -153,7 +232,9 @@ class NullRenderer:
     def available(self) -> bool:
         return False
 
-    def render(self, deck: Path, out: Path) -> dict[int, Path]:
+    def render(
+        self, deck: Path, out: Path, slides: Optional[list[int]] = None
+    ) -> dict[int, Path]:
         return {}
 
 
@@ -173,8 +254,17 @@ def available_renderer() -> Renderer:
     return NullRenderer()
 
 
-def render_deck(deck: str | Path, renderer: Optional[Renderer] = None) -> SlideImages:
+def render_deck(
+    deck: str | Path,
+    renderer: Optional[Renderer] = None,
+    slides: Optional[list[int]] = None,
+) -> SlideImages:
     """Render a deck to PNGs in a temporary directory.
+
+    `slides` names the ones actually wanted. It is a request, not a promise:
+    a renderer free to ignore it comes back with the whole deck, and the caller
+    takes what it needs from that, so nothing downstream has to know which it
+    got.
 
     Never raises. A renderer that is missing, or that fails halfway, gives back
     an empty SlideImages carrying the reason, and the caller carries on without
@@ -194,7 +284,7 @@ def render_deck(deck: str | Path, renderer: Optional[Renderer] = None) -> SlideI
 
     directory = Path(tempfile.mkdtemp(prefix="formatting-tool-render-"))
     try:
-        images = renderer.render(deck, directory)
+        images = _rendered(renderer, deck, directory, slides)
     except Exception as exc:
         shutil.rmtree(directory, ignore_errors=True)
         log.warning("could not render %s: %s", deck.name, exc)

@@ -26,7 +26,7 @@ from formatting_tool.models import (
     SlideProfile,
 )
 from formatting_tool.rules import RuleContext
-from formatting_tool.rules.space import AlignmentGridRule
+from formatting_tool.rules.space import DECLARED_GRID, AlignmentGridRule
 
 CANVAS_W, CANVAS_H = 13.333, 7.5
 
@@ -228,3 +228,78 @@ def test_the_deck_level_finding_lists_its_slides_as_ranges() -> None:
 
     assert len(issues) == 1
     assert "1-3, 7" in issues[0].found
+
+
+# --------------------------------------------------------------------------- #
+# Shapes with no copy in them
+# --------------------------------------------------------------------------- #
+#
+# The rule reads copy, and skipping empty shapes is right for the dividers,
+# rules and background panels that make up most of them. It was wrong for one
+# case, and it is the case that matters: on a real deck a pill in a table had
+# drifted off its column, and the pill is empty because its label is a separate
+# text box that stayed where it belonged. The shape carrying the defect was the
+# one with no text in it, so this rule never looked at it.
+
+
+def test_an_empty_member_of_a_series_is_measured() -> None:
+    """Three pills of one size, one off the declared column by 0.08in.
+
+    Series membership stands in for copy: furniture drawn once and duplicated
+    exists in order to line up.
+    """
+    shapes = [
+        _shape("Pill 0", 6.75, 2.0),
+        _shape("Pill 1", 6.75, 3.0),
+        _shape("Pill 2", 6.83, 4.0),
+    ]
+    issues = list(AlignmentGridRule().check(_ctx(shapes, [_two_column_layout()])))
+
+    assert len(issues) == 1
+    assert issues[0].shape == "Pill 2"
+    assert issues[0].expected == "left 6.75in"
+
+
+def test_a_lone_empty_shape_is_still_left_alone() -> None:
+    """The opening is narrow on purpose. One empty box off a column is a
+    divider or a panel, and holding those to the text grid reported the
+    furniture on every slide."""
+    issues = list(
+        AlignmentGridRule().check(_ctx([_shape("Panel", 6.83, 2.0)],
+                                       [_two_column_layout()]))
+    )
+
+    assert issues == []
+
+
+def test_decoration_does_not_get_a_vote_on_where_the_columns_are() -> None:
+    """Measured against the grid, never counted into it. An inferred grid line
+    comes from copy alone, because letting decoration declare columns would
+    invent lines rather than measure against them."""
+    shapes = (
+        [_shape(f"Pill {n}", 3.21, 1.0 + n * 0.5) for n in range(5)]
+        + [_shape(f"Line {n}", 1.75, 4.0 + n * 0.5, text="copy") for n in range(4)]
+    )
+    # An unmarked master declares nothing, so the grid can only be inferred.
+    grid, source = AlignmentGridRule._grid(
+        _ctx(shapes, [_two_column_layout(ps=False)]), False
+    )
+
+    assert source != DECLARED_GRID
+    assert 1.75 in grid          # four shapes of copy: a column
+    assert 3.21 not in grid      # five identical pills: not a column
+
+
+def test_a_series_wholly_off_the_column_has_a_column_of_its_own() -> None:
+    """The condition that keeps the opening from becoming a nuisance.
+
+    Admitting every empty series member put twenty-eight further findings on
+    one real deck, and turned per-shape findings into deck-level ones: enough
+    decoration crossed `grid_support` in a single miss bucket that a shape a
+    designer could have selected became a sentence about the deck. A majority
+    of the set has to be ON the line before its odd member is judged by it.
+    """
+    shapes = [_shape(f"Pill {n}", 6.83, 2.0 + n) for n in range(3)]
+    issues = list(AlignmentGridRule().check(_ctx(shapes, [_two_column_layout()])))
+
+    assert issues == []

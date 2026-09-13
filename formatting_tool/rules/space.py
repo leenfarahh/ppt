@@ -742,7 +742,11 @@ class CrowdedSeriesRule(Rule):
         for slide in ctx.deck.slides:
             if slide.hidden:
                 continue
-            for series in _series_of(slide, ctx.tuning.repeat_min_members):
+            for series in _series_of(
+                slide,
+                ctx.tuning.repeat_min_members,
+                ctx.spec.tolerances.position_in,
+            ):
                 finding = self._crowded(ctx, slide, series, floor)
                 if finding is not None:
                     yield finding
@@ -821,6 +825,17 @@ class Matrix:
     def cells(self) -> list:
         return [cell for row in self.rows for cell in row]
 
+    @property
+    def body(self) -> list:
+        """The first row with cells side by side in it.
+
+        A heading drawn as one band across the component is a single cell, so
+        it has no horizontal gutter of its own and cannot say how many columns
+        the component has. Everything that reads ACROSS a component reads this
+        row instead of `rows[0]`, which may be that band.
+        """
+        return _body_of(self.rows)
+
 
 def matrix_components(cells: list, tolerance: float) -> list:
     """Every matrix among these cells.
@@ -835,24 +850,115 @@ def matrix_components(cells: list, tolerance: float) -> list:
     sharing a column signature -- the same left edges and widths, which is
     what makes a set of rows one object rather than several.
     """
-    signatures: dict = {}
-    for row in _rows_of(_outermost(cells), tolerance):
-        for run in _contiguous_runs(row):
-            key = tuple((round(c.left_in, 2), round(c.width_in, 2)) for c in run)
-            signatures.setdefault(key, []).append(run)
+    kept = _outermost(cells)
+    runs = [
+        run for row in _rows_of(kept, tolerance) for run in _contiguous_runs(row)
+    ]
+    taken = {id(cell) for run in runs for cell in run}
+    bands = [cell for cell in kept if id(cell) not in taken]
 
     found = []
-    for runs in signatures.values():
-        if len(runs) < 2:
+    for group in _same_columns(runs, tolerance):
+        if len(group) < 2:
             continue
-        runs.sort(key=lambda row: min(c.top_in for c in row))
-        across = [b.left_in - a.right_in for a, b in zip(runs[0], runs[0][1:])]
+        group.sort(key=lambda row: min(c.top_in for c in row))
+        rows = _with_heading(group, bands, tolerance)
+        body = _body_of(rows)
+        across = [b.left_in - a.right_in for a, b in zip(body, body[1:])]
         down = [
             min(c.top_in for c in lower) - max(c.bottom_in for c in upper)
-            for upper, lower in zip(runs, runs[1:])
+            for upper, lower in zip(rows, rows[1:])
         ]
-        found.append(Matrix(rows=runs, across=across, down=down))
+        found.append(Matrix(rows=rows, across=across, down=down))
     return found
+
+
+def _body_of(rows: list) -> list:
+    """The first row of a component that has cells side by side in it.
+
+    One function rather than one in `matrix_components` and one on `Matrix`,
+    for the reason that function's own docstring gives about the rule and the
+    fixer: two places working out the same thing for themselves is how they
+    come to disagree about it.
+    """
+    return next((row for row in rows if len(row) >= 2), rows[0])
+
+
+def _same_columns(runs: list, tolerance: float) -> list:
+    """Runs grouped by the column signature they share.
+
+    Matched within the tool's own position tolerance rather than rounded to a
+    hundredth of an inch. Rounding is a bucket and the edge of a bucket falls
+    in the middle of live data: a heading drawn 0.004in wider than the body it
+    sits over rounds to a different signature, leaves the component, and the
+    row count changes with nothing else about the deck different. That is why
+    a component came out four rows on one deck and three on the next, and why
+    the two halves of one slide -- the same component drawn twice -- could
+    disagree about their own size.
+
+    It is also the tolerance this function is HANDED and, until now, applied
+    only to grouping cells into rows. The comparison that decided what a
+    matrix is ignored it.
+
+    Anchored on each group's first run rather than chained through its last,
+    so however many rows join, the group's spread stays inside one tolerance.
+    """
+    groups: list[list] = []
+    for run in runs:
+        for group in groups:
+            if _same_signature(group[0], run, tolerance):
+                group.append(run)
+                break
+        else:
+            groups.append([run])
+    return groups
+
+
+def _same_signature(a: list, b: list, tolerance: float) -> bool:
+    """Two runs with the same columns: same count, same lefts, same widths."""
+    return len(a) == len(b) and all(
+        abs(one.left_in - other.left_in) <= tolerance
+        and abs(one.width_in - other.width_in) <= tolerance
+        for one, other in zip(a, b)
+    )
+
+
+def _with_heading(rows: list, bands: list, tolerance: float) -> list:
+    """The component's rows, with the heading band above them if it belongs.
+
+    A table heading is routinely drawn as one bar across the whole component
+    with its labels sitting on top of it. `_outermost` correctly reads those
+    labels as content inside the bar, which leaves the heading a single cell,
+    and a single cell is not a row -- so the heading dropped out and the
+    component reported one row fewer than the table has.
+
+    It is admitted only when it is spaced like the component it sits on: the
+    gap above the top row has to sit within the slack of the gutters the rows
+    already keep between themselves. That is the test that makes this safe to
+    add. A bar that spans the component but is spaced differently is a
+    heading with its own spacing, and folding it in would make `down` uneven
+    and silence `space.matrix_gutter` on a component it used to report.
+    """
+    left = min(cell.left_in for cell in rows[0])
+    right = max(cell.right_in for cell in rows[0])
+    top = min(cell.top_in for cell in rows[0])
+    down = [
+        min(c.top_in for c in lower) - max(c.bottom_in for c in upper)
+        for upper, lower in zip(rows, rows[1:])
+    ]
+
+    for band in bands:
+        if (abs(band.left_in - left) > tolerance
+                or abs(band.right_in - right) > tolerance):
+            continue
+        gap = top - band.bottom_in
+        if gap <= 0:
+            continue
+        spread = down + [gap]
+        if max(spread) - min(spread) > _EVEN_SLACK_IN:
+            continue
+        return [[band]] + rows
+    return rows
 
 
 def _rows_of(cells: list, tolerance: float) -> list:
@@ -998,7 +1104,7 @@ class MatrixGutterRule(Rule):
         if anchor is None:
             return None
         return self.issue(
-            f"This {len(matrix.rows)}x{len(matrix.rows[0])} component is "
+            f"This {len(matrix.rows)}x{len(matrix.body)} component is "
             f"{wide:.2f}in apart across and {tall:.2f}in down, so it reads as "
             "two spacings where it was drawn as one.",
             slide=slide,
@@ -1084,7 +1190,11 @@ class UnevenSeriesRule(Rule):
         for slide in ctx.deck.slides:
             if slide.hidden:
                 continue
-            for series in _series_of(slide, ctx.tuning.repeat_min_members):
+            for series in _series_of(
+                slide,
+                ctx.tuning.repeat_min_members,
+                ctx.spec.tolerances.position_in,
+            ):
                 finding = self._uneven(ctx, slide, series)
                 if finding is not None:
                     yield finding
@@ -1168,7 +1278,9 @@ def _usable_width(ctx: RuleContext) -> Optional[tuple[float, float]]:
 def _crowded_members(ctx: RuleContext, slide, floor: float) -> set:
     """Shape ids belonging to a row that `space.series_crowded` will report."""
     found: set = set()
-    for series in _series_of(slide, ctx.tuning.repeat_min_members):
+    for series in _series_of(
+        slide, ctx.tuning.repeat_min_members, ctx.spec.tolerances.position_in
+    ):
         ordered = sorted(series, key=lambda s: s.geometry.left_in)
         if not _is_a_row(ordered, ctx.spec.tolerances.position_in):
             continue
@@ -1211,9 +1323,11 @@ class AlignmentGridRule(Rule):
         if not grid:
             return
 
+        repeated = _repeated_ids(ctx, grid, trailing)
         misses: dict[tuple, list] = {}
         for slide, shape in ctx.shapes():
-            if not shape.text.strip():
+            if (not shape.text.strip()
+                    and (slide.number, shape.shape_id) not in repeated):
                 continue
             left = _leading_edge(shape, trailing)
             nearest = min(grid, key=lambda edge: abs(edge - left))
@@ -1684,6 +1798,60 @@ def _paragraph_size_pt(paragraph) -> float:
     """The largest size stated in a paragraph, which sets its line box."""
     sizes = [run.size_pt for run in paragraph.runs if run.size_pt]
     return max(sizes) if sizes else _DEFAULT_PT
+
+
+def _repeated_ids(ctx: RuleContext, grid: list, trailing: bool) -> set:
+    """(slide number, shape id) for members of a series that follows the grid.
+
+    `space.alignment_grid` reads copy: a shape with no text carries nothing
+    that has to sit on a column, and skipping those is right for the dividers,
+    rules and background panels that make up most of the empty shapes on a
+    slide.
+
+    It is wrong for a member of a series. Five pills drawn once and duplicated
+    are furniture whose entire purpose is to line up, and on a real deck the
+    pill that did not line up was invisible to this rule for the worst
+    possible reason: the label that would have carried it is a separate text
+    box, and that box stayed where it belonged when the pill moved. The shape
+    with the defect was the one with no text in it.
+
+    THE SET HAS TO FOLLOW THE GRID BEFORE ITS ODD MEMBER IS JUDGED BY IT, and
+    that condition is the whole difference between a rule and a nuisance.
+    Admitting every empty series member put twenty-eight further findings on
+    one real deck and, worse, turned per-shape findings into deck-level ones:
+    enough decoration piled into a single miss bucket to cross `grid_support`,
+    so a shape a designer could have selected and nudged became a sentence
+    about the deck. This rule's own docstring has the reason -- a report
+    nobody reads to the end is the same as no report.
+
+    A majority on a line is what says the set was drawn to that line. Where
+    the whole set sits off it, the set has a column of its own and this rule
+    has nothing to say about it; where the whole set sits on it, there is no
+    defect to find.
+
+    None of this reaches the grid INFERENCE below, which stays on text alone.
+    Letting decoration vote on where the deck's columns are would invent lines
+    rather than measure against them.
+    """
+    tolerance = ctx.spec.tolerances.position_in
+    found: set = set()
+    for slide in ctx.deck.slides:
+        if slide.hidden:
+            continue
+        for series in _series_of(
+            slide, ctx.tuning.repeat_min_members, tolerance
+        ):
+            on_grid = sum(
+                1 for shape in series
+                if min(abs(edge - _leading_edge(shape, trailing))
+                       for edge in grid) <= tolerance
+            )
+            if on_grid == len(series):
+                continue        # the whole set is on the line: nothing to find
+            if on_grid < ctx.tuning.majority_fraction * len(series):
+                continue        # the set has a column of its own
+            found.update((slide.number, shape.shape_id) for shape in series)
+    return found
 
 
 def _leading_edge(shape, trailing: bool) -> float:

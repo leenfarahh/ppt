@@ -261,6 +261,35 @@ details.advanced[open] summary::before { content: "\2212  "; }
 @keyframes found { from { background: var(--tint); } to { background: transparent; } }
 .applied-list li.found { animation: found 1.6s ease-out; }
 .applied a.dl { font-size: 12px; }
+/* The take-back. Quiet enough that it is not competing with the change it
+   sits beside, close enough that it is obviously about that one line. */
+.applied-list .take, .slide-changes .take {
+  padding: 1px 9px; font-size: 11.5px; margin-left: 8px; vertical-align: 1px;
+}
+.undone { margin-top: 12px; padding-top: 10px; border-top: 1px dashed var(--line); }
+.undone .note { color: var(--faint); font-size: 11.5px; margin: 6px 0 0; }
+.undone-list li { color: var(--faint); }
+.slide-changes.held { color: var(--faint); font-size: 11.5px; margin: 6px 0 0; }
+.undo-note { color: var(--blocker); margin-left: 6px; }
+/* Clusters: one fold per kind of change, so forty lines read as six groups. */
+.clusters { margin-top: 8px; }
+.cluster { margin: 4px 0; }
+.cluster > summary {
+  cursor: pointer; font-size: 12.5px; padding: 3px 0; color: var(--ink);
+}
+.cluster > summary::marker { color: var(--faint); }
+.cluster > .applied-list { margin-top: 4px; }
+/* The bar over a pair of renders: which slide, and the way to render it again. */
+.slide-bar {
+  display: flex; align-items: center; gap: 10px;
+  font-size: 12.5px; margin: 14px 0 6px;
+}
+.undone-list .tag {
+  display: inline-block; margin-right: 6px; padding: 1px 7px;
+  border: 1px solid var(--line-strong); border-radius: 20px;
+  font-size: 10.5px; letter-spacing: 0.04em; text-transform: uppercase;
+  color: var(--muted);
+}
 
 .preview { margin: 18px 0; }
 .shots { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 12px; }
@@ -505,6 +534,20 @@ const state = {
   // back to the length rule in `slideListOpen`.
   slideOpen: {},
   highlight: true,     // draw the boxes over the before/after renders
+  // Slides to keep in the preview even though nothing on them changed any
+  // more. A slide whose only change has been undone would otherwise drop out
+  // of the renders at the exact moment the designer is looking at it to check
+  // the undo landed, so the slides an undo touched are held here and asked for
+  // by name on every later render.
+  heldSlides: [],
+  // What each undone change actually DID, kept from the run that made it.
+  // The server cannot say: on the run that holds a change back, the change was
+  // never made, so there is no outcome to describe. The page had it a moment
+  // ago, which is the only place it exists.
+  undoneDetails: {},
+  // Which clusters of changes are folded open, by key. Absent means the
+  // length rule in `clusterOpen` decides.
+  clusters: {},
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -869,37 +912,158 @@ function applyBarHTML(issues) {
   </section>`;
 }
 
+/* What a rule is about, for grouping a long list of changes.
+ *
+ * Read off the rule id's first segment, which is the only classification the
+ * findings already agree on -- `space.alignment_grid`, `color.text.off_palette`
+ * -- so nothing here has to be kept in step with the rule list by hand. A rule
+ * in a family nobody has named yet lands in "Other" rather than being dropped.
+ *
+ * The order is the report's own: structure, then brand, then polish. A
+ * designer scanning forty changes is looking for a kind of change, and the
+ * kinds arrive in the order the report argues them. */
+const CLUSTERS = [
+  ["layout", "Layout"],
+  ["title", "Titles"],
+  ["subtitle", "Titles"],
+  ["logo", "Logo"],
+  ["font", "Typefaces"],
+  ["color", "Colour"],
+  ["space", "Position and spacing"],
+  ["table", "Tables"],
+  ["typography", "Typography"],
+  ["production_note", "Production notes"],
+];
+
+function clusterOf(ruleId) {
+  const family = String(ruleId || "").split(".")[0];
+  const found = CLUSTERS.find(([key]) => key === family);
+  return found ? found[1] : "Other";
+}
+
+/* Folded open unless the group is long enough to be in the way. A designer
+ * who has folded one keeps it folded: an explicit choice outlives the rule. */
+function clusterOpen(label, count) {
+  if (label in state.clusters) return state.clusters[label];
+  return count <= 8;
+}
+
+function clusterHTML(label, rows, render) {
+  const open = clusterOpen(label, rows.length);
+  return `<details class="cluster" data-cluster="${esc(label)}"
+    ${open ? "open" : ""}>
+    <summary>${esc(label)} <span class="meta">&middot; ${rows.length}
+      change${rows.length === 1 ? "" : "s"}</span></summary>
+    <ul class="applied-list">${rows.map(render).join("")}</ul>
+  </details>`;
+}
+
 function appliedHTML() {
   const r = state.applied;
   if (!r) return "";
   // The same numbering the boxes on the renders carry, so a box and its line
   // are one thing addressed two ways. Numbered rows get an id to jump to.
-  const rows = changeRows().map((a) => `<li
+  const row = (a) => `<li
     ${a.n === null ? "" : `id="chg-${markKey(a)}"`} class="numbered">
     <span class="num">${a.n}</span>
     ${a.slide ? `slide ${a.slide}` : "deck"}${a.shape ? ` &middot; ${esc(a.shape)}` : ""}
     &mdash; ${esc(a.detail)}${a.round === 2
       ? ` <span class="meta">(second pass)</span>` : ""}
-    <code>${esc(a.id)}</code></li>`).join("");
+    <code>${esc(a.id)}</code>${undoButton(a.id)}</li>`;
   // Not numbered: nothing was changed, so there is nothing on a render to
   // point at.
-  const skipped = r.skipped.map((a) => `<li class="dim"><code>${esc(a.id)}</code>
-    ${esc(a.detail)}</li>`).join("");
+  const skippedRow = (a) => `<li class="dim"><code>${esc(a.id)}</code>
+    ${esc(a.detail)}</li>`;
+
+  const groups = new Map();
+  for (const change of changeRows()) {
+    const label = clusterOf(change.rule_id);
+    if (!groups.has(label)) groups.set(label, []);
+    groups.get(label).push(change);
+  }
+  const order = [...new Set([...CLUSTERS.map(([, label]) => label), "Other"])];
+  const clusters = order
+    .filter((label) => groups.has(label))
+    .map((label) => clusterHTML(label, groups.get(label), row))
+    .join("");
+  const skipped = r.skipped.length
+    ? clusterHTML("Skipped, needs a designer", r.skipped, skippedRow)
+    : "";
+
   const n = changeRows().length + r.skipped.length;
   return `<section class="applied">
     <div class="applied-head">
       <b>${r.applied.length} fix${r.applied.length === 1 ? "" : "es"} applied</b>
       ${r.skipped.length ? `<span class="meta">&middot; ${r.skipped.length} skipped</span>` : ""}
       ${r.rebuilt ? `<span class="meta">&middot; rebuilt onto the master</span>` : ""}
+      ${(r.undone || []).length ? `<span class="meta">&middot;
+        ${r.undone.length} undone</span>` : ""}
       <span class="grow"></span>
       <button class="linkish" id="do-preview">Render before / after</button>
       <a class="dl" href="${esc(r.download)}" download>Download the corrected deck</a>
     </div>
     <details class="runlog changes" ${state.changesOpen ? "open" : ""}>
       <summary>${n} change${n === 1 ? "" : "s"} in detail</summary>
-      <ul class="applied-list">${rows}${skipped}</ul>
+      <div class="clusters">${clusters}${skipped}</div>
     </details>
+    ${undoneHTML()}
   </section>`;
+}
+
+/* What has been taken back, and the way back to it.
+ *
+ * Listed rather than simply gone, for the reason the skipped fixes are: a
+ * change that vanishes from the page without trace reads as a change that was
+ * never offered. This says it was made, taken back, and can be had again.
+ *
+ * The wording is deliberate about what an undo does to the FILE. The deck is
+ * written again from the upload without these, so the download is not the
+ * corrected file with one shape dragged back; it is the file the run would
+ * have produced if the change had never been ticked, and everything else on
+ * it is untouched. */
+/* The Undo beside one change, or nothing when the change has no id.
+ *
+ * A change with no id cannot be addressed, and a button that cannot be
+ * addressed does nothing when it is pressed -- which is indistinguishable, to
+ * whoever pressed it, from a broken feature. Better to not offer it. */
+function undoButton(id) {
+  if (!id) return "";
+  return `<button class="linkish take" data-undo="${esc(id)}">Undo</button>`;
+}
+
+function undoneHTML() {
+  const held = (state.applied && state.applied.undone) || [];
+  if (!held.length) return "";
+  return `<div class="undone">
+    <b>${held.length} change${held.length === 1 ? "" : "s"} held back</b>
+    <ul class="applied-list undone-list">
+      ${held.map((u) => {
+        const was = state.undoneDetails[u.id];
+        // What the change DID, in the words it was described in when it was
+        // made. The finding's message -- "this image starts at the 0.92in
+        // column" -- says what was wrong; a designer taking a change back is
+        // asking what was done about it, and those are different sentences.
+        const what = was && was.detail
+          ? esc(was.detail)
+          : (u.message ? esc(u.message) : "this change");
+        const where = (was && was.slide) || u.slide;
+        const shape = (was && was.shape) || u.shape;
+        return `<li>
+          <span class="tag">Undone</span>
+          ${where ? `slide ${where}` : "deck"}${shape
+            ? ` &middot; ${esc(shape)}` : ""} &mdash; ${what}
+          ${was && was.round === 2
+            ? `<span class="meta">(second pass)</span>` : ""}
+          ${u.unknown ? `<span class="meta">(no finding with this id in the
+            current report)</span>` : ""}
+          <code>${esc(u.id)}</code>
+          <button class="linkish take" data-redo="${esc(u.id)}">Restore</button>
+        </li>`;
+      }).join("")}
+    </ul>
+    <p class="note">The deck was written again from your upload without these,
+      so every other fix is exactly as it was.</p>
+  </div>`;
 }
 
 function previewHTML() {
@@ -929,6 +1093,13 @@ function previewHTML() {
       const mine = marks.get(s.slide) || [];
       return `
       <div class="slide-block">
+        <div class="slide-bar">
+          <b>Slide ${s.slide}</b>
+          <span class="grow"></span>
+          <button class="linkish take" data-rerender="${s.slide}"
+            title="Render this slide again, ignoring what is cached"
+            >Re-render</button>
+        </div>
         <div class="shots">
           <div class="shot"><span>Slide ${s.slide} &mdash; before</span>
             ${shotHTML(s.before, s.slide, "before", mine, false)}</div>
@@ -1075,9 +1246,17 @@ function slideListOpen(slide, count) {
 }
 
 function slideChangesHTML(slide, marks) {
+  const held = ((state.applied && state.applied.undone) || [])
+    .filter((u) => u.slide === slide);
+  const heldLine = held.length
+    ? `<p class="slide-changes held">${held.length}
+       change${held.length === 1 ? "" : "s"} on this slide
+       ${held.length === 1 ? "was" : "were"} undone, so the after render shows
+       the slide without ${held.length === 1 ? "it" : "them"}.</p>`
+    : "";
   if (!marks.length) {
-    return `<p class="slide-changes empty">Nothing on this slide changed.
-      It is shown for context.</p>`;
+    return `${heldLine}<p class="slide-changes empty">Nothing on this slide
+      changed. It is shown for context.</p>`;
   }
   const off = marks.filter((m) => m.n === null).length;
   return `<details class="slide-fold" data-slide="${slide}"
@@ -1094,8 +1273,9 @@ function slideChangesHTML(slide, marks) {
         : `<span class="num">${m.n}</span>`}
       ${m.shape ? `<b>${esc(m.shape)}</b> &mdash; ` : ""}${esc(m.detail)}
       ${m.round === 2 ? `<span class="meta">(second pass)</span>` : ""}
+      ${undoButton(m.id)}
     </li>`).join("")}
-  </ul></details>`;
+  </ul></details>${heldLine}`;
 }
 
 /* One box per rectangle, carrying every change that landed on it.
@@ -1186,6 +1366,7 @@ async function applyTicked() {
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || "the apply failed");
     state.applied = data;
+    state.heldSlides = [];   // a fresh run; nothing is held back on it
     state.preview = null;   // the deck changed; any earlier shots are stale
     render();
   } catch (err) {
@@ -1195,27 +1376,293 @@ async function applyTicked() {
   }
 }
 
-async function loadPreview() {
-  if (state.busy || !state.session) return;
+/* Take one change back, or put one back on.
+ *
+ * One id at a time, because that is how a designer reads a list of changes:
+ * this one, not that one. They accumulate on the server, so taking back a
+ * second change keeps the first one taken back.
+ *
+ * The renders are dropped, not kept: the file has just been written again, so
+ * every "after" shot on the page is of a deck that no longer exists. Leaving
+ * them up would be showing a change that has been undone as though it were
+ * still there, which is the one thing this feature must not do. */
+async function undoChange(id, restore = false, button = null) {
+  // Each of these used to be a silent return, and a silent return is the one
+  // outcome a button must never have: the designer presses it, nothing moves,
+  // and there is nothing on the page to say why.
+  if (!state.session || !id) {
+    return note(button, "this change carries no id, so there is nothing to "
+      + "address the undo to. Re-run the check.");
+  }
+  if (state.busy) {
+    return note(button, "something else is still running; try again in a moment");
+  }
+  // Where this change was, before the run that is about to happen forgets it.
+  // After the undo it is on neither list: not in the changes, because it was
+  // not made, and not necessarily nameable from the report either.
+  const change = changeOf(id);
+  const slide = (change && change.slide) || heldSlideOf(id);
+  // Only re-render if renders are on screen. Rendering drives PowerPoint and
+  // costs seconds; starting one because a designer pressed Undo on a page
+  // that is showing no pictures would be spending that for nothing.
+  const refresh = !!state.preview;
+  state.busy = true;
+  for (const button of document.querySelectorAll(
+    `[data-undo="${CSS.escape(id)}"], [data-redo="${CSS.escape(id)}"]`
+  )) {
+    button.disabled = true;
+    button.textContent = restore ? "Restoring..." : "Undoing...";
+  }
+  // An undo is a whole run of the fixes on the original deck -- see
+  // `apply_fixes(undone=...)` -- so on a large deck it takes as long as the
+  // apply did. The same ticking counter the check uses, because a number
+  // going up is the difference between waiting and wondering.
+  const stopTicking = startTicking(
+    restore ? "Putting the change back" : "Writing the deck again without it"
+  );
+  try {
+    const res = await fetch("/api/undo", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session: state.session,
+        undo: restore ? [] : [id],
+        redo: restore ? [id] : [],
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "the undo failed");
+    stopTicking();
+    if (restore) {
+      delete state.undoneDetails[id];
+    } else if (change) {
+      // Kept because the next payload cannot carry it: on the run that holds
+      // this back, the change is not made and so has no outcome to describe.
+      state.undoneDetails[id] = {
+        slide: change.slide, shape: change.shape,
+        detail: change.detail, round: change.round,
+      };
+    }
+    state.applied = data;
+    if (slide && !state.heldSlides.includes(slide)) state.heldSlides.push(slide);
+    // The shots on screen are of a file that has just been written again, so
+    // they are stale whether or not they are replaced. Dropping them is what
+    // makes the re-render below honest rather than a redraw of old pictures.
+    state.preview = null;
+    render();
+    setStatus(undidLine(change, id, restore));
+  } catch (err) {
+    stopTicking();
+    // A page served by a server started before undo existed gets "no route
+    // for /api/undo", which is true and unhelpful. Say what to do about it.
+    const message = /no route/i.test(err.message)
+      ? `this page is talking to a server started before Undo existed. Restart
+         it: python -m formatting_tool ui --reload`
+      : err.message;
+    setStatus(`<b>Could not undo.</b> ${esc(message)}`, "bad");
+    note(button, message);
+    state.busy = false;
+    return;
+  }
+  state.busy = false;
+  // Straight back to the pictures, on the slide the change was on. A designer
+  // undoing something is asking what the slide looks like without it, and
+  // making them press Render again to find out is making them ask twice.
+  if (refresh) {
+    const stopRendering = startTicking(
+      `Re-rendering ${slide ? `slide ${slide}` : "the deck"}`
+    );
+    const ok = await loadPreview();
+    stopRendering();
+    // Back to naming the change, not the rendering: the rendering is over and
+    // the thing the designer wants to see said is which edit went. Unless the
+    // render failed, in which case its message is the one to leave up -- the
+    // undo itself landed, and saying so over the failure would hide it.
+    if (ok) setStatus(undidLine(change, id, restore));
+  }
+}
+
+/* Say why a button did nothing, where the button is.
+ *
+ * The status line lives at the top of the page and the changes are hundreds
+ * of pixels below it, so a failure reported only up there is a failure the
+ * designer never sees: from where they are standing the button simply did
+ * nothing. */
+function note(button, message) {
+  if (!button) return;
+  button.disabled = false;
+  button.textContent = "Undo";
+  const existing = button.parentElement.querySelector(".undo-note");
+  if (existing) existing.remove();
+  const said = document.createElement("span");
+  said.className = "meta undo-note";
+  said.textContent = ` ${message}`;
+  button.insertAdjacentElement("afterend", said);
+}
+
+/* Undo is delegated from the document, not bound when a section is drawn.
+ *
+ * Binding it per render is what made the Undo under a slide stop working:
+ * `wirePreview` redraws the preview on its own and re-binds only itself, on
+ * purpose -- a full re-wire would bind a second listener to every checkbox
+ * still on the page -- so the buttons inside it came back with no listener at
+ * all. Delegation has no such failure: the listener is on the document, and
+ * whatever draws a button, the button works. */
+document.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-undo], [data-redo], [data-rerender]");
+  if (!button) return;
+  if (button.dataset.rerender) {
+    rerenderSlide(button.dataset.rerender, button);
+    return;
+  }
+  const undo = button.dataset.undo;
+  undoChange(undo || button.dataset.redo, !undo, button);
+});
+
+/* The main Render button: the same call, with a counter running.
+ *
+ * Rendering drives PowerPoint, which is seconds on a small deck and longer on
+ * a large one, and a button that says "Rendering..." and nothing else is
+ * indistinguishable from a button that has stopped working -- which is exactly
+ * how it was read after a run that ended in silence.
+ */
+async function renderPreview() {
+  const wanted = new Set((state.applied?.applied || [])
+    .map((a) => a.slide).filter(Boolean));
+  for (const slide of state.heldSlides) wanted.add(slide);
+  const count = wanted.size;
+  const stopTicking = startTicking(
+    `Rendering ${count || "the"} slide${count === 1 ? "" : "s"} in PowerPoint`
+  );
+  const ok = await loadPreview();
+  stopTicking();
+  if (ok) setStatus("");
+}
+
+/* Render one slide again, whatever is cached for it.
+ *
+ * The cache is right nearly always: the upload never changes, and a run that
+ * writes the corrected deck drops the after images itself. "Nearly always" is
+ * not something a designer can check from the outside, though, and the renders
+ * are what they accept the result on -- so there is a way to say render this
+ * one again, now, and watch it happen. */
+async function rerenderSlide(slide, button) {
+  if (!state.session || !slide) return;
+  if (state.busy) {
+    return note(button, "something else is still running; try again in a moment");
+  }
+  if (button) { button.disabled = true; button.textContent = "Rendering..."; }
+  const stopTicking = startTicking(`Rendering slide ${slide} again`);
+  const ok = await loadPreview([Number(slide)]);
+  stopTicking();
+  if (ok) setStatus("");
+}
+
+/* The change this id names, while it is still one.
+ *
+ * Read before the undo, because afterwards there is nothing to read: the run
+ * that holds a change back never makes it, so it has no outcome and no detail.
+ * What it did is only knowable from the run that did it. */
+function changeOf(id) {
+  return changeRows().find((row) => row.id === id) || null;
+}
+
+/* The slide an already held-back change was on. */
+function heldSlideOf(id) {
+  const held = ((state.applied && state.applied.undone) || [])
+    .find((u) => u.id === id);
+  if (held && held.slide) return held.slide;
+  const remembered = state.undoneDetails[id];
+  return (remembered && remembered.slide) || null;
+}
+
+/* One line naming the change that was just taken back or put back.
+ *
+ * "Undone" on its own is the message a designer cannot act on: with forty
+ * changes on the page and several of them on one slide, which one went is the
+ * whole question. */
+function undidLine(change, id, restore) {
+  const was = change || state.undoneDetails[id];
+  const where = was && was.slide ? `slide ${was.slide}` : "the deck";
+  const shape = was && was.shape ? ` &middot; ${esc(was.shape)}` : "";
+  const what = was && was.detail ? ` &mdash; ${esc(was.detail)}` : "";
+  return `<b>${restore ? "Restored" : "Undone"}.</b> ${where}${shape}${what}`;
+}
+
+// How long the page waits for a render before it stops believing in it. The
+// server gives PowerPoint five minutes; this is that plus a little, so the
+// message a designer sees is the server's ("PowerPoint did not answer") rather
+// than this one, whenever the server is alive to send it.
+const RENDER_WAIT_MS = 330000;
+
+async function loadPreview(force = []) {
+  if (state.busy || !state.session) return false;
   state.busy = true;
   const button = $("#do-preview");
   if (button) { button.disabled = true; button.textContent = "Rendering..."; }
+  const abort = new AbortController();
+  const giveUp = setTimeout(() => abort.abort(), RENDER_WAIT_MS);
   try {
-    const slides = [...new Set((state.applied?.applied || [])
-      .map((a) => a.slide).filter(Boolean))];
+    // The slides something changed on, plus the ones an undo emptied. Both,
+    // because a slide that has just been put back is the one a designer is
+    // checking, and asking only for slides with changes on them would leave
+    // exactly that slide unrendered.
+    const slides = [...new Set([
+      ...(state.applied?.applied || []).map((a) => a.slide),
+      ...state.heldSlides,
+    ].filter(Boolean))];
     const res = await fetch("/api/preview", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ session: state.session, slides }),
+      // `force` names slides to render again whatever is cached for them, and
+      // they have to be in `slides` too or the answer will not include them.
+      body: JSON.stringify({
+        session: state.session,
+        slides: [...new Set([...slides, ...force])],
+        force,
+      }),
+      signal: abort.signal,
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || "the render failed");
     state.preview = data;
     render();
+    return true;
   } catch (err) {
-    setStatus(`<b>Could not render.</b> ${esc(err.message)}`, "bad");
+    // Three failures read the same from here -- the server died, the request
+    // was abandoned, PowerPoint wedged -- and only the first needs saying,
+    // because it is the one where the answer is "start it again".
+    const message = err.name === "AbortError"
+      ? `no answer in ${Math.round(RENDER_WAIT_MS / 1000)}s. PowerPoint may be
+         showing a dialog, or the server may have stopped`
+      : /fetch|network|load failed/i.test(err.message)
+        ? "the server did not answer. Is it still running in the terminal?"
+        : err.message;
+    setStatus(`<b>Could not render.</b> ${esc(message)}`, "bad");
+    // The button that started this is still on the page -- nothing re-rendered
+    // -- so it has to be put back by hand. A control left saying "Rendering..."
+    // forever is the failure this page keeps having: the error goes to the
+    // status line at the top and the designer, reading the changes hundreds of
+    // pixels below, sees only a button that stopped working.
+    restoreRenderButtons(message);
+    return false;
   } finally {
+    clearTimeout(giveUp);
     state.busy = false;
+  }
+}
+
+/* Put every control that starts a render back the way it was. */
+function restoreRenderButtons(message) {
+  const main = $("#do-preview");
+  if (main) {
+    main.disabled = false;
+    main.textContent = "Render before / after";
+    if (message) note(main, message);
+  }
+  for (const button of document.querySelectorAll("[data-rerender]")) {
+    button.disabled = false;
+    button.textContent = "Re-render";
   }
 }
 
@@ -1300,12 +1747,18 @@ function wireResults() {
   wireApplyBar();
 
   const preview = $("#do-preview");
-  if (preview) preview.addEventListener("click", loadPreview);
+  if (preview) preview.addEventListener("click", () => renderPreview());
 
   const changes = document.querySelector("details.changes");
   if (changes) changes.addEventListener("toggle", () => {
     state.changesOpen = changes.open;
   });
+
+  for (const cluster of document.querySelectorAll("details.cluster")) {
+    cluster.addEventListener("toggle", () => {
+      state.clusters[cluster.dataset.cluster] = cluster.open;
+    });
+  }
 
   for (const fold of document.querySelectorAll("details.slide-fold")) {
     fold.addEventListener("toggle", () => {

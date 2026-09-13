@@ -162,6 +162,12 @@ def test_only_the_hard_constraints_may_move_a_set() -> None:
     long, nudge that one on its own and the row is broken, which is a defect
     traded for a defect.
 
+    A shape leading from the left in a deck that reads from the right is the
+    third of that kind, and the same sentence decides it: a column of cards
+    placed against the English margin is ONE column in the wrong place. Move
+    the first of them alone and the column breaks, so the guard refuses every
+    one of them and the deck ships reading backwards.
+
     A grid snap is a preference, and dragging a neighbour to satisfy one is
     the failure that got `space.alignment_grid` disabled once already -- a
     section label pulled off the table it captioned, and with a set move it
@@ -169,6 +175,7 @@ def test_only_the_hard_constraints_may_move_a_set() -> None:
     """
     assert COHORT == {
         "space.safe_margin", "space.off_canvas", "space.text_collision",
+        "space.rtl_leading_edge",
     }
     assert "space.alignment_grid" not in COHORT
     assert "space.repeat_out_of_line" not in COHORT

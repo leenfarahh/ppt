@@ -348,6 +348,64 @@ class ParagraphProfile:
     runs: list[RunProfile] = field(default_factory=list)
 
 
+@dataclass
+class TableCell:
+    """One cell of a real PowerPoint table."""
+
+    row: int
+    column: int
+    text: str = ""
+    paragraphs: list[ParagraphProfile] = field(default_factory=list)
+    geometry: Optional[Geometry] = None
+    fill_hex: Optional[str] = None
+    fill_theme: Optional[str] = None
+    row_span: int = 1
+    column_span: int = 1
+    spanned: bool = False        # covered by another cell's merge
+
+    @property
+    def lines(self) -> int:
+        """Paragraphs carrying copy: the rows of text the cell shows.
+
+        Paragraphs rather than rendered lines. A heading broken with a return
+        is two paragraphs and the author put them there; a heading that wraps
+        because its column is narrow is one paragraph and a different problem,
+        owned by `space.text_overflow`. Counting rendered lines would merge the
+        two and report the column width as a heading defect.
+        """
+        return sum(1 for p in self.paragraphs if p.text.strip())
+
+
+@dataclass
+class TableProfile:
+    """A table graphic frame, as rows of cells.
+
+    Deliberately NOT on `ShapeProfile.children`. A cell is not a shape, and
+    putting cells there would send every existing rule walking through forty-two
+    boxes none of them was written for: a seven-column table would start
+    reporting margins, overlaps and grid misses on every cell it contains. A
+    rule that wants cells asks for them.
+    """
+
+    rows: int = 0
+    columns: int = 0
+    row_heights_in: list[float] = field(default_factory=list)
+    column_widths_in: list[float] = field(default_factory=list)
+    cells: list[TableCell] = field(default_factory=list)
+    # `a:tbl/a:tblPr/@firstRow`: the banding flag, which says the deck's author
+    # asked PowerPoint to style row 0 as a header. Decks set it inconsistently
+    # -- the table this was written against has a plainly styled header row and
+    # the flag off -- so it corroborates a header and never defines one.
+    first_row_header: bool = False
+
+    def row_at(self, index: int) -> list["TableCell"]:
+        """The cells of one row, left to right, merged-away cells omitted."""
+        return sorted(
+            (c for c in self.cells if c.row == index and not c.spanned),
+            key=lambda c: c.column,
+        )
+
+
 # The alt text that marks a shape as the presentation space: the area a layout
 # offers for content. Matched on the whole string, casefolded, so a shape
 # described "PS logo lockup" is not mistaken for a frame.
@@ -399,6 +457,9 @@ class ShapeProfile:
     # marks out the presentation space (see PRESENTATION_SPACE_ALT).
     alt_text: str = ""
     children: list["ShapeProfile"] = field(default_factory=list)
+    # Set only on a table graphic frame. See TableProfile for why its cells are
+    # kept out of `children`.
+    table: Optional[TableProfile] = None
 
     @property
     def placeholder_token(self) -> Optional[str]:
@@ -542,19 +603,29 @@ class DeckProfile:
 
         The threshold is a majority of the text-bearing shapes, so an English
         deck with an Arabic quotation on one slide stays an English deck.
+
+        Table cells count as well as shapes. A table's copy is not on the
+        shape that holds it, so a deck whose content is mostly tables -- which
+        a comparison-heavy Arabic deck usually is -- had almost nothing to
+        count and came back left-to-right. Everything that reads a leading
+        edge then reads the wrong one, and reports a correctly set Arabic deck
+        as clean, which is worse than reporting it wrongly.
         """
         from .script import is_rtl      # noqa: PLC0415 - avoids a cycle
 
         rtl = latin = 0
         for slide in self.slides:
             for shape in walk_shapes(slide.shapes):
-                text = shape.text.strip()
-                if not text:
-                    continue
-                if is_rtl(text):
-                    rtl += 1
-                else:
-                    latin += 1
+                texts = [shape.text]
+                if shape.table is not None:
+                    texts += [cell.text for cell in shape.table.cells]
+                for text in texts:
+                    if not text.strip():
+                        continue
+                    if is_rtl(text):
+                        rtl += 1
+                    else:
+                        latin += 1
         return rtl > latin
 
     @property

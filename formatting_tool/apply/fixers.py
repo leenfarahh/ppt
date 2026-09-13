@@ -54,6 +54,7 @@ GEOMETRIC = frozenset(
         "space.text_collision",
         "space.row_out_of_line",
         "space.satellite_offset",
+        "space.rtl_leading_edge",
         "title.position_inconsistent",
         "logo.geometry",
     }
@@ -93,8 +94,19 @@ RELATIVE = frozenset({"space.satellite_offset"})
 # copy that ran long: nudge that one down on its own and the row is broken,
 # which is a defect a client sees just as readily as the collision was. The
 # set moves or nothing does.
+#
+# `space.rtl_leading_edge` is here for the same reason and the reason is the
+# same sentence: a column of cards placed against the English margin in a deck
+# that reads from the right is ONE column in the wrong place. Moving the first
+# of them alone breaks the column, so the guard would refuse every one of them
+# and the deck would keep reading backwards.
 COHORT = frozenset(
-    {"space.safe_margin", "space.off_canvas", "space.text_collision"}
+    {
+        "space.safe_margin",
+        "space.off_canvas",
+        "space.text_collision",
+        "space.rtl_leading_edge",
+    }
 )
 
 # Whitespace that is safe to strip from the end of a paragraph. A vertical tab
@@ -429,7 +441,7 @@ def fix_matrix_gutter(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[s
     # nothing happened.
     return (
         f"re-spaced {len(matrix.cells)} cells of a "
-        f"{len(matrix.rows)}x{len(matrix.rows[0])} component onto one "
+        f"{len(matrix.rows)}x{len(matrix.body)} component onto one "
         f"{target:.3f}in gutter, moving {moved} of them; it was "
         f"{_median(matrix.across):.3f}in across and "
         f"{_median(matrix.down):.3f}in down"
@@ -895,6 +907,91 @@ def fix_row_out_of_line(shape: Any, issue: Issue, ctx: "FixContext") -> Optional
         f"moved {moved:+.2f}in onto the centre {axis} of {target:.2f}in "
         "the rest of the set shares"
     )
+
+
+def fix_table_header_alignment(
+    shape: Any, issue: Issue, ctx: "FixContext"
+) -> Optional[str]:
+    """Set a table's header row to the edge its columns start at.
+
+    The whole row, not only the cells the finding counted. A designer fixes
+    this by selecting the header and pressing one button, and a fix that
+    touched five of seven cells would leave the row in a third state that
+    nobody chose -- correct on the cells that were wrong and untouched on the
+    ones that happened to be right, which is the same row read two ways.
+
+    Which edge is not decided here. The rule measured it against the deck's
+    own direction, so it is read back off the finding: an Arabic deck sets its
+    headings flush right, and a fixer that assumed left would take a correct
+    Arabic table and break it.
+
+    Nothing moves and nothing is resized. This writes `a:pPr/@algn` on the
+    paragraphs of the header cells, so the copy stays in the cells it was in
+    and the table keeps its geometry.
+    """
+    from pptx.enum.text import PP_ALIGN  # noqa: PLC0415 - lazy, optional dep
+
+    table = _live_table(shape)
+    if table is None:
+        raise LeaveAlone(
+            "the shape this names is no longer a table; the deck has changed "
+            "since the report was made"
+        )
+
+    match = _LEADING.search(issue.expected or "")
+    if match is None:
+        return None
+    side = match.group(1).lower()
+    wanted = PP_ALIGN.RIGHT if side == "right" else PP_ALIGN.LEFT
+
+    changed = 0
+    for cell in _header_cells(table):
+        for paragraph in _safely(lambda: cell.text_frame.paragraphs) or []:
+            if not (paragraph.text or "").strip():
+                continue
+            if paragraph.alignment == wanted:
+                continue
+            paragraph.alignment = wanted
+            changed += 1
+
+    if not changed:
+        return None
+    return (
+        f"set the header row {side} aligned, changing {changed} heading "
+        f"line(s); the column a heading names starts at that edge"
+    )
+
+
+def _live_table(shape: Any) -> Any:
+    """The table on a graphic frame, or None when the shape is not one."""
+    if not _safely(lambda: shape.has_table):
+        return None
+    return _safely(lambda: shape.table)
+
+
+def _header_cells(table: Any) -> list:
+    """Row 0, with the cells another cell's merge has swallowed left out."""
+    rows = _safely(lambda: list(table.rows)) or []
+    if not rows:
+        return []
+    return [
+        cell
+        for cell in _safely(lambda: list(rows[0].cells)) or []
+        if not _safely(lambda: cell.is_spanned)
+    ]
+
+
+def _safely(getter):
+    """A getter's value, or None when python-pptx raises reaching for it."""
+    try:
+        return getter()
+    except Exception:
+        return None
+
+
+# "left aligned, as the rest of the header" -> "left". The rule decides which
+# edge leads, because only it knows which way the deck reads.
+_LEADING = re.compile(r"\b(left|right)\s+aligned\b", re.IGNORECASE)
 
 
 def fix_safe_margin(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[str]:
@@ -1712,6 +1809,114 @@ def fix_rtl_not_set(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[str
     )
 
 
+def fix_rtl_alignment(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[str]:
+    """Set the Arabic paragraphs flush right inside the box they are in.
+
+    Nothing moves and nothing is resized. This writes `a:pPr/@algn` on the
+    paragraphs the rule counted, so the copy stays in the shape it was in and
+    swaps which edge of it the lines sit against.
+
+    ONLY THE PARAGRAPHS THAT STATE "LEFT". Three other states exist and none of
+    them is this defect: a paragraph that states nothing inherits, and what a
+    right-to-left paragraph inherits is flush right; centred copy reads the
+    same either way; and justified copy justifies to whichever direction the
+    paragraph runs. Rewriting any of those would be a change nobody asked for,
+    and the centred case would be visible on the slide.
+
+    Only the Arabic ones, for the reason `typography.rtl_not_set` gives: a
+    bilingual shape holding an English heading over an Arabic body has one of
+    each, and pushing the heading to the right would be the same defect
+    pointed the other way.
+
+    Table cells are included, minus the header row, which is
+    `table.header_alignment`'s to set. Its fixer takes the whole header at
+    once; this one would take a cell at a time and leave the row in a third
+    state nobody chose.
+    """
+    from pptx.enum.text import PP_ALIGN  # noqa: PLC0415 - lazy, optional dep
+
+    changed = 0
+    for paragraph in _flush_left_rtl(shape):
+        paragraph.alignment = PP_ALIGN.RIGHT
+        changed += 1
+    if not changed:
+        return None
+    return (
+        f"set {changed} Arabic paragraph(s) right aligned, so the copy sits "
+        "against the edge the reader starts from"
+    )
+
+
+def _flush_left_rtl(shape: Any):
+    """The live paragraphs `typography.rtl_alignment` counted on this shape."""
+    from pptx.enum.text import PP_ALIGN  # noqa: PLC0415
+    from ..script import is_rtl  # noqa: PLC0415
+
+    frames = []
+    if _has_text(shape):
+        frames.append(shape.text_frame)
+    table = _live_table(shape)
+    if table is not None:
+        rows = _safely(lambda: list(table.rows)) or []
+        for index, row in enumerate(rows):
+            if index == 0:
+                continue        # the header row belongs to the other fixer
+            for cell in _safely(lambda: list(row.cells)) or []:
+                frame = _safely(lambda: cell.text_frame)
+                if frame is not None:
+                    frames.append(frame)
+
+    for frame in frames:
+        for paragraph in _safely(lambda: frame.paragraphs) or []:
+            if _safely(lambda: paragraph.alignment) != PP_ALIGN.LEFT:
+                continue
+            if not is_rtl(paragraph.text or ""):
+                continue
+            yield paragraph
+
+
+def fix_rtl_leading_edge(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[str]:
+    """Move a shape across so it leads from the edge the reader starts at.
+
+    One axis and one number: the finding names the column the shape's RIGHT
+    edge belongs on, and that column is the mirror of the one its left edge is
+    sitting on now -- a position the master draws, which the rule checked
+    before reporting. So there is nothing to decide here, which is what makes
+    this mechanical where a general "move it to the other side" would not be.
+
+    The width is read and reapplied rather than left alone: the shape keeps the
+    size it was drawn at, and only the side of the page it leads from changes.
+
+    IT MOVES AS A SET. A column of cards placed against the English margin is
+    one column in the wrong place, not four findings about four cards, and
+    moving the first of them on its own would break the column -- which is
+    exactly what the applier's alignment guard would refuse to do. The set move
+    is the answer, on the same terms as the margin and canvas fixes: a deck
+    that reads backwards is not a preference about where a shape looks best.
+
+    The cost of that, and it is worth knowing: a shape that merely happens to
+    share an edge with this one is carried too. The applier says how many it
+    took, and refuses the whole move if it would push any of them over a
+    neighbour.
+    """
+    side, target = _edge(issue.expected)
+    if side != "right" or target is None:
+        return None
+    width = shape.width or 0
+    if not width or shape.left is None:
+        return None
+
+    new_left = int(round(target * EMU_PER_INCH)) - width
+    if new_left == shape.left:
+        return None
+    moved = (new_left - shape.left) / EMU_PER_INCH
+    shape.left = new_left
+    return (
+        f"moved it {moved:+.2f}in across so its right edge sits on the "
+        f"{target:.2f}in column the master draws"
+    )
+
+
 def fix_arabic_font(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[str]:
     """Set the Arabic runs in the brand's Arabic face.
 
@@ -2119,6 +2324,12 @@ def _ai_remove_note(shape: Any, action: Any, ctx: "FixContext") -> Optional[str]
     _record_note(shape, action, ctx, text)
 
     parent.remove(element)
+    # The one thing in this module that changes WHICH shapes a slide has. The
+    # applier indexes them per slide and would otherwise go on handing later
+    # findings a shape that is no longer in the file.
+    forget = getattr(ctx, "forget_shapes", None)
+    if callable(forget):
+        forget()
     return f"removed the production note {_shorten(text)}"
 
 
@@ -2227,6 +2438,7 @@ FIXERS: dict[str, Fixer] = {
     "space.overlap": fix_overlap,
     "space.text_collision": fix_text_collision,
     "space.band_width": fix_band_width,
+    "table.header_alignment": fix_table_header_alignment,
     "space.matrix_gutter": fix_matrix_gutter,
     "space.text_overflow": fix_text_overflow,
     "space.series_crowded": fix_series_crowded,
@@ -2245,6 +2457,8 @@ FIXERS: dict[str, Fixer] = {
     "font.family.theme_drift": fix_theme_font_drift,
     "font.family.arabic": fix_arabic_font,
     "typography.rtl_not_set": fix_rtl_not_set,
+    "typography.rtl_alignment": fix_rtl_alignment,
+    "space.rtl_leading_edge": fix_rtl_leading_edge,
 }
 
 # The order fixes run in, low first. Two fixes can touch one shape, and then
@@ -2264,6 +2478,12 @@ FIX_ORDER: dict[str, int] = {
     "font.family.theme_drift": 10,
     "font.family.arabic": 10,
     "typography.rtl_not_set": 10,
+    "typography.rtl_alignment": 10,
+    # First of the moves, and deliberately: turning a shape round to the side
+    # the deck reads from is the largest change any of these make, and every
+    # smaller one below -- the series alignments, the collision nudges, the
+    # clamps -- should be measuring the position the shape is going to keep.
+    "space.rtl_leading_edge": 12,
     # The series fixes, together: each one puts a shape back where the rest of
     # its set already is, so they cannot fight each other, and both want to
     # run before the clamps below decide anything about the same shape.
@@ -2301,6 +2521,10 @@ NEEDS_A_PERSON: dict[str, str] = {
         "names two shapes that disagree about a height, and nothing in the "
         "geometry says which of them moved; moving both to the midpoint would "
         "level the pair and put both of them off the arrangement they belong to"
+    ),
+    "table.header_rows": (
+        "the fix is to shorten a heading or widen its column, and joining two "
+        "lines into one would push the copy past the cell it sits in"
     ),
     "logo.missing": "needs the approved logo file, which the tool does not have",
     "logo.unapproved_asset": "needs the approved logo file to swap in",

@@ -45,7 +45,6 @@ from ..rules import build_default_rules, describe_rules
 log = logging.getLogger(__name__)
 
 STATIC = Path(__file__).parent / "static"
-MAX_UPLOAD = 256 * 1024 * 1024
 
 # The page prefills this rather than DEFAULT_MODEL. `gemini-2.5-pro` is retired
 # for new API keys and answers 404, which the pipeline swallows into a
@@ -94,6 +93,15 @@ class _Session:
     # there -- and, where it is, may not be the file the report describes.
     spec: Any = None
     created: float = field(default_factory=time.time)
+    # The last apply, kept so an undo can replay it without the page having to
+    # send the whole tick list back. `selection` is None for "everything
+    # fixable", the same as `apply_fixes` reads it, and `undone` accumulates:
+    # the designer takes back one change, looks at the result, takes back
+    # another, and each run is the original deck minus everything on this list.
+    selection: Optional[list[str]] = None
+    rebuild: bool = False
+    undone: list[str] = field(default_factory=list)
+    applied_once: bool = False
 
     @property
     def fixed(self) -> Path:
@@ -266,6 +274,8 @@ class _Handler(BaseHTTPRequestHandler):
             code, payload = self._guarded(self._run_pipeline)
         elif route == "/api/apply":
             code, payload = self._guarded(self._run_apply)
+        elif route == "/api/undo":
+            code, payload = self._guarded(self._run_undo)
         elif route == "/api/preview":
             code, payload = self._guarded(self._run_preview)
         else:
@@ -285,6 +295,44 @@ class _Handler(BaseHTTPRequestHandler):
         if not chosen and not rebuild_too:
             raise _BadRequest("nothing was ticked")
 
+        # A fresh apply is a fresh run, so anything held back on the last one
+        # is not held back on this one. The designer has just re-ticked the
+        # list; taking an old undo forward would silently drop a fix they can
+        # see they asked for.
+        session.selection = chosen
+        session.rebuild = rebuild_too
+        session.undone = []
+        return self._apply_session(session)
+
+    def _run_undo(self) -> dict[str, Any]:
+        """Take back one applied change, or put one back.
+
+        The deck is written again from the ORIGINAL upload without the changes
+        on the undo list, which is why this and `/api/apply` return the same
+        payload: both of them are one whole run of the fixes, and the file the
+        page offers for download after an undo is the file it would have
+        offered had that fix never been ticked. See `apply_fixes(undone=...)`
+        for why it is a replay rather than a reverse.
+
+        Cumulative and reversible: `undo` adds ids to the list, `redo` takes
+        them off, and either can name several at once.
+        """
+        body = self._json_body()
+        session = _session(str(body.get("session", "")))
+        if not session.applied_once:
+            raise _BadRequest("nothing has been applied to this deck yet")
+
+        undo = [str(i) for i in body.get("undo", [])]
+        redo = {str(i) for i in body.get("redo", [])}
+        if not undo and not redo:
+            raise _BadRequest("no change was named to undo")
+
+        held = [key for key in (*session.undone, *undo) if key not in redo]
+        session.undone = list(dict.fromkeys(held))
+        return self._apply_session(session)
+
+    def _apply_session(self, session: _Session) -> dict[str, Any]:
+        """One run of the fixes on this session, as its state now stands."""
         issues = [_issue_from_dict(e) for e in session.report.get("issues", [])]
         for issue in issues:
             if not issue.id:
@@ -296,18 +344,21 @@ class _Handler(BaseHTTPRequestHandler):
                 deck=session.deck,
                 issues=issues,
                 out=session.fixed,
-                selected=chosen,
-                master=session.master if rebuild_too else None,
+                selected=session.selection,
+                master=session.master if session.rebuild else None,
                 spec=session.spec,
+                undone=session.undone,
             )
             elapsed = time.perf_counter() - started
+        session.applied_once = True
+        _stale(session)
 
         return {
             "session": session.id,
             # Listed apart from the rest: a removal is the one change with
             # nothing left on the slide to check it against.
             "removed": [
-                {"id": o.issue.id, "slide": o.issue.slide, "detail": o.detail,
+                {"id": _outcome_id(o), "slide": o.issue.slide, "detail": o.detail,
                  "box_before": o.box_before, "box_after": o.box_after}
                 for o in result.removed
             ],
@@ -319,8 +370,15 @@ class _Handler(BaseHTTPRequestHandler):
                 # What the second round corrected on the written deck, and
                 # what the deck measures now that it has.
                 "second_round": [
-                    {"id": o.issue.id, "detail": o.detail,
+                    # Shape and rule as well as the change itself. The page
+                    # groups changes by what kind of rule made them and names
+                    # the shape beside each one, and a second-pass change that
+                    # carried neither read as an anonymous line in "Other" --
+                    # which is exactly the change a designer is least likely to
+                    # recognise, having never ticked it.
+                    {"id": _outcome_id(o), "detail": o.detail,
                      "applied": o.applied, "slide": o.issue.slide,
+                     "shape": o.issue.shape, "rule_id": o.issue.rule_id,
                      "box_before": o.box_before, "box_after": o.box_after}
                     for o in result.second_round
                 ],
@@ -338,7 +396,7 @@ class _Handler(BaseHTTPRequestHandler):
                 ],
             },
             "applied": [
-                {"id": o.issue.id, "detail": o.detail, "slide": o.issue.slide,
+                {"id": _outcome_id(o), "detail": o.detail, "slide": o.issue.slide,
                  "shape": o.issue.shape, "rule_id": o.issue.rule_id,
                  # Where to draw the change on the rendered slides. See
                  # FixOutcome.
@@ -346,8 +404,23 @@ class _Handler(BaseHTTPRequestHandler):
                 for o in result.applied
             ],
             "skipped": [
-                {"id": o.issue.id, "detail": o.detail, "slide": o.issue.slide}
+                {"id": _outcome_id(o), "detail": o.detail, "slide": o.issue.slide}
                 for o in result.skipped
+            ],
+            # What is being held back, and enough about each one to offer it
+            # back. The detail cannot come from this run -- the change was
+            # never made on it -- so it comes from the finding itself, which is
+            # what the page was showing before it was applied anyway.
+            "undone": [
+                {
+                    "id": key,
+                    "slide": _undone_field(key, issues, "slide"),
+                    "shape": _undone_field(key, issues, "shape"),
+                    "rule_id": _undone_field(key, issues, "rule_id"),
+                    "message": _undone_field(key, issues, "message"),
+                    "unknown": key in result.undone_unknown,
+                }
+                for key in result.undone
             ],
             "download": f"/api/download/{session.id}",
             "rebuilt": result.rebuilt is not None,
@@ -365,11 +438,18 @@ class _Handler(BaseHTTPRequestHandler):
         body = self._json_body()
         session = _session(str(body.get("session", "")))
         slides = [int(n) for n in body.get("slides", [])] or None
+        # Slides to render again whatever is cached for them. The cache is
+        # right nearly always -- the upload never changes, and a run that
+        # rewrites the corrected deck drops the after images itself -- but
+        # "nearly always" is not something a designer can check from the
+        # outside, and PowerPoint does occasionally export a slide mid-repaint.
+        # So there is a way to say: render this one again, now.
+        _forget(session, [int(n) for n in body.get("force", [])])
 
-        before = _render_into(session.deck, session.directory / "before")
+        before = _render_into(session.deck, session.directory / "before", slides)
         after: dict[int, str] = {}
         if session.fixed.exists():
-            after = _render_into(session.fixed, session.directory / "after")
+            after = _render_into(session.fixed, session.directory / "after", slides)
 
         numbers = sorted(set(before) | set(after))
         if slides:
@@ -529,13 +609,25 @@ class _Handler(BaseHTTPRequestHandler):
     # -- plumbing ---------------------------------------------------------- #
 
     def _body(self) -> bytes:
+        """The whole request body.
+
+        No size cap. There was a 256 MB one and it was the wrong shape of
+        guard for this server: a real deck of photographs reaches that, and
+        the person hitting the limit is the one who most needs the check run.
+
+        What remains is the machine. The body is read whole and the multipart
+        parse copies out of it, so a deck needs a small multiple of its own
+        size in memory. That is a resource question rather than a policy one,
+        and the host answers it.
+
+        Safe here because of what this server is: loopback by default, one run
+        at a time behind `_RUN_LOCK`, and not hardened -- see the module
+        docstring. Anyone passing `--host` to put it on a network is past the
+        point where a byte count was the protection.
+        """
         length = int(self.headers.get("Content-Length") or 0)
         if length <= 0:
             raise _BadRequest("empty request body")
-        if length > MAX_UPLOAD:
-            raise _BadRequest(
-                f"upload is {length / 1e6:.0f} MB; the limit is {MAX_UPLOAD / 1e6:.0f} MB"
-            )
         return self.rfile.read(length)
 
     def _send_json(self, code: int, payload: dict[str, Any]) -> None:
@@ -565,6 +657,71 @@ class _Handler(BaseHTTPRequestHandler):
 # Helpers
 # --------------------------------------------------------------------------- #
 
+def _outcome_id(outcome: Any) -> str:
+    """The id a change is addressed by, which every change has to have.
+
+    A first-round finding carries the id the report gave it. A SECOND-ROUND one
+    often does not: it was measured on the written deck by `_recheck`, which
+    builds findings rather than reading them back off a report, and nothing had
+    needed an id for them before. The page sent `null` for those, so the Undo
+    beside a second-pass change was addressed to nothing and did nothing when
+    it was pressed -- silently, because an empty id looks exactly like a click
+    on nothing at all.
+
+    The fingerprint is the same id the report would have given it, so undoing
+    one names the same finding `apply_fixes(undone=...)` matches on.
+    """
+    return outcome.issue.id or outcome.issue.fingerprint()
+
+
+def _forget(session: _Session, slides: list[int]) -> None:
+    """Drop the cached renders of these slides, both sides of the pair.
+
+    Both, because the two are read together: a designer asking for a slide
+    again is asking whether the comparison in front of them is true, and
+    refreshing half of it answers half the question.
+    """
+    for number in slides:
+        for side in ("before", "after"):
+            path = session.directory / side / f"{number}.png"
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
+def _stale(session: _Session) -> None:
+    """Throw away the renders of the corrected deck, which has just changed.
+
+    `_render_into` caches, deliberately: driving PowerPoint costs seconds and
+    the BEFORE images are of the upload, which never changes. The after images
+    are of a file this run has just written again, so the cache is of a deck
+    that no longer exists -- and a stale after image is the worst thing this
+    page can show, because the whole point of it is to be the evidence. Undo
+    made that visible; it was already true of a second apply.
+
+    The whole directory rather than the slides that changed: `render_deck`
+    renders a deck, not a slide, and `_render_into` returns its cache whole, so
+    a half-emptied directory would hand back the stale half.
+    """
+    rmtree(session.directory / "after", ignore_errors=True)
+
+
+def _undone_field(key: str, issues: list[Any], field_name: str) -> Any:
+    """One field of the finding an undo id names, or None if it names none.
+
+    None is a real answer here: an id can come from the recheck rather than
+    from the report -- a second-round fix is undoable too -- and then there is
+    no report finding to read a shape name off. The page shows the id alone,
+    which is what it has.
+    """
+    for issue in issues:
+        if issue.id == key:
+            value = getattr(issue, field_name, None)
+            return getattr(value, "value", value)
+    return None
+
+
 def _options_of(parts: list[_Part]) -> dict[str, Any]:
     for part in parts:
         if part.name == "options" and part.filename is None:
@@ -584,22 +741,31 @@ def _spill(directory: Path, part: _Part) -> Path:
     return target
 
 
-def _render_into(deck: Path, directory: Path) -> dict[int, str]:
+def _render_into(
+    deck: Path, directory: Path, wanted: Optional[list[int]] = None
+) -> dict[int, str]:
     """Render a deck into `directory`, reusing what is already there.
 
     Rendering drives PowerPoint and costs seconds, and the before-images do not
     change between one apply and the next, so they are rendered once.
+
+    `wanted` is the slides the page is about to show. Given them, only the ones
+    not already on disk are rendered, and the renderer is asked for those alone
+    -- which on a big deck is the difference between eleven seconds and one.
+    Without them this renders whatever it has to and keeps everything, which is
+    what every caller did before.
     """
     existing = _existing_images(directory)
-    if existing:
+    missing = [n for n in (wanted or []) if n not in existing]
+    if existing and (wanted is None or not missing):
         return existing
 
-    images = render_deck(deck)
+    images = render_deck(deck, slides=missing or None)
     if not images:
         log.info("no preview for %s: %s", deck.name, images.reason)
-        return {}
+        return existing
     directory.mkdir(parents=True, exist_ok=True)
-    out: dict[int, str] = {}
+    out = dict(existing)
     for number, path in images.images.items():
         target = directory / f"{number}.png"
         target.write_bytes(path.read_bytes())

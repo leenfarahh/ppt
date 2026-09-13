@@ -42,6 +42,8 @@ def _matrix(
     nested: bool = False,
     bystander: bool = False,
     downs: Optional[tuple] = None,
+    heading: Optional[float] = None,
+    nudge: float = 0.0,
 ) -> Path:
     """A rows x len(widths) component on the given gutters."""
     pytest.importorskip("pptx")
@@ -60,9 +62,20 @@ def _matrix(
         shape.text_frame.text = name
         return shape
 
+    if heading is not None:
+        # A table heading as decks actually draw it: one bar across the whole
+        # component with its labels sitting on top of it, so the labels are
+        # content inside a cell and the heading itself is a single cell.
+        span = sum(widths) + across * (len(widths) - 1)
+        depth = 0.4
+        box("Heading", left, top - heading - depth, span, depth)
+        for i in range(2):
+            box(f"Heading label {i}", left + 0.2 + i * 1.8,
+                top - heading - depth + 0.05, 1.0, 0.2)
+
     y = top
     for row in range(rows):
-        x = left
+        x = left + (nudge if row == 1 else 0.0)
         for column, width in enumerate(widths):
             box(f"Cell {row + 1}-{column + 1}", x, y, width, height)
             x += width + across
@@ -346,3 +359,77 @@ def test_a_row_is_clustered_against_its_neighbours_not_rounded_into_buckets(
     prs.save(str(deck))
 
     assert len(_found(deck)) == 1
+
+
+# --------------------------------------------------------------------------- #
+# What counts as a row of the component
+# --------------------------------------------------------------------------- #
+#
+# Both of these decided membership by an exact key, so a component's size
+# changed with how its deck happened to be drawn rather than with anything
+# about the component. That is why a table came out with its heading on one
+# deck and without it on the next.
+
+
+def test_a_row_a_few_thousandths_off_is_still_the_same_component(
+    tmp_path: Path,
+) -> None:
+    """The column signature was rounded to a hundredth of an inch while the
+    function was handed a tolerance it never applied to it.
+
+    A hundredth is a bucket and its edge falls in the middle of live data: a
+    row nudged 0.006in rounds to a different signature, leaves the component,
+    and a three-row table reports as two rows with a gutter neither half has.
+    """
+    deck = _matrix(tmp_path, across=0.06, down=0.10, nudge=0.006)
+
+    found = _found(deck)
+
+    assert len(found) == 1
+    assert "3x2 component" in found[0].message, found[0].message
+
+
+def test_a_heading_band_spaced_like_the_rows_is_one_of_them(
+    tmp_path: Path,
+) -> None:
+    """The heading is drawn as one bar with its labels on top, so the labels
+    are content inside a cell and the bar is a single cell. A single cell is
+    not a row, so the heading dropped out and the component reported one row
+    fewer than the table has."""
+    deck = _matrix(tmp_path, across=0.06, down=0.10, heading=0.10)
+
+    found = _found(deck)
+
+    assert len(found) == 1
+    assert "4x2 component" in found[0].message, found[0].message
+
+
+def test_a_heading_on_its_own_spacing_stays_out(tmp_path: Path) -> None:
+    """The test that makes admitting the band safe. A bar spanning the
+    component but spaced differently is a heading with its own spacing, and
+    folding it in would make the vertical gutters uneven -- which would
+    silence this rule on a component it used to report."""
+    deck = _matrix(tmp_path, across=0.06, down=0.10, heading=0.5)
+
+    found = _found(deck)
+
+    assert len(found) == 1
+    assert "3x2 component" in found[0].message, found[0].message
+
+
+def test_a_heading_band_is_re_spaced_with_the_rest(tmp_path: Path) -> None:
+    from formatting_tool.apply import apply_fixes
+
+    deck = _matrix(tmp_path, across=0.06, down=0.10, heading=0.10)
+    found = _found(deck)
+    out = tmp_path / "fixed.pptx"
+
+    result = apply_fixes(deck, found, out, selected=[i.id for i in found])
+
+    assert len(result.applied) == 1
+    assert "4x2 component" in result.applied[0].detail
+    boxes = _boxes(out)
+    band = boxes["Heading"]
+    first = boxes["Cell 1-1"]
+    gap = (first.top - (band.top + band.height)) / EMU
+    assert round(gap, 3) == 0.06, f"heading kept its own gutter: {gap}"

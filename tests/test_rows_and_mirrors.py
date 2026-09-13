@@ -218,3 +218,117 @@ def test_the_odd_one_out_is_put_back_on_the_row(tmp_path: Path) -> None:
         s for s in Presentation(str(out)).slides[0].shapes if s.name == "Cell 11"
     )
     assert round(moved.top / 914400, 2) == 3.0
+
+
+# --------------------------------------------------------------------------- #
+# Adrift: past the clustering window, on no row at all
+# --------------------------------------------------------------------------- #
+#
+# The inversion this closes. `_off_line` reads shapes that are already inside a
+# settled cluster, so a shape stayed reportable only while it remained in the
+# row it was drifting out of. One clustering window further and it became a
+# cluster of one, clusters of one were dropped before anything was measured,
+# and the finding disappeared. Small misalignments caught, large ones silent.
+#
+# Off a real deck: a table of pills, five rows of three, with one pill sitting
+# clear below the row it belongs to and its two row-mates still in place. Not a
+# single space finding, and the pill survived a fix pass untouched.
+
+
+def test_a_cell_that_falls_clear_of_its_row_is_found(tmp_path: Path) -> None:
+    """0.5in low, which is far enough to leave the row rather than stretch it.
+
+    The 0.08in version of this is `test_a_cell_off_its_row_in_a_grid_is_found`
+    and was always caught. This one is the same defect, worse, and was not.
+    """
+    prs, slide, path = _slide(tmp_path, "adrift.pptx")
+    for row in range(3):
+        for column in range(3):
+            low = 0.5 if (row, column) == (1, 1) else 0.0
+            _box(slide, f"Cell {row}{column}", 1.0 + column * 3.0, 1.0 + row * 2.0 + low)
+    prs.save(str(path))
+
+    found = _of(path, "space.row_out_of_line")
+
+    assert len(found) == 1
+    assert found[0].shape == "Cell 11"
+    assert "0.50in clear of the nearest row" in found[0].message
+    assert "centre y 3.60in" in found[0].expected
+
+
+def test_the_row_it_left_is_the_one_it_goes_back_to(tmp_path: Path) -> None:
+    """Two members are enough to say where the row is. Three are needed only
+    to arbitrate which member moved, and there is nothing to arbitrate when
+    the shape is on its own."""
+    from formatting_tool.apply import apply_fixes
+    from formatting_tool.extract import read_deck
+    from formatting_tool.extract.master_spec import derive_master_spec
+    from pptx import Presentation
+
+    prs, slide, path = _slide(tmp_path, "adrift.pptx")
+    for row in range(3):
+        for column in range(3):
+            low = 0.5 if (row, column) == (1, 1) else 0.0
+            _box(slide, f"Cell {row}{column}", 1.0 + column * 3.0, 1.0 + row * 2.0 + low)
+    prs.save(str(path))
+
+    findings = _of(path, "space.row_out_of_line")
+    for issue in findings:
+        issue.id = issue.fingerprint()
+    out = tmp_path / "fixed.pptx"
+    spec = derive_master_spec(read_deck("test_master1.pptx"), BrandGuidelines())
+
+    result = apply_fixes(
+        path, findings, out, selected=[i.id for i in findings], spec=spec
+    )
+
+    assert len(result.applied) == 1
+    moved = next(
+        s for s in Presentation(str(out)).slides[0].shapes if s.name == "Cell 11"
+    )
+    assert round(moved.top / 914400, 2) == 3.0
+
+
+def test_further_out_than_the_ceiling_is_a_placement_not_a_drift(
+    tmp_path: Path,
+) -> None:
+    """The ceiling every repeat rule uses. Past it a shape was put where it is
+    rather than nudged there, and calling that a misalignment would report
+    every deliberate layout in the deck."""
+    prs, slide, path = _slide(tmp_path, "placed.pptx")
+    for row in range(3):
+        for column in range(3):
+            low = 1.2 if (row, column) == (1, 1) else 0.0
+            _box(
+                slide, f"Cell {row}{column}",
+                1.0 + column * 3.0, 1.0 + row * 2.0 + low, 2.0, 0.8,
+            )
+    prs.save(str(path))
+
+    assert _of(path, "space.row_out_of_line") == []
+
+
+def test_one_row_adrift_stays_with_the_rule_that_owns_it(tmp_path: Path) -> None:
+    """A series that is a single row has a shared top edge, and a member off
+    it is `space.repeat_out_of_line`'s finding. Both rules reporting would be
+    two findings and two fixes for one shape."""
+    prs, slide, path = _slide(tmp_path, "cards.pptx")
+    for i in range(5):
+        _box(slide, f"Card {i}", 1.0 + i * 2.3, 3.0 + (0.5 if i == 2 else 0.0))
+    prs.save(str(path))
+
+    assert _of(path, "space.row_out_of_line") == []
+    assert len(_of(path, "space.repeat_out_of_line")) == 1
+
+
+def test_a_scatter_holding_one_row_is_not_an_arrangement(tmp_path: Path) -> None:
+    """Most of the set has to have settled before the rest read as departures
+    from it. Three on a row and three loose is not a row with exceptions."""
+    prs, slide, path = _slide(tmp_path, "loose.pptx")
+    for i, x in enumerate((1.0, 4.0, 7.0)):
+        _box(slide, f"Row {i}", x, 1.0)
+    for i, (x, y) in enumerate(((1.0, 2.4), (4.0, 3.3), (7.0, 4.2))):
+        _box(slide, f"Loose {i}", x, y)
+    prs.save(str(path))
+
+    assert _of(path, "space.row_out_of_line") == []

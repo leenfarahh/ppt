@@ -137,6 +137,87 @@ class FixContext:
     removed_notes: list = field(default_factory=list)
 
 
+    # (presentation, [slides]) for the deck being worked on. Deliberately NOT
+    # an annotated field: an annotated name in a dataclass becomes part of the
+    # record, and this is a live python-pptx object graph, not data.
+    _slides = None
+
+    # {slide number: (top-level shapes, every shape by OOXML id)} for the
+    # presentation in `_slides`. Not annotated, for the same reason: live
+    # python-pptx proxies, not data.
+    _shapes = None
+
+    def shapes_of(self, presentation: Any, number: int) -> tuple[list, dict]:
+        """One slide's shapes: the top-level ones, and every one by its id.
+
+        Built once per slide per run. `_find_shape` walked the whole slide
+        comparing ids on every finding, and `_neighbours` listed it again, and
+        reading `shape_id` is an XPath into the shape's non-visual properties
+        -- so a slide with ten findings on it was walked thirty times and its
+        ids read six hundred times to answer the same question.
+
+        Held until something REMOVES a shape, which one fixer does: taking a
+        production note off the deck. That fixer calls `forget_shapes`, which
+        is the only thing that can make this wrong. Moving, recolouring and
+        retyping a shape all leave the index true -- it maps ids to proxies and
+        says nothing about where they are.
+        """
+        if self._shapes is None or self._shapes[0] is not presentation:
+            self._shapes = (presentation, {})
+        cached = self._shapes[1].get(number)
+        if cached is not None:
+            return cached
+
+        slides = self.slides(presentation)
+        if not 1 <= number <= len(slides):
+            return [], {}
+        top = list(slides[number - 1].shapes)
+        by_id: dict[int, Any] = {}
+        for shape in _walk(top):
+            try:
+                by_id.setdefault(int(shape.shape_id), shape)
+            except Exception:
+                pass
+        self._shapes[1][number] = (top, by_id)
+        return top, by_id
+
+    def forget_shapes(self) -> None:
+        """Drop the shape index: a shape has been taken off the deck.
+
+        Called by the one fixer that removes anything. Everything else this
+        runs leaves the index true, and an index that outlived a deletion would
+        hand a later finding a shape that is no longer in the file.
+        """
+        self._shapes = None
+
+    def slides(self, presentation: Any) -> list:
+        """This presentation's slides, listed once rather than once per fix.
+
+        python-pptx resolves the whole collection on every access -- a part
+        lookup per slide -- and `_find_shape` and `_neighbours` each ask for it
+        for every finding. On a 105-slide deck with 632 fixes that was twenty
+        seconds spent rebuilding one list seven thousand times, and it is most
+        of what made an undo feel slow: an undo is a replay, so it pays the
+        whole cost of an apply again.
+
+        Held here rather than in a module-level cache for two reasons. A
+        `FixContext` already stands for exactly one run of the fixes, so its
+        lifetime is the right one; and python-pptx's `Presentation` defines
+        equality without a hash, so it cannot be a dictionary key at all.
+
+        Only the latest is kept, which is what the second round needs: it opens
+        the written file as a new presentation, and the list from the first is
+        of a different object and no longer wanted.
+
+        Safe because no fix adds or removes a SLIDE. Fixes move, recolour,
+        retype and occasionally delete a shape; the rebuild that does change
+        the slide set runs afterwards, on a file that is reopened.
+        """
+        if self._slides is None or self._slides[0] is not presentation:
+            self._slides = (presentation, list(presentation.slides))
+        return self._slides[1]
+
+
 @dataclass
 class FixOutcome:
     issue: Issue
@@ -181,6 +262,13 @@ class ApplyResult:
     # One entry per deleted production note, saying whether its text made it
     # into a PowerPoint comment. See apply.notes.
     notes_copied: list[Any] = field(default_factory=list)
+    # The findings held back on this run, and the ids asked for that matched
+    # nothing. See `apply_fixes(undone=...)`: undoing a fix is replaying the
+    # run without it, so what is undone is a property of the run rather than
+    # of some earlier one, and it is echoed here for a caller that has to show
+    # the designer what is still held back.
+    undone: list[str] = field(default_factory=list)
+    undone_unknown: list[str] = field(default_factory=list)
 
     @property
     def changed(self) -> int:
@@ -232,6 +320,7 @@ def apply_fixes(
     tuning: Optional[RuleTuning] = None,
     tolerances: Optional[Tolerances] = None,
     spec: Optional[Any] = None,
+    undone: Optional[Iterable[str]] = None,
 ) -> ApplyResult:
     """Apply the selected findings to `deck` and write the result to `out`.
 
@@ -239,6 +328,31 @@ def apply_fixes(
     finding that has a fixer, which is the "fix everything mechanical" case;
     an empty set means none, which is a legitimate request when the only thing
     wanted is the rebuild.
+
+    `undone` is how a fix is taken back, one fix at a time: the ids of changes
+    the designer has looked at and does not want. They are held back from both
+    rounds, and the deck is written again from the untouched original.
+
+    UNDO IS A REPLAY, NOT A REVERSE, and that is the whole design of it. The
+    other way of doing this edits the written file to put one shape back, and
+    that is wrong here for reasons this module establishes elsewhere:
+
+    - A fix is not an independent edit. The colour plan is decided across the
+      whole deck at once so that colours which are distinct stay distinct; a
+      cohort move carries shapes no finding named, because a column moves
+      whole or not at all; and the second round exists only to clear up what
+      the first round caused. Put one shape back by hand and everything that
+      was derived from it stays behind, which is a file in a state no run of
+      this tool would ever produce.
+    - The input deck is never modified. So the original is still on disk
+      exactly as it arrived, and replaying the run without one finding gives
+      the file the designer would have had if they had never ticked it. Not an
+      approximation of it: the same file.
+
+    The cost is that an undo re-runs the fixes, which on a large deck is
+    seconds rather than milliseconds. That is the right trade for a client
+    file -- a fast undo that leaves debris is worse than a slow one that does
+    not -- and it is what makes undoing several, in any order, safe.
 
     With `master`, the corrected deck is then rebuilt onto that master's
     layouts.
@@ -250,6 +364,10 @@ def apply_fixes(
         raise ApplyError(f"deck not found: {deck}")
 
     wanted = _wanted(issues, selected)
+    held = list(dict.fromkeys(str(key) for key in (undone or ())))
+    if held:
+        blocked = set(held)
+        wanted = [issue for issue in wanted if (issue.id or "") not in blocked]
     out.parent.mkdir(parents=True, exist_ok=True)
 
     presentation = Presentation(str(deck))
@@ -267,6 +385,7 @@ def apply_fixes(
         ),
     )
     result = ApplyResult(deck=deck.name, output=out)
+    result.undone = held
 
     # Shapes the report already faults geometrically. An alignment with one of
     # these is not a relationship worth protecting: it is two shapes wrong the
@@ -307,7 +426,8 @@ def apply_fixes(
 
     result.before = list(issues)
     _recheck(result, spec)
-    _second_round(result, context, spec)
+    _second_round(result, context, spec, set(held))
+    _note_unmatched_undo(result, issues)
     _copy_notes(result, context)
     return result
 
@@ -353,6 +473,35 @@ def _copy_notes(result: ApplyResult, context: FixContext) -> None:
 _MEASURED_AFTER = frozenset({"typography.heading_balance"})
 
 
+def _note_unmatched_undo(result: ApplyResult, issues: Sequence[Issue]) -> None:
+    """Undo ids that held nothing back, recorded rather than raised.
+
+    An id from an earlier report, or one already dropped from the selection,
+    holds nothing back and is not an error: undoing a fix twice is a thing a
+    page with a button on it will do. But it is not silence either -- an id
+    matching nothing usually means the selection and the report have come
+    apart, and a designer looking at a change that is still there needs to be
+    told this run did not hold it back.
+
+    Matched against the report's own ids and against what the run applied or
+    skipped, which between them cover both rounds.
+    """
+    if not result.undone:
+        return
+    known = {issue.id for issue in issues if issue.id}
+    known |= {
+        outcome.issue.id or outcome.issue.fingerprint()
+        for outcome in (*result.applied, *result.skipped, *result.second_round)
+    }
+    result.undone_unknown = [key for key in result.undone if key not in known]
+    if result.undone_unknown:
+        log.warning(
+            "%s: nothing to undo for id %s; it is not in this report",
+            result.deck,
+            ", ".join(result.undone_unknown),
+        )
+
+
 def _needs_measuring(result: ApplyResult) -> bool:
     return any(
         (outcome.issue.rule_id or "") in _MEASURED_AFTER
@@ -378,7 +527,10 @@ def _reverses_a_fix(issue: Issue, applied: dict) -> bool:
 
 
 def _second_round(
-    result: ApplyResult, context: FixContext, spec: Optional[Any]
+    result: ApplyResult,
+    context: FixContext,
+    spec: Optional[Any],
+    held: Optional[set[str]] = None,
 ) -> None:
     """Correct what this run caused, on the deck it wrote.
 
@@ -405,9 +557,15 @@ def _second_round(
     for outcome in result.applied:
         key = (outcome.issue.slide, outcome.issue.shape_id)
         already.setdefault(key, set()).add(outcome.issue.rule_id or "")
+    # A second-round fix is undoable on the same terms as a first-round one.
+    # It has to be: the designer sees both in one list of changes and has no
+    # reason to care which round made one, so a fix that could not be taken
+    # back would be a hole in the list at exactly the point they reach for it.
+    held = held or set()
     todo = [
         issue for issue in fixable(result.introduced)
         if not _reverses_a_fix(issue, already)
+        and (issue.id or issue.fingerprint()) not in held
     ]
     if not todo:
         result.settled = list(result.recheck)
@@ -551,7 +709,10 @@ def _apply_one(
     The second lookup costs one walk of one slide and cannot disagree with
     what was fixed: it matches on the OOXML id, which a fix does not change.
     """
-    found = _find_shape(presentation, issue) if issue.slide and issue.shape else None
+    found = (
+        _find_shape(presentation, issue, context)
+        if issue.slide and issue.shape else None
+    )
     before = _box_fraction(found, context)
 
     outcome = _apply_one_uninstrumented(issue, presentation, context, in_breach, moved)
@@ -562,7 +723,9 @@ def _apply_one(
         # replaces a shape rather than editing it leaves the old object
         # detached, and a removal leaves nothing at all, which is a None the
         # overlay reads as "there is a gap here now".
-        outcome.box_after = _box_fraction(_find_shape(presentation, issue), context)
+        outcome.box_after = _box_fraction(
+            _find_shape(presentation, issue, context), context
+        )
     return outcome
 
 
@@ -588,7 +751,7 @@ def _apply_one_uninstrumented(
             "needs a designer: this describes the deck as a whole, not one shape",
         )
 
-    shape = _find_shape(presentation, issue)
+    shape = _find_shape(presentation, issue, context)
     if shape is None:
         return FixOutcome(
             issue,
@@ -615,11 +778,13 @@ def _apply_one_uninstrumented(
     geometric = is_geometric(issue)
     before = (shape.left, shape.top) if geometric else None
     neighbours = (
-        _neighbours(presentation, issue, shape)
+        _neighbours(presentation, issue, shape, context)
         if geometric or (issue.rule_id or "") in _NEEDS_NEIGHBOURS
         else []
     )
-    covered_before = _covered(shape, neighbours) if geometric else {}
+    # Read once, for both guards below. See `_boxes`.
+    snapshot = _boxes(neighbours) if geometric else None
+    covered_before = _covered(shape, neighbours, snapshot) if geometric else {}
     partners = (
         [
             other
@@ -630,7 +795,9 @@ def _apply_one_uninstrumented(
         else []
     )
     aligned_before = (
-        _aligned(shape, partners, context.align_tolerance_in)
+        # The partners are the neighbours minus the ones the report already
+        # faults, so the one snapshot serves both guards.
+        _aligned(shape, partners, context.align_tolerance_in, snapshot)
         if geometric
         else set()
     )
@@ -881,20 +1048,50 @@ def _worsened(before: dict[str, int], after: dict[str, int]) -> set[str]:
     }
 
 
-def _neighbours(presentation: Any, issue: Issue, shape: Any) -> list[Any]:
+def _neighbours(
+    presentation: Any,
+    issue: Issue,
+    shape: Any,
+    context: Optional["FixContext"] = None,
+) -> list[Any]:
     """The other top-level shapes on the same slide.
 
     Top-level only, and never the moved shape's own descendants: a group
     carries its parts with it, so its own children can never be collided with.
     """
-    slides = list(presentation.slides)
-    if not issue.slide or not 1 <= issue.slide <= len(slides):
+    if not issue.slide:
         return []
+    if context is not None:
+        top, _by_id = context.shapes_of(presentation, issue.slide)
+    else:
+        slides = list(presentation.slides)
+        if not 1 <= issue.slide <= len(slides):
+            return []
+        top = list(slides[issue.slide - 1].shapes)
     own = _identities([shape])
-    return [
-        s for s in slides[issue.slide - 1].shapes
-        if not (_identities([s]) & own)
-    ]
+    return [s for s in top if not _is_own(s, own)]
+
+
+def _is_own(shape: Any, own: set) -> bool:
+    """Whether this top-level shape is the moved shape, or contains it.
+
+    The same question `_identities([shape]) & own` answered, asked without
+    walking every shape on the slide. `own` holds the moved shape and its
+    descendants, so a top-level shape matches only by being it or by being a
+    group it sits inside -- and a shape that is not a group has no insides to
+    look through. Most shapes on a slide are not groups, and this was two
+    hundred thousand walks on one real deck.
+    """
+    try:
+        if int(shape.shape_id) in own:
+            return True
+    except Exception:
+        pass
+    try:
+        children = shape.shapes
+    except Exception:
+        return False
+    return bool(_identities(children) & own)
 
 
 def _identities(shapes: Any) -> set:
@@ -920,7 +1117,12 @@ def _identities(shapes: Any) -> set:
 EMU_PER_INCH = 914400
 
 
-def _aligned(shape: Any, neighbours: list[Any], tolerance_in: float) -> set[str]:
+def _aligned(
+    shape: Any,
+    neighbours: list[Any],
+    tolerance_in: float,
+    boxes: Optional[dict[int, tuple[str, tuple[int, int, int, int]]]] = None,
+) -> set[str]:
     """Neighbours this shape currently shares an edge with, by name and edge.
 
     Left, right and centre horizontally, top and bottom vertically. A caption
@@ -938,10 +1140,7 @@ def _aligned(shape: Any, neighbours: list[Any], tolerance_in: float) -> set[str]
     }
     slack = int(tolerance_in * EMU_PER_INCH)
     out: set[str] = set()
-    for other in neighbours:
-        theirs = _box(other)
-        if theirs is None:
-            continue
+    for name, theirs in _measured(neighbours, boxes):
         o_left, o_top, o_right, o_bottom = theirs
         edges = {
             "left": o_left, "right": o_right, "top": o_top, "bottom": o_bottom,
@@ -950,23 +1149,64 @@ def _aligned(shape: Any, neighbours: list[Any], tolerance_in: float) -> set[str]
         }
         for edge, value in edges.items():
             if abs(mine[edge] - value) <= slack:
-                out.add(f"{_name_of(other)} ({edge})")
+                out.add(f"{name} ({edge})")
     return out
 
 
-def _covered(shape: Any, neighbours: list[Any]) -> dict[str, int]:
+def _boxes(shapes: list[Any]) -> dict[int, tuple[str, tuple[int, int, int, int]]]:
+    """Each shape's name and box, read once, keyed by the proxy's identity.
+
+    The guards run twice per geometric finding -- once before the fix and once
+    after -- and the second reading was of shapes nothing had touched. Reading
+    a box is not free: `shape.left` on a placeholder resolves up through the
+    layout behind it, and a slide of forty shapes was read twice for every one
+    of 632 fixes.
+
+    Keyed by `id()`, which is exactly the identity python-pptx cannot be
+    trusted for ANYWHERE ELSE -- it hands out a fresh proxy every time a shape
+    collection is walked, which is the whole reason `_identities` exists. It is
+    right here and only here: the snapshot is taken from one list, and the
+    partners are that list filtered, so they are the same objects. Keying by
+    name instead is what this first did, and it is wrong for the reason
+    `_find_shape` documents: sixteen shapes called "Pentagon 7" on one slide is
+    a real deck, and the lookup hands one of them another's box.
+
+    Only ever used for the BEFORE reading. After the fixer has run, the state
+    is whatever it made -- that is the thing being measured -- so that side is
+    always read fresh, and the cohort path, which moves neighbours, reads it
+    fresh for the same reason.
+    """
+    out: dict[int, tuple[str, tuple[int, int, int, int]]] = {}
+    for shape in shapes:
+        box = _box(shape)
+        if box is not None:
+            out[id(shape)] = (_name_of(shape), box)
+    return out
+
+
+def _measured(
+    shapes: list[Any],
+    boxes: Optional[dict[int, tuple[str, tuple[int, int, int, int]]]],
+) -> list[tuple[str, tuple[int, int, int, int]]]:
+    """Name and box per shape, from the snapshot when there is one."""
+    if boxes is None:
+        return list(_boxes(shapes).values())
+    return [boxes[id(shape)] for shape in shapes if id(shape) in boxes]
+
+
+def _covered(
+    shape: Any,
+    neighbours: list[Any],
+    boxes: Optional[dict[int, tuple[str, tuple[int, int, int, int]]]] = None,
+) -> dict[str, int]:
     """How much of each neighbour this shape's box currently covers."""
     box = _box(shape)
     if box is None:
         return {}
     covered: dict[str, int] = {}
-    for other in neighbours:
-        theirs = _box(other)
-        if theirs is None:
-            continue
+    for name, theirs in _measured(neighbours, boxes):
         area = _intersection(box, theirs)
         if area:
-            name = _name_of(other)
             covered[name] = covered.get(name, 0) + area
     return covered
 
@@ -989,7 +1229,9 @@ def _intersection(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) ->
     return dx * dy if dx > 0 and dy > 0 else 0
 
 
-def _find_shape(presentation: Any, issue: Issue) -> Optional[Any]:
+def _find_shape(
+    presentation: Any, issue: Issue, context: Optional["FixContext"] = None
+) -> Optional[Any]:
     """The live shape a finding names, searched inside groups too.
 
     By OOXML id first. Shape names are not unique and in a real deck are
@@ -1005,20 +1247,28 @@ def _find_shape(presentation: Any, issue: Issue) -> Optional[Any]:
     """
     if not issue.slide:
         return None
-    slides = list(presentation.slides)
-    if not 1 <= issue.slide <= len(slides):
+    if context is not None:
+        top, by_id = context.shapes_of(presentation, issue.slide)
+    else:
+        slides = list(presentation.slides)
+        if not 1 <= issue.slide <= len(slides):
+            return None
+        top = list(slides[issue.slide - 1].shapes)
+        by_id = {}
+        for shape in _walk(top):
+            try:
+                by_id.setdefault(int(shape.shape_id), shape)
+            except Exception:
+                pass
+    if not top:
         return None
-    shapes = list(_walk(slides[issue.slide - 1].shapes))
 
     if issue.shape_id is not None:
-        for shape in shapes:
-            if _attr(shape, "shape_id") == issue.shape_id:
-                return shape
-        return None
+        return by_id.get(issue.shape_id)
 
     if not issue.shape:
         return None
-    named = [s for s in shapes if _attr(s, "name") == issue.shape]
+    named = [s for s in _walk(top) if _attr(s, "name") == issue.shape]
     return named[0] if len(named) == 1 else None
 
 
@@ -1155,14 +1405,22 @@ def _cohort_move(
 
     shapes = [shape] + [other for other, _edge in members]
     carried = _identities(shapes)
+    # The shapes NOT coming along, and their boxes, worked out once for the
+    # whole set rather than once per member. This line used to sit inside the
+    # dictionary comprehension below, so a five-shape column walked every one
+    # of forty-odd neighbours five times to decide the same thing five times,
+    # and then read all their boxes again for each member. It was the single
+    # most expensive thing an apply did, and an undo is a replay, so it paid
+    # for it twice.
+    #
+    # Nothing here moves anything, so one reading is as true as five.
+    outside = [n for n in neighbours if not _is_own(n, carried)]
+    outside_boxes = _boxes(outside)
     move = CohortMove(
         shapes=shapes,
         origin={id(s): (s.left, s.top) for s in shapes},
         covered={
-            s.shape_id: _covered(
-                s, [n for n in neighbours if not (_identities([n]) & carried)]
-            )
-            for s in shapes
+            s.shape_id: _covered(s, outside, outside_boxes) for s in shapes
         },
     )
 
@@ -1190,11 +1448,16 @@ def _cohort_worsened(
     one that was asked to move.
     """
     carried = _identities(move.shapes)
-    outside = [n for n in neighbours if not (_identities([n]) & carried)]
+    outside = [n for n in neighbours if not _is_own(n, carried)]
+    # The shapes that did not move, measured once. Only `move.shapes` have
+    # moved, so every neighbour's box is the same for every member being
+    # checked against it.
+    outside_boxes = _boxes(outside)
     worse: set[str] = set()
     for shape in move.shapes:
         worse |= _worsened(
-            move.covered.get(shape.shape_id, {}), _covered(shape, outside)
+            move.covered.get(shape.shape_id, {}),
+            _covered(shape, outside, outside_boxes),
         )
     return worse
 

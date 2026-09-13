@@ -33,6 +33,7 @@ def _shape(
     *,
     ph: str | None = None,
     idx: int | None = None,
+    left: float = 1.0,
     top: float = 3.0,
     height: float = 1.0,
     text: bool = False,
@@ -41,7 +42,7 @@ def _shape(
         shape_id=1,
         name=name,
         shape_type="PLACEHOLDER (14)" if ph else "AUTO_SHAPE (1)",
-        geometry=Geometry(left_in=1.0, top_in=top, width_in=4.0, height_in=height),
+        geometry=Geometry(left_in=left, top_in=top, width_in=4.0, height_in=height),
         placeholder_type=ph,
         placeholder_idx=idx,
         paragraphs=[ParagraphProfile(text="x", runs=[RunProfile(text="x")])]
@@ -192,7 +193,11 @@ def test_a_band_is_found_by_position_not_only_by_name() -> None:
 # Layout matching
 # --------------------------------------------------------------------------- #
 
-def test_a_matching_name_wins_outright() -> None:
+def test_a_matching_name_decides_when_there_is_nothing_to_measure() -> None:
+    """The name is the weakest signal now -- below a reading of the render and
+    below the measurements -- but it is not nothing. A slide carrying no
+    content at all gives the structure no evidence, and "structure first"
+    cannot mean preferring a silence to the designer's own statement."""
     layouts = [
         LayoutProfile(name="Cover", index=0),
         LayoutProfile(name="title_content", index=1),
@@ -203,6 +208,7 @@ def test_a_matching_name_wins_outright() -> None:
 
     assert match.name == "title_content"
     assert match.confident and match.score == 1.0
+    assert "nothing to measure" in match.basis
 
 
 def test_loose_text_boxes_count_as_content_regions() -> None:
@@ -221,7 +227,35 @@ def test_loose_text_boxes_count_as_content_regions() -> None:
         ],
     )
 
-    assert slide_regions(slide) == {"title": 1, "content": 2}
+    # One column: both boxes start at the same edge, one above the other.
+    assert slide_regions(slide) == {"title": 1, "content": 1}
+
+
+def test_loose_copy_is_counted_in_columns_not_in_boxes() -> None:
+    """A heading, the list under it and a caption beneath that are ONE column
+    of copy, and a layout offering one content region can hold them.
+
+    Counting each box as a demand is what made a messy deck unmatchable: one
+    real 17-slide deck put its copy in fourteen boxes a slide, so every slide
+    asked for fourteen regions, no layout offered more than three, and every
+    candidate scored alike -- leaving the pick to whichever layout came first
+    in the master.
+    """
+    stacked = SlideProfile(
+        number=1,
+        shapes=[_shape(f"Box {n}", left=1.0, top=1.0 + n, text=True) for n in range(5)],
+    )
+    side_by_side = SlideProfile(
+        number=2,
+        shapes=[
+            _shape("Left", left=1.0, text=True),
+            _shape("Middle", left=5.0, text=True),
+            _shape("Right", left=9.5, text=True),
+        ],
+    )
+
+    assert slide_regions(stacked)["content"] == 1
+    assert slide_regions(side_by_side)["content"] == 3
 
 
 def test_decoration_does_not_inflate_the_region_count() -> None:

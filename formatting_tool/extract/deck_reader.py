@@ -16,6 +16,7 @@ from typing import Any, Optional
 from xml.etree import ElementTree
 
 from .. import svgicon
+from . import textstyle
 from ..models import (
     DeckProfile,
     Geometry,
@@ -85,7 +86,7 @@ def read_deck(path: str | Path) -> DeckProfile:
         path=str(path),
         width_in=_inches(prs.slide_width),
         height_in=_inches(prs.slide_height),
-        layouts=_read_layouts(prs),
+        layouts=_read_layouts(prs, theme_colors),
         theme_fonts=theme_fonts,
         theme_colors=theme_colors,
     )
@@ -435,13 +436,20 @@ def _role_for(placeholder_type: Optional[str], shape_name: str) -> TextRole:
 # Layouts
 # --------------------------------------------------------------------------- #
 
-def _read_layouts(prs: Any) -> list[LayoutProfile]:
+def _read_layouts(
+    prs: Any, theme_colors: Optional[dict[str, str]] = None
+) -> list[LayoutProfile]:
     """Read every layout in the file, shapes and all.
 
     Names alone are not enough for either job that needs layouts: checking a
     layout carries its header and footer furniture means looking at its
     shapes, and choosing which layout a messy slide belongs on means comparing
     placeholder structure.
+
+    Placeholders also carry the colour the master gives their text, which is
+    readable here and nowhere downstream: it lives in default run properties
+    on the layout, the master and the theme, and a layout placeholder holds no
+    runs to find it on. See `extract.textstyle`.
     """
     layouts: list[LayoutProfile] = []
     for index, layout in enumerate(_layouts(prs)):
@@ -449,10 +457,25 @@ def _read_layouts(prs: Any) -> list[LayoutProfile]:
             name=_safe(lambda: layout.name) or f"layout {index + 1}",
             index=index,
         )
+        master = _safe(lambda: layout.slide_master)
         for shape in _safe(lambda: list(layout.shapes)) or []:
-            profile.shapes.append(_read_shape(shape))
+            read = _read_shape(shape)
+            _read_placeholder_color(read, shape, master, theme_colors or {})
+            profile.shapes.append(read)
         layouts.append(profile)
     return layouts
+
+
+def _read_placeholder_color(
+    profile: ShapeProfile, shape: Any, master: Any, theme_colors: dict[str, str]
+) -> None:
+    """Record what the master colours this placeholder's text, if anything."""
+    token = profile.placeholder_token
+    if not token:
+        return
+    profile.text_color_hex, profile.text_color_theme = textstyle.placeholder_color(
+        shape, master, theme_colors, token
+    )
 
 
 # --------------------------------------------------------------------------- #

@@ -518,7 +518,7 @@ class _Signals:
             full_bleed_picture=biggest >= 0.9 * canvas,
             body_boxes=len(body),
             body_chars=sum(len(s.text.strip()) for s in body),
-            column_bands=_column_bands(body, deck.width_in),
+            column_bands=column_bands(body, deck.width_in),
         )
 
 
@@ -538,11 +538,16 @@ def _title_text(shapes: list[ShapeProfile]) -> str:
     return min(candidates, key=lambda s: s.geometry.top_in).text
 
 
-def _column_bands(body: list[ShapeProfile], width_in: float) -> list[int]:
+def column_bands(body: list[ShapeProfile], width_in: float) -> list[int]:
     """Which quarters of the canvas the body content starts in.
 
     Quarters rather than exact left edges, so a column heading sitting a
     little proud of the list beneath it still counts as one column and not two.
+
+    Public because the rebuild's matcher counts the same thing for a different
+    purpose -- how many content regions a slide is actually asking a layout for
+    -- and two implementations of "how many columns is this" would drift into
+    two answers.
     """
     if width_in <= 0:
         return []

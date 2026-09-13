@@ -205,29 +205,50 @@ def test_a_renderer_that_produces_nothing_keeps_what_was_there(
 # Rendering one slide again on purpose
 # --------------------------------------------------------------------------- #
 
+def _session(tmp_path: Path, run: int = 3):
+    return type("S", (), {"directory": tmp_path, "run": run})()
+
+
 def test_forcing_a_slide_drops_both_sides_of_its_pair(tmp_path: Path) -> None:
     """A designer asking for a slide again is asking whether the comparison in
     front of them is true, and refreshing half of it answers half of that."""
-    session = type("S", (), {"directory": tmp_path})()
-    for side in ("before", "after"):
-        (tmp_path / side).mkdir()
+    session = _session(tmp_path)
+    sides = (tmp_path / "before", web._after_dir(session))
+    for side in sides:
+        side.mkdir(parents=True)
         for number in (1, 2):
-            (tmp_path / side / f"{number}.png").write_bytes(b"png")
+            (side / f"{number}.png").write_bytes(b"png")
 
     web._forget(session, [1])
 
-    assert not (tmp_path / "before" / "1.png").exists()
-    assert not (tmp_path / "after" / "1.png").exists()
-    assert (tmp_path / "before" / "2.png").exists()      # untouched
-    assert (tmp_path / "after" / "2.png").exists()
+    for side in sides:
+        assert not (side / "1.png").exists()
+        assert (side / "2.png").exists()        # untouched
+
+
+def test_each_run_renders_into_its_own_directory(tmp_path: Path) -> None:
+    """Which is what makes a stale picture unreachable rather than merely
+    deleted: deletion is allowed to fail, and this is not."""
+    assert web._after_dir(_session(tmp_path, run=1))         != web._after_dir(_session(tmp_path, run=2))
+
+
+def test_the_sweep_leaves_the_current_run_alone(tmp_path: Path) -> None:
+    session = _session(tmp_path, run=2)
+    for run in (1, 2):
+        directory = tmp_path / "after" / str(run)
+        directory.mkdir(parents=True)
+        (directory / "1.png").write_bytes(b"png")
+
+    web._sweep(session)
+
+    assert (tmp_path / "after" / "2" / "1.png").exists()
+    assert not (tmp_path / "after" / "1").exists()
 
 
 def test_forcing_a_slide_that_was_never_rendered_is_not_an_error(
     tmp_path: Path,
 ) -> None:
-    session = type("S", (), {"directory": tmp_path})()
-
-    web._forget(session, [3])       # nothing on disk at all
+    web._forget(_session(tmp_path), [3])       # nothing on disk at all
 
 
 # --------------------------------------------------------------------------- #

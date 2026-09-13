@@ -364,8 +364,9 @@ def _rebuild_slide(
         )
 
     pool = _placeholder_pool(new_slide)
+    canvas = _canvas_of(base)
     for shape in src_slide.shapes:
-        target = _claim(pool, shape) if _is_placeholder(shape) else None
+        target = _claim(pool, shape, canvas) if _is_placeholder(shape) else None
         if target is not None:
             _copy_text(shape, target)
             record.filled.append(_name_of(target))
@@ -416,8 +417,32 @@ def _placeholder_pool(slide: Any) -> list[Any]:
         return []
 
 
-def _claim(pool: list[Any], shape: Any) -> Optional[Any]:
-    """Take the first unclaimed placeholder of the same family.
+def _claim(
+    pool: list[Any], shape: Any, canvas: tuple[int, int] = (0, 0)
+) -> Optional[Any]:
+    """Take the unclaimed placeholder of the same family nearest this shape.
+
+    NEAREST, not first, and the difference is a slide arriving scrambled. The
+    pool is in the layout's document order, which is the order the designer's
+    XML happens to carry and has nothing to do with the order a reader sees.
+    On an agenda of eleven numbered items -- twenty-two placeholders, a number
+    and a label each -- taking the first free one of the family put item 01 in
+    the last slot on the slide, shifted every other item up by one, and dropped
+    a two-digit number into a slot sized for something else, where it wrapped
+    to "0 / 3".
+
+    Matched on the box instead: the item that sits top-left on the old slide
+    goes in the placeholder that sits top-left on the new one. Overlap decides
+    it, with the distance between centres breaking ties, so a slide whose
+    layout has moved a little still lands in reading order and a number slot
+    takes a number.
+
+    Greedy, in the order the source slide lists its shapes. A shape can take a
+    placeholder a later one wanted, which a global assignment would avoid; on
+    every deck measured this has not come up, because a source item overlaps
+    its own slot far more than it overlaps its neighbour's, and the simpler
+    thing that can be read in one sitting is worth more here than the last
+    fraction of a percent.
 
     A source placeholder with no counterpart on the new layout returns None
     and is transplanted instead, so extra content is never silently lost.
@@ -425,10 +450,81 @@ def _claim(pool: list[Any], shape: Any) -> Optional[Any]:
     family = _family_of(shape)
     if family is None:
         return None
-    for index, candidate in enumerate(pool):
-        if _family_of(candidate) == family:
-            return pool.pop(index)
-    return None
+    candidates = [
+        index for index, candidate in enumerate(pool)
+        if _family_of(candidate) == family
+    ]
+    if not candidates:
+        return None
+    best = max(candidates, key=lambda index: _affinity(shape, pool[index], canvas))
+    return pool.pop(best)
+
+
+def _affinity(source: Any, target: Any, canvas: tuple[int, int]) -> float:
+    """How much these two boxes look like the same place on the slide.
+
+    Overlap first, because two boxes that share ground are the same slot
+    however differently they are sized. Where nothing overlaps -- a messy
+    deck's item sitting where the new layout puts nothing -- the nearer of the
+    free slots is the better guess, so the distance between centres decides,
+    negated so that closer scores higher and always below any real overlap.
+    """
+    a, b = _box_of(source), _box_of(target)
+    if a is None or b is None:
+        return -1e9
+    width, height = canvas
+    if width > 0 and height > 0:
+        a = (a[0] / width, a[1] / height, a[2] / width, a[3] / height)
+        b = (b[0] / width, b[1] / height, b[2] / width, b[3] / height)
+
+    overlap = (
+        max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+        * max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+    )
+    if overlap > 0:
+        union = (
+            (a[2] - a[0]) * (a[3] - a[1])
+            + (b[2] - b[0]) * (b[3] - b[1])
+            - overlap
+        )
+        return overlap / union if union > 0 else 0.0
+
+    centre_a = ((a[0] + a[2]) / 2, (a[1] + a[3]) / 2)
+    centre_b = ((b[0] + b[2]) / 2, (b[1] + b[3]) / 2)
+    distance = (
+        (centre_a[0] - centre_b[0]) ** 2 + (centre_a[1] - centre_b[1]) ** 2
+    ) ** 0.5
+    return -distance
+
+
+def _box_of(shape: Any) -> Optional[tuple[float, float, float, float]]:
+    """(left, top, right, bottom), or None where the shape will not say.
+
+    A placeholder that states no position of its own answers with the value it
+    inherits from its layout, which is the position it will be drawn at and so
+    the one to match on.
+    """
+    try:
+        left, top = shape.left, shape.top
+        width, height = shape.width, shape.height
+    except Exception:
+        return None
+    if None in (left, top, width, height):
+        return None
+    return (float(left), float(top), float(left + width), float(top + height))
+
+
+def _canvas_of(presentation: Any) -> tuple[int, int]:
+    """The output canvas, for measuring both decks in the same units.
+
+    A deck built at 4:3 and a master at 16:9 state the same place with
+    different numbers, so boxes are compared as fractions of their own canvas
+    rather than in EMU.
+    """
+    try:
+        return int(presentation.slide_width or 0), int(presentation.slide_height or 0)
+    except Exception:
+        return (0, 0)
 
 
 def _family_of(shape: Any) -> Optional[str]:

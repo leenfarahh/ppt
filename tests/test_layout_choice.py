@@ -20,6 +20,8 @@ from formatting_tool.models import (
     Geometry,
     LayoutChoice,
     LayoutProfile,
+    ParagraphProfile,
+    RunProfile,
     ShapeProfile,
     SlideProfile,
 )
@@ -98,16 +100,94 @@ def test_a_model_pick_outranks_the_structural_fit() -> None:
     assert picked.confident
 
 
-def test_a_layout_name_both_files_share_still_wins() -> None:
-    """A designer naming a layout the same in both files is that designer's own
-    statement, and it outranks any reading of a picture."""
+def test_a_shared_layout_name_no_longer_decides_on_its_own() -> None:
+    """The name used to settle this outright, and it is now the weakest of the
+    three signals -- below a reading of the render, and below the measurements.
+
+    Evidence beats labels. A name survives everything: a deck rebuilt onto one
+    master and handed another carries the old names, a template renamed around
+    its slides carries names describing what a layout used to be, and an author
+    duplicating "Title with Content 03" to make something else keeps the name.
+    In each case the name is a label and the structure is the evidence, and
+    this was trusting the label.
+    """
     slide = _slide(layout_name="title_comparison")
     seen = LayoutChoice(slide=1, layout="Cover", confidence=1.0, why="a cover")
 
     picked = choose_layout(slide, _layouts(), FLOOR, deck=_deck(slide), seen=seen)
 
-    assert picked.name == "title_comparison"
-    assert "matches the master" in picked.basis
+    assert picked.name == "Cover"                  # what was looked at
+    assert "read off the rendered slide" in picked.basis
+
+
+def _twins():
+    """Two layouts a master really does carry: the same regions in the same
+    places, drawn apart for something the file does not record -- a darker
+    background, a rule, a different set of furniture."""
+    return [
+        LayoutProfile(name="Title with Content 01", index=0, shapes=[
+            _ph("Title", "TITLE (1)", 0.9, 0.4, 11.5, 1.4),
+            _ph("Body", "BODY (2)", 0.9, 2.0, 11.5, 4.8),
+        ]),
+        LayoutProfile(name="Title with Content 02", index=1, shapes=[
+            _ph("Title", "TITLE (1)", 0.9, 0.4, 11.5, 1.4),
+            _ph("Body", "BODY (2)", 0.9, 2.0, 11.5, 4.8),
+        ]),
+    ]
+
+
+def _body_slide(layout_name=None, number=3):
+    """A body slide with real copy in it, so it classifies as content rather
+    than falling to the heuristics for a slide with nothing on it."""
+    shapes = [
+        ShapeProfile(
+            shape_id=200 + n, name=f"TextBox {n}", shape_type="TEXT_BOX (17)",
+            geometry=Geometry(left_in=0.9, top_in=2.0 + n * 0.9,
+                              width_in=11.0, height_in=0.8),
+            text="body copy " * 12,
+            paragraphs=[ParagraphProfile(
+                text="body copy " * 12,
+                runs=[RunProfile(text="body copy " * 12)],
+            )],
+        )
+        for n in range(3)
+    ]
+    return SlideProfile(number=number, layout_name=layout_name, shapes=shapes)
+
+
+def test_the_name_settles_a_tie_the_measurements_cannot() -> None:
+    """Where the name still counts, and it is not a small case: a master with
+    seven near-identical content layouts is normal, and the structure cannot
+    separate them at all. Without the name the tie goes to whichever sits
+    earlier in the master, which is how every content slide in a real deck
+    ended up on the same layout."""
+    slide = _body_slide(layout_name="Title with Content 02")
+
+    picked = choose_layout(slide, _twins(), FLOOR, deck=_deck(slide))
+
+    assert picked.name == "Title with Content 02"
+    assert "names" in picked.basis
+
+
+def test_a_tie_with_no_name_to_settle_it_still_picks_one() -> None:
+    picked = choose_layout(
+        _body_slide(), _twins(), FLOOR, deck=_deck(_body_slide())
+    )
+
+    assert picked.name == "Title with Content 01"       # the earlier one
+
+
+def test_a_name_that_does_not_fit_is_reported_and_not_followed() -> None:
+    """The disagreement is worth a designer's eye either way, so it is said out
+    loud rather than resolved silently."""
+    # Slide 1 reads as a cover whatever its boxes say, and it names a content
+    # layout. The classification decided; the name is reported, not followed.
+    slide = _slide(layout_name="title_content")
+
+    picked = choose_layout(slide, _layouts(), FLOOR, deck=_deck(slide))
+
+    assert picked.name == "Cover"
+    assert "title_content" in picked.basis and "fits less well" in picked.basis
 
 
 def test_a_hesitant_pick_is_left_to_the_structure() -> None:
@@ -170,3 +250,92 @@ def test_no_layout_choices_at_all_is_fine() -> None:
     """The field is optional in practice: an older response, or a batch with no
     render attached, and the structural matcher decides alone."""
     assert layout_choices_from_response({}, {"Cover"}) == []
+
+
+# --------------------------------------------------------------------------- #
+# Where the content sits, when counting cannot tell two layouts apart
+# --------------------------------------------------------------------------- #
+
+def _image_layouts():
+    """A master's two image layouts, alike but mirrored -- which is how a real
+    one is drawn: `Content with Image 01` puts its picture left and `02` puts
+    it right, and they differ in nothing else."""
+    return [
+        LayoutProfile(name="Content with Image 01", index=0, shapes=[
+            _ph("Title", "TITLE (1)", 6.9, 0.6, 5.6, 1.2),
+            _ph("Body", "BODY (2)", 6.9, 2.0, 5.6, 4.6),
+            _ph("Picture", "PICTURE (18)", 0.0, 0.0, 6.5, 7.5),
+        ]),
+        LayoutProfile(name="Content with Image 02", index=1, shapes=[
+            _ph("Title", "TITLE (1)", 0.8, 0.6, 5.6, 1.2),
+            _ph("Body", "BODY (2)", 0.8, 2.0, 5.6, 4.6),
+            _ph("Picture", "PICTURE (18)", 6.8, 0.0, 6.5, 7.5),
+        ]),
+    ]
+
+
+def _picture(name, left, width=6.5):
+    shape = ShapeProfile(
+        shape_id=abs(hash(name)) % 9999,
+        name=name,
+        shape_type="PICTURE (13)",
+        geometry=Geometry(left_in=left, top_in=0.0, width_in=width, height_in=7.5),
+    )
+    shape.is_picture = True
+    return shape
+
+
+def _slide_with_image_on(side: str) -> SlideProfile:
+    """A slide the count cannot place: a photograph down one half and a column
+    of loose text boxes down the other, which is what a messy deck looks like."""
+    picture_left = 0.0 if side == "left" else 6.8
+    copy_left = 6.9 if side == "left" else 0.8
+    shapes = [_picture("Photo", picture_left)]
+    for index in range(6):
+        box = ShapeProfile(
+            shape_id=100 + index,
+            name=f"TextBox {index}",
+            shape_type="TEXT_BOX (17)",
+            geometry=Geometry(
+                left_in=copy_left, top_in=1.0 + index * 0.9,
+                width_in=5.6, height_in=0.8,
+            ),
+            text="copy",
+        )
+        box.paragraphs = [ParagraphProfile(text="copy")]
+        shapes.append(box)
+    return SlideProfile(number=1, layout_name="Title Only", shapes=shapes)
+
+
+def _best(slide, layouts):
+    from formatting_tool.rebuild.matcher import structure_score
+
+    return max(
+        ((structure_score(slide, layout), layout.name) for layout in layouts),
+    )[1]
+
+
+def test_the_layout_with_the_image_on_the_same_side_wins() -> None:
+    """Counting regions cannot separate these two: both offer a title, a body
+    and a picture, and the slide asks for the same three however many loose
+    boxes its copy is in. Before there was anything else to go on, the tie went
+    to whichever layout came first in the master -- so every slide in a deck
+    got the same one, image on the left or not."""
+    layouts = _image_layouts()
+
+    assert _best(_slide_with_image_on("left"), layouts) == "Content with Image 01"
+    assert _best(_slide_with_image_on("right"), layouts) == "Content with Image 02"
+
+
+def test_a_layout_that_cannot_hold_the_content_still_loses() -> None:
+    """Position is the tie-break, not the decision. A layout with nowhere to
+    put the picture is wrong wherever its regions sit."""
+    from formatting_tool.rebuild.matcher import structure_score
+
+    slide = _slide_with_image_on("left")
+    text_only = LayoutProfile(name="Title with Content", index=2, shapes=[
+        _ph("Title", "TITLE (1)", 0.9, 0.4, 11.5, 1.4),
+        _ph("Body", "BODY (2)", 0.9, 2.0, 11.5, 4.8),
+    ])
+
+    assert structure_score(slide, _image_layouts()[0]) > structure_score(slide, text_only)

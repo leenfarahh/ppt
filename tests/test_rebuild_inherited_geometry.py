@@ -30,6 +30,7 @@ from formatting_tool.rebuild.pictures import (
     _bake_frame,
     _bake_look,
     _carries_picture,
+    _ensure_geometry,
     _strip_ph,
     freeze_file,
 )
@@ -439,3 +440,49 @@ def test_a_custom_mask_survives_too(tmp_path: Path) -> None:
     rebuild(master, deck, out, route="xml")
 
     assert _pictures(out)[0].spPr.custGeom is not None
+
+
+# --------------------------------------------------------------------------- #
+# The photograph that rendered as white
+# --------------------------------------------------------------------------- #
+
+def test_a_picture_with_nothing_to_inherit_from_gets_the_implicit_rectangle() -> None:
+    """The second half of the same bug, and a worse one to look at: not a
+    photograph in the wrong shape but no photograph at all.
+
+    A picture placeholder states no geometry because it takes one from the
+    layout behind it, and where the layout states none either, both are
+    relying on the implicit rectangle the schema gives a placeholder. Take the
+    `p:ph` away -- which is the whole point of freezing -- and the shape is an
+    ordinary picture with a frame and no geometry, and a shape with no geometry
+    has nothing to fill. PowerPoint opens the file, lists the shape as visible
+    at the right size, and exports white.
+    """
+    spPr = _spPr('<a:xfrm><a:off x="1" y="2"/><a:ext cx="3" cy="4"/></a:xfrm>')
+
+    _ensure_geometry(spPr)
+
+    geometry = spPr.find(qn("a:prstGeom"))
+    assert geometry is not None
+    assert geometry.get("prst") == "rect"
+    # After the frame, which is the order the schema states.
+    assert list(spPr).index(spPr.find(qn("a:xfrm"))) < list(spPr).index(geometry)
+
+
+def test_a_shape_that_states_its_own_geometry_is_left_alone() -> None:
+    """The circle case. Writing a rectangle over a mask somebody drew would be
+    the original bug, arriving by the other door."""
+    spPr = _spPr('<a:custGeom><a:pathLst/></a:custGeom>')
+
+    _ensure_geometry(spPr)
+
+    assert spPr.find(qn("a:prstGeom")) is None
+    assert spPr.find(qn("a:custGeom")) is not None
+
+
+def test_an_inherited_preset_is_not_replaced_by_the_rectangle() -> None:
+    spPr = _spPr('<a:prstGeom prst="ellipse"><a:avLst/></a:prstGeom>')
+
+    _ensure_geometry(spPr)
+
+    assert spPr.find(qn("a:prstGeom")).get("prst") == "ellipse"

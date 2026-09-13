@@ -192,6 +192,67 @@ def test_the_original_deck_is_still_never_modified(tmp_path: Path) -> None:
     assert deck.read_bytes() == before
 
 
+def test_the_second_round_does_not_put_an_undone_change_back(tmp_path: Path) -> None:
+    """The hole that made an undo look broken on a real deck.
+
+    Holding a change back leaves the defect it was correcting standing. The
+    recheck then finds that defect -- and can find it under a rule the original
+    report never fired on that shape, which makes it, to the second round, a
+    finding this run introduced and therefore its business to clear up. The
+    shapes move again and the file comes out as though nothing was undone.
+
+    So a shape a change has been taken back on is one the run has finished
+    with. Checked here at the seam rather than through a deck contrived to
+    provoke the pair of rules, because the guard is the thing worth pinning:
+    `_second_round` must skip a finding on a held-back shape even when that
+    finding carries an id nobody has undone.
+    """
+    from formatting_tool.apply.applier import ApplyResult, FixContext, _second_round
+
+    other = _issue("space.series_uneven", "Row 0", 42)
+    result = ApplyResult(deck="messy.pptx", output=tmp_path / "out.pptx")
+    result.rechecked = True
+    result.recheck = [other]
+    result.before = []                      # so `introduced` holds `other`
+
+    _second_round(
+        result,
+        FixContext(width_emu=12192000, height_emu=6858000),
+        spec=None,
+        held=set(),                          # a different id: not held by id
+        held_shapes={(other.slide, other.shape_id)},
+    )
+
+    assert result.second_round == []         # the shape is finished with
+
+
+def test_the_second_round_still_clears_up_after_itself_elsewhere(
+    tmp_path: Path,
+) -> None:
+    """The guard is one shape wide. A defect this run caused on some other
+    shape is still this run's mess."""
+    from formatting_tool.apply.applier import ApplyResult, FixContext, _second_round
+
+    deck, made = _deck(tmp_path, [-1.0])
+    other = _issue("space.off_canvas", "Row 0", made[0].shape_id)
+    result = ApplyResult(deck="messy.pptx", output=deck)
+    result.rechecked = True
+    result.recheck = [other]
+    result.before = []
+
+    _second_round(
+        result,
+        FixContext(width_emu=12192000, height_emu=6858000),
+        spec=None,
+        held=set(),
+        held_shapes={(1, made[0].shape_id + 1000)},     # a different shape
+    )
+
+    assert len(result.second_round) == 1
+    assert result.second_round[0].applied
+    assert _lefts(deck)["Row 0"] == 0.0      # cleared up, as it should be
+
+
 # --------------------------------------------------------------------------- #
 # Ids that name nothing
 # --------------------------------------------------------------------------- #

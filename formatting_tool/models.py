@@ -452,6 +452,19 @@ class ShapeProfile:
     image_sha1: Optional[str] = None    # identifies a logo asset across decks
     autofit: Optional[str] = None
     word_wrap: Optional[bool] = None
+    # What the MASTER says text in this placeholder is coloured, resolved
+    # through the chain that decides it: the layout placeholder's own default
+    # run properties, the master's placeholder, the master's text styles, the
+    # theme. Read for layout placeholders only -- a slide's shape carries its
+    # colour on its runs, where everything else here reads it from.
+    #
+    # It is the value a fix should use where it exists. Snapping an off-palette
+    # title to the nearest brand colour is a guess; the master has already said
+    # which colour a title on this layout is, and it is not always the same one
+    # -- white on the cover, the accent on a section divider, the dark text
+    # colour on a content layout.
+    text_color_hex: Optional[str] = None
+    text_color_theme: Optional[str] = None
     # cNvPr/@descr. Carried because a designer can put a machine-readable mark
     # in it, and one convention depends on that: a rectangle described "PS"
     # marks out the presentation space (see PRESENTATION_SPACE_ALT).

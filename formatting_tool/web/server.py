@@ -102,6 +102,35 @@ class _Session:
     rebuild: bool = False
     undone: list[str] = field(default_factory=list)
     applied_once: bool = False
+    # How many times the corrected deck has been written. Every run produces a
+    # different file, so its renders go in a directory of their own and are
+    # served from URLs carrying the number.
+    #
+    # THE ALTERNATIVE DOES NOT WORK, which is what this replaces: deleting the
+    # old images and rendering into the same place again. Deletion is allowed
+    # to fail -- on Windows a file that anything still holds open cannot be
+    # removed, and the removal was deliberately best-effort so it could not
+    # fail a request -- and a directory that did not empty reads as a cache
+    # that is already full. The page then shows the previous run's pictures
+    # beside the new deck, which is the worst thing it can do: the undo was
+    # applied, the download was right, and the evidence on screen said it had
+    # not happened.
+    #
+    # A number in the path cannot half-work. A render either exists for this
+    # run or is made; nothing older is reachable, by the page or by anything
+    # caching on its behalf.
+    run: int = 0
+    # How the check was run, so a rebuild minutes later can ask the model the
+    # one question it is good at. Kept rather than re-derived: the page sends
+    # nothing about the AI when it applies, and guessing at a model and a key
+    # would be inventing the designer's settings for them.
+    ai: Any = None
+    use_ai: bool = False
+    # Which layout each slide belongs on, as read off its render. Computed at
+    # most once per session: it costs a model call a slide, and an undo is a
+    # whole run of the fixes, so charging for it again on every take-back would
+    # make the cheapest correction the most expensive thing on the page.
+    layout_picks: Optional[list] = None
 
     @property
     def fixed(self) -> Path:
@@ -348,10 +377,14 @@ class _Handler(BaseHTTPRequestHandler):
                 master=session.master if session.rebuild else None,
                 spec=session.spec,
                 undone=session.undone,
+                layout_choices=_layout_picks(session) if session.rebuild else None,
             )
             elapsed = time.perf_counter() - started
         session.applied_once = True
-        _stale(session)
+        # A new file, so a new place for its pictures, and the old ones swept
+        # up if they will go.
+        session.run += 1
+        _sweep(session)
 
         return {
             "session": session.id,
@@ -449,7 +482,7 @@ class _Handler(BaseHTTPRequestHandler):
         before = _render_into(session.deck, session.directory / "before", slides)
         after: dict[int, str] = {}
         if session.fixed.exists():
-            after = _render_into(session.fixed, session.directory / "after", slides)
+            after = _render_into(session.fixed, _after_dir(session), slides)
 
         numbers = sorted(set(before) | set(after))
         if slides:
@@ -466,7 +499,13 @@ class _Handler(BaseHTTPRequestHandler):
                 {
                     "slide": n,
                     "before": f"/api/preview/{session.id}/before/{n}" if n in before else None,
-                    "after": f"/api/preview/{session.id}/after/{n}" if n in after else None,
+                    # The run number rides along so that a page, and anything
+                    # caching for it, cannot answer with the last run's picture
+                    # from a URL that has not changed.
+                    "after": (
+                        f"/api/preview/{session.id}/after/{n}?run={session.run}"
+                        if n in after else None
+                    ),
                 }
                 for n in numbers
             ],
@@ -483,7 +522,10 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": str(exc)})
             return
 
-        directory = session.directory / parts[3]
+        directory = (
+            _after_dir(session) if parts[3] == "after"
+            else session.directory / "before"
+        )
         image = _image_for(directory, parts[4])
         if image is None:
             self._send_json(404, {"error": "no such rendered slide"})
@@ -581,6 +623,8 @@ class _Handler(BaseHTTPRequestHandler):
                 deck=config.decks[0],
                 report=report.to_dict(),
                 spec=report.spec,
+                ai=config.ai,
+                use_ai=config.use_ai,
             )
             _remember(session)
             keep = True
@@ -680,31 +724,101 @@ def _forget(session: _Session, slides: list[int]) -> None:
     Both, because the two are read together: a designer asking for a slide
     again is asking whether the comparison in front of them is true, and
     refreshing half of it answers half the question.
+
+    This one may fail quietly: it is a designer asking for a picture to be made
+    again, so the worst case is the button appearing not to work, and they can
+    press it again. Nothing silently presents an old image as a new one -- that
+    is what the per-run directories are for.
     """
     for number in slides:
-        for side in ("before", "after"):
-            path = session.directory / side / f"{number}.png"
+        for directory in (session.directory / "before", _after_dir(session)):
             try:
-                path.unlink()
+                (directory / f"{number}.png").unlink()
             except OSError:
                 pass
 
 
-def _stale(session: _Session) -> None:
-    """Throw away the renders of the corrected deck, which has just changed.
+def _layout_picks(session: _Session) -> list:
+    """Which layout each slide belongs on, as somebody looking would say.
 
-    `_render_into` caches, deliberately: driving PowerPoint costs seconds and
-    the BEFORE images are of the upload, which never changes. The after images
-    are of a file this run has just written again, so the cache is of a deck
-    that no longer exists -- and a stale after image is the worst thing this
-    page can show, because the whole point of it is to be the evidence. Undo
-    made that visible; it was already true of a second apply.
+    The structural matcher counts the content regions a slide uses against the
+    regions a layout offers, which is right on a tidy deck and not on a messy
+    one: a messy deck keeps its copy in loose text boxes -- that is what makes
+    it messy -- so the count is of boxes rather than of regions. `ai.layout`
+    exists for exactly that, and was reachable only from
+    `validate --apply-master`; the rebuild a designer runs from this page never
+    asked it, and picked structurally every time.
 
-    The whole directory rather than the slides that changed: `render_deck`
-    renders a deck, not a slide, and `_render_into` returns its cache whole, so
-    a half-emptied directory would hand back the stale half.
+    Silent and empty whenever it cannot help: the AI layer off, no renderer on
+    this machine, no API key, a model that declines. The structural matcher
+    then decides alone, which is what happened before this was wired in, so the
+    worst case is the behaviour that was already there.
+
+    Computed once and kept. It costs a call a slide, and an undo replays the
+    whole run -- charging again for the same answer on every take-back would
+    make the cheapest correction on the page the most expensive.
     """
-    rmtree(session.directory / "after", ignore_errors=True)
+    if session.layout_picks is not None:
+        return session.layout_picks
+    session.layout_picks = []           # so a failure is not retried per run
+    if not session.use_ai or session.spec is None or session.ai is None:
+        return session.layout_picks
+
+    try:
+        from ..ai.layout import choose_layouts  # noqa: PLC0415 - lazy, optional
+
+        directory = session.directory / "before"
+        rendered = _render_into(session.deck, directory)
+        if not rendered:
+            log.info("no layout pass: nothing rendered for %s", session.deck.name)
+            return session.layout_picks
+
+        images = sorted(
+            (number, directory / name) for number, name in rendered.items()
+        )
+        session.layout_picks = choose_layouts(
+            session.spec,
+            images,
+            model=session.ai.model,
+            thinking_budget=session.ai.thinking_budget,
+            api_key_env=session.ai.api_key_env,
+        )
+        log.info(
+            "the model chose a layout for %d of %d slide(s)",
+            len(session.layout_picks), len(images),
+        )
+    except Exception:
+        log.warning(
+            "could not ask the model which layouts these slides belong on; "
+            "the structural matcher decides alone", exc_info=True,
+        )
+    return session.layout_picks
+
+
+def _after_dir(session: _Session) -> Path:
+    """Where this run's renders of the corrected deck live.
+
+    One directory per run. See `_Session.run` for why the images are not simply
+    replaced in place.
+    """
+    return session.directory / "after" / str(session.run)
+
+
+def _sweep(session: _Session) -> None:
+    """Remove renders of runs that are over. Best effort, and that is safe.
+
+    Nothing depends on this working: the current run reads its own directory
+    and cannot see these whether they go or not. It is housekeeping, so a file
+    Windows will not let go of costs disk space rather than correctness --
+    which is exactly what could not be said when the same deletion was what
+    made the pictures on the page true.
+    """
+    root = session.directory / "after"
+    if not root.is_dir():
+        return
+    for directory in root.iterdir():
+        if directory.is_dir() and directory.name != str(session.run):
+            rmtree(directory, ignore_errors=True)
 
 
 def _undone_field(key: str, issues: list[Any], field_name: str) -> Any:

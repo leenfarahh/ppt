@@ -59,6 +59,64 @@ def _theme_note(slot: Optional[str], spec) -> Optional[str]:
     return f"theme:{slot} #{theirs}" if theirs else None
 
 
+# Said in the finding and read back by the fixer, which is how the two agree on
+# where the colour came from. A nearest-palette target is a guess and is moved
+# by the deck-wide colour plan; this one is the master's own statement and is
+# not up for negotiation.
+MASTER_SETS_IT = "the master sets this placeholder"
+
+
+def master_text_color(ctx: RuleContext, slide, shape) -> Optional[tuple[str, str]]:
+    """The colour the master gives this placeholder, and which layout said so.
+
+    None unless all three of these hold, and each of them is the difference
+    between an answer and a guess:
+
+    - the shape is a PLACEHOLDER. A loose text box is not the master's to
+      colour, and there is nothing to look its intended colour up by.
+    - the slide is on a layout the master HAS. A deck still sitting on its
+      previous master names layouts this one has never heard of, and matching
+      them by name would be reading another brand's file.
+    - that layout states a colour for this placeholder, through the chain
+      `extract.textstyle` walks. A master may leave a placeholder to inherit
+      all the way to a theme that states nothing either, and then it has said
+      nothing and this says nothing.
+
+    Matched by placeholder INDEX before type, because index is what PowerPoint
+    binds a slide's placeholder to its layout's. A layout with two body
+    placeholders colours them separately -- one real master colours its agenda
+    rows alternately, black and the accent -- and matching on "BODY" would hand
+    back whichever came first.
+    """
+    token = shape.placeholder_token
+    if not token or token in _CHROME:
+        return None
+    layout = ctx.spec.layout_named(slide.layout_name)
+    if layout is None:
+        return None
+
+    match = None
+    if shape.placeholder_idx is not None:
+        match = next(
+            (p for p in layout.placeholders
+             if p.placeholder_idx == shape.placeholder_idx),
+            None,
+        )
+    if match is None:
+        match = next(
+            (p for p in layout.placeholders if p.placeholder_token == token),
+            None,
+        )
+    if match is None or not match.text_color_hex:
+        return None
+    return match.text_color_hex.upper(), repr(layout.name)
+
+
+# Placeholders whose colour is furniture rather than content. A page number is
+# the master's business and nobody's finding.
+_CHROME = frozenset({"FOOTER", "SLIDE_NUMBER", "DATE"})
+
+
 def _target(value: str, palette: dict, tolerance: float, tuning) -> tuple:
     """What a colour should become, and how sure the rule is about it.
 
@@ -134,6 +192,27 @@ class OffPaletteTextRule(Rule):
             label, distance = nearest_palette_entry(value, palette)
             if distance is None or distance <= tolerance:
                 continue
+
+            stated = master_text_color(ctx, slide, shape)
+            if stated is not None:
+                colour, where = stated
+                yield self.issue(
+                    f"Text colour #{value} is off-palette "
+                    f"(nearest: {label}, delta-E {distance:.1f}). "
+                    f"{MASTER_SETS_IT.capitalize()} on {where}.",
+                    slide=slide,
+                    shape=shape,
+                    expected=f"{MASTER_SETS_IT} in #{colour}",
+                    found=f"#{value}",
+                    suggestion=(
+                        f"Set it to #{colour}, the colour {where} gives this "
+                        "placeholder. Better still, clear the colour on the run "
+                        "so it inherits and follows the master if the master "
+                        "changes."
+                    ),
+                )
+                continue
+
             expected, suggestion = _target(value, palette, tolerance, ctx.tuning)
             yield self.issue(
                 f"Text colour #{value} is off-palette "

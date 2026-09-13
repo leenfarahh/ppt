@@ -321,6 +321,7 @@ def apply_fixes(
     tolerances: Optional[Tolerances] = None,
     spec: Optional[Any] = None,
     undone: Optional[Iterable[str]] = None,
+    layout_choices: Optional[Sequence[Any]] = None,
 ) -> ApplyResult:
     """Apply the selected findings to `deck` and write the result to `out`.
 
@@ -355,7 +356,11 @@ def apply_fixes(
     not -- and it is what makes undoing several, in any order, safe.
 
     With `master`, the corrected deck is then rebuilt onto that master's
-    layouts.
+    layouts, and `layout_choices` is which layout each slide belongs on as read
+    off its rendered picture. Without them the structural matcher decides
+    alone, which is what every rebuild from the page did until this argument
+    existed: the model pass was reachable from `validate --apply-master` and
+    from nowhere else.
     """
     from pptx import Presentation  # noqa: PLC0415 - lazy heavy dependency
 
@@ -365,9 +370,35 @@ def apply_fixes(
 
     wanted = _wanted(issues, selected)
     held = list(dict.fromkeys(str(key) for key in (undone or ())))
+    # The shapes a change has been taken back on. Held back BY SHAPE as well as
+    # by id, because the second round would otherwise put the change straight
+    # back under another name.
+    #
+    # The hole this closes, on a real deck: a row of six shapes corrected by
+    # `space.series_crowded`, the correction taken back, and the row left
+    # crowded -- which is a defect, so the recheck finds it, and finds it under
+    # `space.series_uneven`, a rule the original report had not fired on that
+    # shape. To the second round that is a finding this run introduced and
+    # therefore its business to clear up. The shapes move again, the file comes
+    # out the same as before the undo, and the designer, who watched a change
+    # vanish from the list and nothing change in the deck, is right to say the
+    # undo did not work.
+    #
+    # So a shape the designer has taken a change back on is one this run has
+    # finished with. Only that shape, and only in the second round: the first
+    # round is the list they ticked, and a second change they ticked on the
+    # same shape is still theirs to have.
+    held_shapes: set = set()
     if held:
         blocked = set(held)
         wanted = [issue for issue in wanted if (issue.id or "") not in blocked]
+        held_shapes = {
+            (issue.slide, issue.shape_id)
+            for issue in issues
+            if (issue.id or "") in blocked
+            and issue.slide is not None
+            and issue.shape_id is not None
+        }
     out.parent.mkdir(parents=True, exist_ok=True)
 
     presentation = Presentation(str(deck))
@@ -422,11 +453,11 @@ def apply_fixes(
     )
 
     if master is not None:
-        result.rebuilt = _rebuild_in_place(master, out, tuning)
+        result.rebuilt = _rebuild_in_place(master, out, tuning, layout_choices)
 
     result.before = list(issues)
     _recheck(result, spec)
-    _second_round(result, context, spec, set(held))
+    _second_round(result, context, spec, set(held), held_shapes)
     _note_unmatched_undo(result, issues)
     _copy_notes(result, context)
     return result
@@ -531,6 +562,7 @@ def _second_round(
     context: FixContext,
     spec: Optional[Any],
     held: Optional[set[str]] = None,
+    held_shapes: Optional[set] = None,
 ) -> None:
     """Correct what this run caused, on the deck it wrote.
 
@@ -562,10 +594,15 @@ def _second_round(
     # reason to care which round made one, so a fix that could not be taken
     # back would be a hole in the list at exactly the point they reach for it.
     held = held or set()
+    # And the shapes those changes were about: a defect left standing BECAUSE a
+    # change was taken back is not this run's mess to clear up, whatever rule
+    # the recheck reports it under. See `apply_fixes`.
+    held_shapes = held_shapes or set()
     todo = [
         issue for issue in fixable(result.introduced)
         if not _reverses_a_fix(issue, already)
         and (issue.id or issue.fingerprint()) not in held
+        and (issue.slide, issue.shape_id) not in held_shapes
     ]
     if not todo:
         result.settled = list(result.recheck)
@@ -1318,19 +1355,31 @@ def _wanted(
 
 
 def _rebuild_in_place(
-    master: str | Path, target: Path, tuning: Optional[RuleTuning]
+    master: str | Path,
+    target: Path,
+    tuning: Optional[RuleTuning],
+    layout_choices: Optional[Sequence[Any]] = None,
 ) -> Any:
     """Rebuild the corrected deck onto the master, over the same output path.
 
     Done through a temporary file because the rebuild reads its source while
     writing its target, and those cannot be the same path.
+
+    `layout_choices` is which layout each slide belongs on as read off its
+    rendered picture -- see `ai.layout`, and `rebuild.matcher.choose_layout`
+    for where it sits among the other signals. Passing none leaves the
+    structural matcher to decide alone, which is what this did before: the
+    model pass was wired into `validate --apply-master` and into nothing else,
+    so the rebuild a designer actually runs from the page never saw it.
     """
     from ..rebuild import rebuild  # noqa: PLC0415 - avoids a circular import
 
     staged = target.with_suffix(".prefix.pptx")
     shutil.move(str(target), str(staged))
     try:
-        return rebuild(master, staged, target, tuning=tuning)
+        return rebuild(
+            master, staged, target, tuning=tuning, seen=layout_choices or None
+        )
     finally:
         staged.unlink(missing_ok=True)
 

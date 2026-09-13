@@ -284,7 +284,7 @@ there is one way to reach the target:
 | `space.satellite_offset` | nudges one copy of a repeated pairing back onto the offset its cohort shares |
 | `title.position_inconsistent` | moves a drifting title onto the position the rest of the deck's titles hold |
 | `logo.geometry` | moves the logo onto the master's position |
-| `color.text.off_palette` | recolours the runs carrying the off-palette colour to the nearest palette entry |
+| `color.text.off_palette` | in a placeholder, sets the colour the master gives it; elsewhere, the nearest palette entry |
 | `color.shape.off_palette` | recolours the fill, the outline, or the SVG an icon draws from |
 | `typography.terminal_punctuation` | takes the full stop off the end of a title |
 | `font.family.arabic` | sets the Arabic runs in the brand's Arabic face, when it declares one |
@@ -332,6 +332,22 @@ not just the undos:
 | The fixes, on 105 slides / 1086 fixes | 47.4s | 20.9s |
 | Preview render, three slides of that deck | 10.6s | 2.2s |
 
+A rebuilt run costs more per undo than a plain one: measured on a real
+31-slide, 31MB deck, an undo takes 50s and 30s of that is PowerPoint applying
+the master again. The fixes themselves are 9s of it.
+
+**An undone change stays undone.** Holding a fix back leaves the defect it was
+correcting standing, the recheck finds that defect, and it can find it under a
+rule the original report never fired on that shape -- which makes it, to the
+second round, a finding this run introduced and therefore its business to clear
+up. A row of six shapes went back to being spread evenly by
+`space.series_uneven` after `space.series_crowded` had been taken back on it,
+and the file came out as though nothing had been undone. So a shape a change
+has been taken back on is one the run has finished with: the second round skips
+it. One shape wide, and only in the second round -- the first round is the list
+the designer ticked, and a second change they ticked on the same shape is still
+theirs to have.
+
 The fix loop was reading the same slide over and over through python-pptx,
 where every geometry read is an XPath: `_cohort_move` rebuilt the list of
 shapes not coming along once per member and re-read all their boxes each time,
@@ -346,6 +362,33 @@ It now asks PowerPoint for the slides it needs, falling back to the whole deck
 when that is cheaper (above a fifth of it) or when per-slide export fails,
 which it does on some paths. The rest of an undo is the recheck and the second
 round, which measure the written deck the same way `validate` does.
+
+**Placeholder text takes the master's own colour.** Snapping an off-palette
+title to the closest brand colour is a guess made in front of an answer: the
+master has already said what colour a title on that layout is. It is not one
+colour per deck either -- off one real master a title is white on the cover,
+the accent green on a section divider, and the dark text colour on a content
+layout -- so the question is always about a particular layout.
+
+The cost of guessing was not theoretical. On that master a red cover title
+measured nearest to the theme's dark colour, so the fix was black text on a
+dark navy slide: unreadable, and reported as putting the deck on brand.
+
+The value is read where it lives, which is why nothing found it before: a
+layout placeholder holds no text, so it carries no run with a colour on it.
+What it carries is a default, `a:lstStyle/a:lvl1pPr/a:defRPr`, and where it
+carries none it inherits from the master's placeholder and then the master's
+`p:txStyles`, with scheme colours resolved through the theme. See
+`extract.textstyle`.
+
+It applies to any placeholder -- title, subtitle, body -- whenever the slide
+sits on a layout the master has and that layout states a colour for it.
+Otherwise the nearest-palette fallback stands, because a deck still on its
+previous master names layouts this one has never heard of, and matching them
+by name would be reading another brand's file. The deck-wide colour plan gets
+no say here: it exists to keep colours that MEAN something distinct from each
+other, and a title is not an encoding -- every title on a layout is the same
+colour on purpose.
 
 **A set is read as rows and columns, not as one shared edge.** Every space
 rule modelled a set as shapes sharing ONE edge, which meant two columns of
@@ -700,10 +743,101 @@ after before sending it on.
 | Speaker notes | Carried across as plain text |
 | The master's own sample slides | Dropped. The master is a template here, not content |
 
-Layouts are matched by name first. Failing that, by what the slide is for
-(see `classify` above), and failing that by content regions and their counts.
+**A picture that renders as white.** A full-bleed image down the right half of
+a section divider came out of the rebuild as a blank panel, and every check
+said the file was fine: the `p:pic` was there, on top, with its frame baked in
+and its image resolving to a 2.4MB JPEG in the package. PowerPoint opened it
+without complaint, listed the shape as visible at the right size, and exported
+nothing. What the shape had lost was its GEOMETRY -- a picture placeholder
+states no `a:prstGeom` because it takes one from the layout behind it, and
+where the layout states none either, both are relying on the implicit rectangle
+the schema gives a placeholder. Strip the `p:ph`, which is what freezing must
+do, and the shape is an ordinary picture with a frame and no geometry, and a
+shape with no geometry has nothing to fill. So the implicit rectangle is now
+written out before the `p:ph` goes, and only where the shape states nothing of
+its own.
+
+Layouts are matched by what somebody looked at first -- the AI layer's reading
+of the render, when there is one -- then by what the slide is for (see
+`classify` above) and the content regions it carries: how many of each kind,
+and **where they sit**.
+
+**The reading of the render now reaches the rebuild a designer actually runs.**
+`ai.layout` asks the model which layout each slide belongs on, from its
+picture, and its own notes record it beating the structural matcher on four of
+five slides of a real deck -- the question it answers is coarse and
+categorical, which is what a render is good for. It was wired into
+`validate --apply-master` and into nothing else: Apply with "rebuild onto the
+master" called `rebuild()` with no picks at all, so every layout it chose came
+from counting boxes. The picks are computed once per session and kept, because
+an undo replays the whole run and paying a call a slide again on every
+take-back would make the cheapest correction the most expensive thing on the
+page. With the AI layer off, no renderer, or no key, the structural matcher
+decides alone exactly as before.
+
+**The name the slide carries is the weakest of the three**, and it used to be
+the strongest. A slide whose layout name existed in the master was placed on it
+outright, scored 1.0, called confident and never measured. That is right often
+enough, and wrong in the cases that matter: a name survives everything. A deck
+rebuilt onto one master and handed another carries the old names; a template
+renamed around its slides carries names for what a layout used to be; an author
+duplicating `Title with Content 03` to make something else keeps the name.
+Evidence beats labels.
+
+Three things keep that from throwing the name away entirely, because it is
+still a designer's own statement:
+
+- **It settles ties.** A master with seven near-identical content layouts is
+  normal and the structure cannot separate them at all; the slide's own name
+  for one of them beats the tie-break it replaced, which was whichever layout
+  sat earlier in the master.
+- **It decides when there is nothing to measure.** A slide carrying no content
+  gives the structure no evidence, and "structure first" cannot mean preferring
+  a silence to a statement.
+- **It outranks a classification the classifier is unsure of.** `classify_slide`
+  grades itself: a title saying "Agenda" is 0.9, a first slide with one region
+  0.75, "too little text to be a content slide" 0.6. Below 0.75 the reading is
+  a guess, and a guess does not move a slide off the layout its author named --
+  before this, it called a rebuilt deck's cover a section and took it off
+  `Title Slide`.
+
+Where the name and the structure disagree and the structure wins, the report
+says so: the disagreement is worth a designer's eye either way.
+
+Four things decide it, and each was a wrong pick on a real deck before it was
+there:
+
+| | |
+| --- | --- |
+| Copy is counted in COLUMNS, not boxes | Fourteen loose text boxes a slide is not fourteen demands; a heading, its list and a caption are one column |
+| Imagery has to be big enough to be imagery | Three 0.4in icons beside the copy made a slide with no photograph read as an image slide |
+| Position is measured PER FAMILY | Title against title, copy against copy, photo against photo. Compared as one union, a layout wins by being big: an agenda layout with 25 placeholders overlapped everything |
+| Crowding lowers the score | Twelve boxes and two boxes both read as one column. The layout is the right shape for either; it only FITS the second, and the difference is what the confidence flag is for |
+
+Position matters because counting runs out. A messy slide made of fourteen
+loose text boxes asks for fourteen regions, no designed layout offers more than
+three, and every candidate scores the same; the match was then settled by which
+layout came first in the master, so seven content slides on one real deck all
+went to `Content with Image 01`, image layouts for slides with no image. Where
+the content sits survives that: a photograph down the right half and a column
+of copy on the left is the same shape of slide whether the copy is in one
+placeholder or fourteen boxes. Counting still dominates -- a layout that cannot
+hold the content is wrong wherever its regions sit -- and position breaks the
+ties, with the imagery weighted heaviest, because `Content with Image 01` and
+`02` differ by nothing else. A picture region is also no longer counted as
+interchangeable with a body one: text in a picture region and a photograph in a
+body region are both wrong, and a designer sees which straight away.
 A slide that fits nothing well is still placed, on the best layout available,
 and named in the output for a designer to look at.
+
+**Copy lands in the slot it sat on, not the next one in the file.** A layout's
+placeholders sit in the order the designer's XML happens to carry, which has
+nothing to do with the order a reader sees. Claiming the first free one of the
+same family scrambled an agenda of eleven numbered items: the rebuilt slide
+read 02, 03 ... 11, 01, with item 01 alone at the foot of the second column and
+a two-digit number wrapped to "0 / 3" in a slot sized for something else. The
+item at the top left of the old slide now takes the placeholder at the top left
+of the new one -- overlap decides, distance between centres breaks ties.
 
 Two things it deliberately does not do:
 
@@ -750,10 +884,27 @@ changed before downloading the corrected deck.
   listed under the changes with a **Restore** on each, and they accumulate, so
   taking back a second change keeps the first one taken back. Pressing Apply
   again starts a fresh run: the tick list you just sent is what you want.
+- **The two changes that will not show on a render say so.** `typography.whitespace`
+  is marked *no visible change* and `typography.orphan_widow` *wrap only*: one
+  non-breaking space, which shows only if it changes where the line breaks, and
+  in a box too narrow for the pair to share a line it shows nowhere at all. Two
+  identical pictures otherwise read as a tool that did nothing, and the next
+  thing doubted is the rest of the list.
+
+  It is a list of two rules rather than a measurement, and that is deliberate.
+  The first attempt asked whether the shape had moved, which is wrong twice
+  over: clearing a hardcoded typeface moves nothing and changes every glyph,
+  and re-spacing a component's cells moves the other shapes rather than the one
+  the finding names. Marking either invisible tells a designer to stop looking
+  at the changes most worth looking at.
 - **The change list is grouped by what kind of change it is** -- layout,
   titles, logo, typefaces, colour, position and spacing, tables, typography --
-  each group folded on its own, and each fold remembered. Forty lines read as
-  six groups, and skipped findings get a group of their own rather than a tail.
+  each group folded on its own, and each fold remembered. The same grouping
+  appears under each pair of renders, keyed per slide so one slide's Colour
+  does not fold with another's. Groups start closed: forty-four changes is a
+  wall of text however it is sorted, and the point of the groups is to read as
+  six lines saying what kind of work was done. Skipped findings get a group of
+  their own rather than a tail.
 - **An undone change says what it did**, in the words it was described in when
   it was made: "slide 12 &middot; Picture 3 -- moved it +2.31in across". The
   server cannot supply that, because on the run that holds a change back the
@@ -767,10 +918,20 @@ changed before downloading the corrected deck.
   outside, and the renders are what they accept the result on.
 - **An undo re-renders the slide it happened on**, when renders are already up.
   The file has just been written again, so every after image on the page is of
-  a deck that no longer exists; the server drops its cache of them and the page
-  asks for the slide again, keeping it in view even though it now carries no
-  change. That cache was stale after a second apply too, which nothing had
-  noticed because nothing had looked.
+  a deck that no longer exists.
+
+  **Each run's renders live in a directory of its own**, `after/<run>/`, and
+  are served from URLs carrying the run number. The first version of this
+  deleted the old images and rendered into the same place, and that cannot be
+  relied on: deletion is best-effort, on Windows a file anything still holds
+  open will not go, and a directory that did not empty reads as a cache that is
+  already full. The page then showed the previous run's pictures beside the new
+  deck -- the undo applied, the download correct, and the evidence on screen
+  saying it had not happened. A number in the path cannot half-work: a render
+  either exists for this run or is made, and nothing older is reachable, by the
+  page or by anything caching on its behalf. Sweeping up the old directories is
+  housekeeping, so a file that will not go costs disk space rather than
+  correctness.
 
 The uploaded deck is kept for four hours so the ticking and the applying can be
 minutes apart. Nothing leaves the machine except the AI call, if it is on.

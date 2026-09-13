@@ -180,14 +180,67 @@ def _text_of(shape: Any) -> str:
 
 
 def _freeze(shape: Any, layout_ph: Optional[Any]) -> bool:
-    """Bake the frame, then the look, then drop the `p:ph`."""
+    """Bake the frame, then the look, then the geometry, then drop the `p:ph`."""
     spPr = getattr(shape._element, "spPr", None)
     if spPr is None:
         return False
     _bake_frame(spPr, _frame_of(shape))
     if layout_ph is not None:
         _bake_look(spPr, getattr(layout_ph._element, "spPr", None))
+    _ensure_geometry(spPr)
     return _strip_ph(shape._element)
+
+
+def _ensure_geometry(spPr: Any) -> None:
+    """Leave every frozen picture with a geometry of its own. Always.
+
+    THE PHOTOGRAPH THAT RENDERED AS WHITE. On a real deck, a full-bleed image
+    down the right half of a section divider came out of the rebuild as a white
+    panel, and every check said the file was fine: the `p:pic` was there, on
+    top, with its `a:xfrm` baked in and its `r:embed` resolving to a 2.4MB
+    JPEG that was present in the package. PowerPoint opened it without
+    complaint and listed the shape as visible at the right size. Then it
+    exported the slide with nothing in that half.
+
+    What the shape had lost was its GEOMETRY. A picture placeholder states no
+    `a:prstGeom`, because it takes one from the layout placeholder behind it --
+    and where the layout states none either, both are relying on the implicit
+    rectangle the schema gives a shape that is still a placeholder. Strip the
+    `p:ph`, as this module must, and that inheritance is over: the shape is now
+    an ordinary picture with an explicit frame and no geometry at all, and a
+    shape with no geometry has nothing to fill.
+
+    `_bake_look` is not the answer to this, though it looks like it should be.
+    It copies what the layout SUPPLIES, which is right for a circle or a drawn
+    mask and useless here, where the layout supplies nothing and there is no
+    layout placeholder at all in the case a template has renamed its indices.
+
+    So the implicit rectangle is written out, and only when the shape has said
+    nothing of its own. It is not a new decision about how the picture looks --
+    it is the value the file already meant, made explicit before the thing that
+    was carrying it is taken away.
+    """
+    if spPr is None:
+        return
+    if spPr.find(f"{_A_NS}prstGeom") is not None:
+        return
+    if spPr.find(f"{_A_NS}custGeom") is not None:
+        return
+    geometry = etree.SubElement(spPr, f"{_A_NS}prstGeom")
+    geometry.set("prst", "rect")
+    etree.SubElement(geometry, f"{_A_NS}avLst")
+    # Order matters to the schema: a:xfrm comes first, then the geometry, and
+    # everything else after. `SubElement` appends, so a shape that already
+    # carries a fill or an outline would have the geometry land behind them.
+    _put_geometry_after_xfrm(spPr, geometry)
+
+
+def _put_geometry_after_xfrm(spPr: Any, geometry: Any) -> None:
+    """`a:xfrm`, then geometry, then the rest -- which is what `a:CT_ShapeProperties` says."""
+    xfrm = spPr.find(f"{_A_NS}xfrm")
+    index = list(spPr).index(xfrm) + 1 if xfrm is not None else 0
+    spPr.remove(geometry)
+    spPr.insert(index, geometry)
 
 
 def _frame_of(shape: Any) -> Optional[tuple[int, int, int, int]]:

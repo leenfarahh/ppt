@@ -23,6 +23,7 @@ from typing import Any, Callable, Optional
 
 from ..colorutil import TEXT_CONTRAST_FLOOR, contrast_ratio
 from ..models import Issue
+from ..rules.colors import MASTER_SETS_IT
 from ..rules.space import DECLARED_GRID
 
 log = logging.getLogger(__name__)
@@ -1131,6 +1132,17 @@ def _planned_target(issue: Issue, ctx: "FixContext") -> tuple[Optional[str], str
     a decision, not a missing value, and the reason belongs in front of the
     designer: their three-step legend is why this shape was left alone.
     """
+    # The master's own value for a placeholder is not a candidate to be
+    # negotiated. The plan exists to keep colours that MEAN something distinct
+    # from each other -- three pills in a legend, a chart's series -- by
+    # mapping them one to one onto the palette. A title is not an encoding: it
+    # is a title, and every title on that layout is the same colour on purpose.
+    # So where the finding carries the master's statement, it is used as it
+    # stands, and two different off-palette headings both becoming the master's
+    # heading colour is the correct outcome rather than a collision.
+    if MASTER_SETS_IT in (issue.expected or ""):
+        return _hex_of(issue.expected), "the colour the master gives it"
+
     plan = getattr(ctx, "color_plan", None)
     if plan is None:
         return _hex_of(issue.expected), ""

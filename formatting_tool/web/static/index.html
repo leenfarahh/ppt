@@ -270,7 +270,16 @@ details.advanced[open] summary::before { content: "\2212  "; }
 .undone .note { color: var(--faint); font-size: 11.5px; margin: 6px 0 0; }
 .undone-list li { color: var(--faint); }
 .slide-changes.held { color: var(--faint); font-size: 11.5px; margin: 6px 0 0; }
+.slide-fold .clusters { margin: 4px 0 0 4px; }
+.slide-fold .cluster > summary { font-size: 12px; color: var(--muted); }
 .undo-note { color: var(--blocker); margin-left: 6px; }
+/* A note about the change, set apart from it: run into the sentence, "wrap
+   only" reads as part of what the fix did. */
+.quiet {
+  display: inline-block; margin: 0 6px; padding: 0 7px;
+  border: 1px solid var(--line); border-radius: 20px;
+  font-size: 10.5px; color: var(--faint); white-space: nowrap;
+}
 /* Clusters: one fold per kind of change, so forty lines read as six groups. */
 .clusters { margin-top: 8px; }
 .cluster { margin: 4px 0; }
@@ -935,27 +944,94 @@ const CLUSTERS = [
   ["production_note", "Production notes"],
 ];
 
+/* The changes a designer will look for on a render and not find.
+ *
+ * WHY THIS IS A LIST OF RULES and not a measurement. The first version asked
+ * whether the shape had moved, on the grounds that a fix which reported the
+ * same box twice had changed nothing visible. That is wrong twice over, and
+ * both were on the page within a minute: clearing a hardcoded typeface does
+ * not move a shape and changes every glyph in it, and re-spacing the cells of
+ * a component moves the OTHER shapes, not the one the finding names. Marking
+ * either "text only" tells a designer to stop looking at the very changes that
+ * are most worth looking at.
+ *
+ * Only two fixes here, and they are the two that edit characters rather than
+ * appearance. Everything else this tool applies shows.
+ */
+const INVISIBLE = {
+  "typography.whitespace": [
+    "no visible change",
+    "Trailing or repeated spaces were removed. Nothing on the slide moves; "
+    + "the copy is the same to read.",
+  ],
+  "typography.orphan_widow": [
+    "wrap only",
+    "One non-breaking space, binding two words. It shows on a render only if "
+    + "it changes where the line breaks -- in a box too narrow for the pair to "
+    + "share a line, it shows nowhere at all.",
+  ],
+};
+
+function invisibleMark(row) {
+  const entry = INVISIBLE[(row && row.rule_id) || ""];
+  if (!entry) return "";
+  return `<span class="quiet" title="${esc(entry[1])}">${esc(entry[0])}</span>`;
+}
+
 function clusterOf(ruleId) {
   const family = String(ruleId || "").split(".")[0];
   const found = CLUSTERS.find(([key]) => key === family);
   return found ? found[1] : "Other";
 }
 
-/* Folded open unless the group is long enough to be in the way. A designer
- * who has folded one keeps it folded: an explicit choice outlives the rule. */
-function clusterOpen(label, count) {
-  if (label in state.clusters) return state.clusters[label];
-  return count <= 8;
+/* Folded shut until somebody opens it, and never against their choice: once a
+ * designer has opened a group it stays open, and once they have closed one it
+ * stays closed.
+ *
+ * Closed is the default in both places these appear. Forty-four changes on two
+ * slides is a wall of text whichever way it is sorted, and the point of the
+ * groups is to be read as six lines that say what kind of work was done --
+ * "Colour, 28 changes" -- with the detail there for whoever wants it. A list
+ * under a slide has a second reason: it sits between one pair of renders and
+ * the next, so anything opened there pushes the next slide off the screen.
+ */
+function clusterOpen(key, count, fallback) {
+  if (key in state.clusters) return state.clusters[key];
+  return fallback === undefined ? false : fallback;
 }
 
-function clusterHTML(label, rows, render) {
-  const open = clusterOpen(label, rows.length);
-  return `<details class="cluster" data-cluster="${esc(label)}"
+function clusterHTML(label, rows, render, options = {}) {
+  // Keyed separately per slide, or every slide's "Colour" would fold and
+  // unfold together -- and the one a designer opened would not be the one that
+  // opened.
+  const key = options.key || label;
+  const open = clusterOpen(key, rows.length, options.open);
+  return `<details class="cluster" data-cluster="${esc(key)}"
     ${open ? "open" : ""}>
     <summary>${esc(label)} <span class="meta">&middot; ${rows.length}
       change${rows.length === 1 ? "" : "s"}</span></summary>
     <ul class="applied-list">${rows.map(render).join("")}</ul>
   </details>`;
+}
+
+/* The changes of one list, split into the groups they belong to, in report
+ * order. Shared so the list under a slide groups exactly as the full list
+ * does: two answers to "what kind of change is this" would be one too many. */
+function clustered(rows, render, options = {}) {
+  const groups = new Map();
+  for (const row of rows) {
+    const label = clusterOf(row.rule_id);
+    if (!groups.has(label)) groups.set(label, []);
+    groups.get(label).push(row);
+  }
+  const order = [...new Set([...CLUSTERS.map(([, label]) => label), "Other"])];
+  return order
+    .filter((label) => groups.has(label))
+    .map((label) => clusterHTML(label, groups.get(label), render, {
+      ...options,
+      key: options.prefix ? `${options.prefix}:${label}` : label,
+    }))
+    .join("");
 }
 
 function appliedHTML() {
@@ -969,23 +1045,14 @@ function appliedHTML() {
     ${a.slide ? `slide ${a.slide}` : "deck"}${a.shape ? ` &middot; ${esc(a.shape)}` : ""}
     &mdash; ${esc(a.detail)}${a.round === 2
       ? ` <span class="meta">(second pass)</span>` : ""}
+    ${invisibleMark(a)}
     <code>${esc(a.id)}</code>${undoButton(a.id)}</li>`;
   // Not numbered: nothing was changed, so there is nothing on a render to
   // point at.
   const skippedRow = (a) => `<li class="dim"><code>${esc(a.id)}</code>
     ${esc(a.detail)}</li>`;
 
-  const groups = new Map();
-  for (const change of changeRows()) {
-    const label = clusterOf(change.rule_id);
-    if (!groups.has(label)) groups.set(label, []);
-    groups.get(label).push(change);
-  }
-  const order = [...new Set([...CLUSTERS.map(([, label]) => label), "Other"])];
-  const clusters = order
-    .filter((label) => groups.has(label))
-    .map((label) => clusterHTML(label, groups.get(label), row))
-    .join("");
+  const clusters = clustered(changeRows(), row);
   const skipped = r.skipped.length
     ? clusterHTML("Skipped, needs a designer", r.skipped, skippedRow)
     : "";
@@ -1054,6 +1121,7 @@ function undoneHTML() {
             ? ` &middot; ${esc(shape)}` : ""} &mdash; ${what}
           ${was && was.round === 2
             ? `<span class="meta">(second pass)</span>` : ""}
+          ${invisibleMark(was)}
           ${u.unknown ? `<span class="meta">(no finding with this id in the
             current report)</span>` : ""}
           <code>${esc(u.id)}</code>
@@ -1264,18 +1332,24 @@ function slideChangesHTML(slide, marks) {
     <summary>${marks.length} change${marks.length === 1 ? "" : "s"} on this
       slide${off ? ` <span class="off-count">&middot; ${off} not on the
       canvas</span>` : ""}</summary>
-  <ul class="slide-changes">
-    ${marks.map((m) => `<li class="${m.n === null ? "offcanvas" : ""}"
-      ${m.n === null ? "" : `id="chgs-${markKey(m)}"`}>
-      ${m.n === null
-        ? `<span class="num off" title="This shape sits outside the slide
-             canvas, so there is nothing on the render to mark">off</span>`
-        : `<span class="num">${m.n}</span>`}
-      ${m.shape ? `<b>${esc(m.shape)}</b> &mdash; ` : ""}${esc(m.detail)}
-      ${m.round === 2 ? `<span class="meta">(second pass)</span>` : ""}
-      ${undoButton(m.id)}
-    </li>`).join("")}
-  </ul></details>${heldLine}`;
+  <div class="clusters">${clustered(marks, slideChangeRow, {
+    prefix: `slide${slide}`, open: false,
+  })}</div></details>${heldLine}`;
+}
+
+/* One change, as it reads under the slide it happened on. */
+function slideChangeRow(m) {
+  return `<li class="${m.n === null ? "offcanvas" : ""}"
+    ${m.n === null ? "" : `id="chgs-${markKey(m)}"`}>
+    ${m.n === null
+      ? `<span class="num off" title="This shape sits outside the slide
+           canvas, so there is nothing on the render to mark">off</span>`
+      : `<span class="num">${m.n}</span>`}
+    ${m.shape ? `<b>${esc(m.shape)}</b> &mdash; ` : ""}${esc(m.detail)}
+    ${m.round === 2 ? `<span class="meta">(second pass)</span>` : ""}
+    ${invisibleMark(m)}
+    ${undoButton(m.id)}
+  </li>`;
 }
 
 /* One box per rectangle, carrying every change that landed on it.
@@ -1439,7 +1513,7 @@ async function undoChange(id, restore = false, button = null) {
       // Kept because the next payload cannot carry it: on the run that holds
       // this back, the change is not made and so has no outcome to describe.
       state.undoneDetails[id] = {
-        slide: change.slide, shape: change.shape,
+        slide: change.slide, shape: change.shape, rule_id: change.rule_id,
         detail: change.detail, round: change.round,
       };
     }
@@ -1586,7 +1660,15 @@ function undidLine(change, id, restore) {
   const where = was && was.slide ? `slide ${was.slide}` : "the deck";
   const shape = was && was.shape ? ` &middot; ${esc(was.shape)}` : "";
   const what = was && was.detail ? ` &mdash; ${esc(was.detail)}` : "";
-  return `<b>${restore ? "Restored" : "Undone"}.</b> ${where}${shape}${what}`;
+  // The sentence that stops a correct undo from looking like a broken one: a
+  // change of this kind cannot show on a render, so the designer is about to
+  // compare two identical pictures and conclude the undo failed.
+  const known = INVISIBLE[(was && was.rule_id) || ""];
+  const invisible = known
+    ? ` <span class="meta">${esc(known[1])} The deck has been written again
+        either way.</span>`
+    : "";
+  return `<b>${restore ? "Restored" : "Undone"}.</b> ${where}${shape}${what}${invisible}`;
 }
 
 // How long the page waits for a render before it stops believing in it. The
@@ -1754,11 +1836,7 @@ function wireResults() {
     state.changesOpen = changes.open;
   });
 
-  for (const cluster of document.querySelectorAll("details.cluster")) {
-    cluster.addEventListener("toggle", () => {
-      state.clusters[cluster.dataset.cluster] = cluster.open;
-    });
-  }
+  wireClusters(document);
 
   for (const fold of document.querySelectorAll("details.slide-fold")) {
     fold.addEventListener("toggle", () => {
@@ -1767,6 +1845,20 @@ function wireResults() {
   }
 
   wirePreview();
+}
+
+/* Remember which groups are folded open.
+ *
+ * `toggle` does not bubble, so this binds each fold rather than delegating,
+ * and it is called again wherever a section redraws itself -- the preview does
+ * that on its own, and a fold that came back unbound would forget the state
+ * the moment it was used. */
+function wireClusters(root) {
+  for (const cluster of root.querySelectorAll("details.cluster")) {
+    cluster.addEventListener("toggle", () => {
+      state.clusters[cluster.dataset.cluster] = cluster.open;
+    });
+  }
 }
 
 function wirePreview() {
@@ -1781,7 +1873,10 @@ function wirePreview() {
     if (!section) return;
     section.outerHTML = previewHTML();
     wirePreview();
+    wireClusters(document.querySelector(".preview") || document);
   });
+
+  wireClusters(document.querySelector(".preview") || document);
 
   for (const badge of document.querySelectorAll(".hl b[data-jump]")) {
     badge.addEventListener("click", () => jumpToChange(badge.dataset.jump));
@@ -1791,6 +1886,25 @@ function wirePreview() {
         jumpToChange(badge.dataset.jump);
       }
     });
+  }
+}
+
+/* Open every fold a row sits inside, so an anchor into it lands on something.
+ *
+ * A row under a slide is now inside two: the slide's own fold and the group of
+ * changes it belongs to. An anchor into a closed <details> scrolls nowhere, so
+ * both have to be opened, and the state recorded -- otherwise the next redraw
+ * closes what the reader has just been shown. */
+function openFoldsAround(row) {
+  for (let fold = row.closest("details"); fold; fold = fold.parentElement?.closest("details")) {
+    if (!fold.open) fold.open = true;
+    if (fold.classList.contains("slide-fold")) {
+      state.slideOpen[fold.dataset.slide] = true;
+    } else if (fold.classList.contains("cluster")) {
+      state.clusters[fold.dataset.cluster] = true;
+    } else if (fold.classList.contains("changes")) {
+      state.changesOpen = true;
+    }
   }
 }
 
@@ -1807,13 +1921,7 @@ function jumpToChange(key) {
   // <details> lands nowhere, so it is opened first, exactly as the full list
   // below is.
   let row = document.getElementById(`chgs-${key}`);
-  if (row) {
-    const fold = row.closest("details.slide-fold");
-    if (fold && !fold.open) {
-      fold.open = true;
-      state.slideOpen[fold.dataset.slide] = true;
-    }
-  }
+  if (row) openFoldsAround(row);
   if (!row) {
     const details = document.querySelector("details.changes");
     if (details && !details.open) {
@@ -1821,6 +1929,7 @@ function jumpToChange(key) {
       state.changesOpen = true;
     }
     row = document.getElementById(`chg-${key}`);
+    if (row) openFoldsAround(row);
   }
   if (!row) return;
   row.scrollIntoView({ behavior: "smooth", block: "center" });

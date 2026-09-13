@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 
+from formatting_tool.ai.client import AIConfig
 from formatting_tool.models import Category, Issue, Severity, Source
 
 
@@ -163,29 +164,65 @@ def test_applying_again_starts_a_fresh_run(wired) -> None:
     assert _lefts(session.fixed) == {"Row 0": 0.0, "Row 1": 0.0}
 
 
-def test_the_renders_of_the_corrected_deck_are_dropped_when_it_is_rewritten(
-    wired,
-) -> None:
+def test_a_new_run_cannot_be_shown_the_last_run_s_renders(wired) -> None:
     """A stale after image is the worst thing this page can show: the renders
-    are the evidence a designer accepts the result on. `_render_into` caches
-    because driving PowerPoint costs seconds, so a run that writes the file
-    again has to throw that cache away -- true of an undo, and already true of
-    a second apply."""
+    are the evidence a designer accepts the result on, and one from the run
+    before says an undo that WAS applied was not.
+
+    Deleting the old images and rendering into the same place again is what
+    this replaces, and it could not be relied on: deletion is best-effort --
+    on Windows a file anything still holds open will not go -- and a directory
+    that did not empty reads as a cache that is already full. So each run
+    renders into a directory of its own, and the old one is unreachable
+    whether it went or not.
+    """
+    from formatting_tool.web import server as web
+
     base, session, issues = wired
     _post(base, "/api/apply", {"session": session.id, "fix": [i.id for i in issues]})
-    after = session.directory / "after"
-    after.mkdir(exist_ok=True)
-    (after / "1.png").write_bytes(b"a render of a deck that no longer exists")
+    stale = web._after_dir(session)
+    stale.mkdir(parents=True, exist_ok=True)
+    (stale / "1.png").write_bytes(b"a render of a deck that no longer exists")
 
     _post(base, "/api/undo", {"session": session.id, "undo": [issues[0].id]})
 
-    assert not (after / "1.png").exists()
-    # The before images are of the upload, which no run touches, so they stay.
+    fresh = web._after_dir(session)
+    assert fresh != stale                    # a new run, a new place
+    assert not (fresh / "1.png").exists()    # and nothing carried over into it
+
+
+def test_an_undeletable_stale_render_is_still_not_served(wired) -> None:
+    """The failure mode that made an applied undo look like it had not run.
+    Housekeeping may fail; what may not fail is which picture the page gets."""
+    from formatting_tool.web import server as web
+
+    base, session, issues = wired
+    _post(base, "/api/apply", {"session": session.id, "fix": [i.id for i in issues]})
+    stale = web._after_dir(session)
+    stale.mkdir(parents=True, exist_ok=True)
+    (stale / "1.png").write_bytes(b"stale")
+    held = open(stale / "1.png", "rb")       # as Windows would hold it
+    try:
+        _post(base, "/api/undo", {"session": session.id, "undo": [issues[0].id]})
+        # The sweep may or may not have managed it. What matters is that this
+        # run reads somewhere else entirely.
+        assert web._after_dir(session) != stale
+    finally:
+        held.close()
+
+
+def test_the_before_renders_are_kept_across_runs(wired) -> None:
+    """They are of the upload, which no run touches, and they are the
+    expensive half."""
+    base, session, issues = wired
+    _post(base, "/api/apply", {"session": session.id, "fix": [i.id for i in issues]})
     before = session.directory / "before"
     before.mkdir(exist_ok=True)
     (before / "1.png").write_bytes(b"still true")
-    _post(base, "/api/undo", {"session": session.id, "undo": [issues[1].id]})
-    assert (before / "1.png").exists()
+
+    _post(base, "/api/undo", {"session": session.id, "undo": [issues[0].id]})
+
+    assert (before / "1.png").read_bytes() == b"still true"
 
 
 def test_every_change_the_page_lists_carries_an_id_to_undo_by() -> None:
@@ -234,9 +271,9 @@ def test_a_forced_render_ignores_what_is_cached(wired, monkeypatch) -> None:
 
     monkeypatch.setattr(web, "render_deck", fake_render)
 
-    stale = session.directory / "after"
-    stale.mkdir(exist_ok=True)
-    (stale / "1.png").write_bytes(b"stale")
+    cached = web._after_dir(session)
+    cached.mkdir(parents=True, exist_ok=True)
+    (cached / "1.png").write_bytes(b"stale")
 
     code, payload = _post(
         base, "/api/preview", {"session": session.id, "slides": [1], "force": [1]}
@@ -244,8 +281,10 @@ def test_a_forced_render_ignores_what_is_cached(wired, monkeypatch) -> None:
 
     assert code == 200
     assert payload["slides"][0]["slide"] == 1
-    assert (stale / "1.png").read_bytes() == b"fresh"
+    assert (cached / "1.png").read_bytes() == b"fresh"
     assert asked == [[1], [1]]      # the before pair and the after pair
+    # The URL carries the run, so nothing can answer it with an older picture.
+    assert payload["slides"][0]["after"].endswith(f"?run={session.run}")
 
 
 def test_an_undo_before_anything_was_applied_is_refused(wired) -> None:
@@ -257,3 +296,77 @@ def test_an_undo_before_anything_was_applied_is_refused(wired) -> None:
 
     assert code == 400
     assert "nothing has been applied" in payload["error"]
+
+
+# --------------------------------------------------------------------------- #
+# Asking the model which layout each slide belongs on
+# --------------------------------------------------------------------------- #
+
+def test_the_rebuild_is_given_the_model_s_layout_picks(wired, monkeypatch) -> None:
+    """The wiring that was missing. `ai.layout` exists to answer exactly the
+    question the structural matcher gets wrong on a messy deck, and it was
+    reachable from `validate --apply-master` and from nowhere else -- so the
+    rebuild a designer runs from the page picked structurally every time."""
+    from formatting_tool.apply import applier
+    from formatting_tool.models import LayoutChoice
+    from formatting_tool.web import server as web
+
+    base, session, issues = wired
+    session.use_ai = True
+    session.rebuild = True
+    picks = [LayoutChoice(slide=1, layout="Section Divider", confidence=0.9)]
+    monkeypatch.setattr(web, "_layout_picks", lambda _session: picks)
+
+    seen = {}
+
+    def fake_rebuild(master, target, tuning, layout_choices=None):
+        seen["choices"] = layout_choices
+        return None
+
+    monkeypatch.setattr(applier, "_rebuild_in_place", fake_rebuild)
+
+    _post(base, "/api/apply", {"session": session.id, "fix": [i.id for i in issues],
+                               "rebuild": True})
+
+    assert seen["choices"] == picks
+
+
+def test_the_picks_are_asked_for_once_and_kept(wired, monkeypatch) -> None:
+    """An undo replays the whole run. Charging a model call a slide again on
+    every take-back would make the cheapest correction the most expensive thing
+    on the page."""
+    from formatting_tool.web import server as web
+
+    base, session, issues = wired
+    session.use_ai = True
+    session.spec = object()          # a master was read; its values are irrelevant here
+    session.ai = AIConfig()          # and the check ran with the AI layer on
+    calls = []
+
+    def fake_choose(spec, images, **kwargs):
+        calls.append(len(images))
+        return []
+
+    monkeypatch.setattr("formatting_tool.ai.layout.choose_layouts", fake_choose)
+    monkeypatch.setattr(web, "_render_into", lambda *a, **k: {1: "1.png"})
+
+    web._layout_picks(session)
+    web._layout_picks(session)
+
+    assert len(calls) == 1
+
+
+def test_no_ai_means_no_picks_and_no_call(wired, monkeypatch) -> None:
+    """The structural matcher then decides alone, which is what it did before
+    this was wired in -- the worst case is the behaviour that was there."""
+    from formatting_tool.web import server as web
+
+    base, session, issues = wired
+    session.use_ai = False
+
+    def explode(*args, **kwargs):
+        raise AssertionError("the model must not be asked")
+
+    monkeypatch.setattr("formatting_tool.ai.layout.choose_layouts", explode)
+
+    assert web._layout_picks(session) == []

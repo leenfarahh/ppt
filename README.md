@@ -724,9 +724,9 @@ the master's geometry and type actually take effect.
 | What | Treatment |
 | --- | --- |
 | Placeholder copy | Moved into the matching placeholder on the new layout. Paragraph level and bold/italic/underline survive; typeface, size and colour are dropped so the layout supplies them |
-| Loose shapes | Transplanted as they are, position included. They were never governed by a layout and are not now |
+| Loose shapes | Transplanted as they are, position included. They were never governed by a layout and are not now -- unless they form a run the layout has repeated regions for, in which case they fill them in reading order |
 | Pictures | Transplanted with the image itself, so crops and effects survive |
-| Charts, SmartArt, media, embedded objects | Left behind and reported by name. Their content lives in parts this cannot rebuild, and a silently broken chart is worse than a missing one |
+| Charts, SmartArt, media, embedded objects | Left behind and reported by name. Their content lives in parts this cannot rebuild, and a silently broken chart is worse than a missing one. They are also never carried off a LAYOUT onto a slide: doing so wrote a file PowerPoint would not open at all |
 | Customer-data tags, empty `r:id` hyperlinks, hd/svg image alternates | Stripped, and the shape kept. None is content: an empty `r:id` is the idiom for "no hyperlink", a tag is metadata, and an `hdphoto` is a second copy of a picture the shape already carries |
 
 **think-cell is the real casualty.** Its charts are OLE objects with their own
@@ -761,6 +761,70 @@ Layouts are matched by what somebody looked at first -- the AI layer's reading
 of the render, when there is one -- then by what the slide is for (see
 `classify` above) and the content regions it carries: how many of each kind,
 and **where they sit**.
+
+**The model is now shown the layouts, not told about them.** It used to get a
+picture of the slide and a written list of what the master offered, which is
+half a comparison. On a real fourteen-layout master, seven of them --
+`Title with Content 01` through `07` -- describe identically: one title, one
+content region, six of the seven at the same inches. What separates them is
+decoration no placeholder records -- a panel down the right of `03`, an image
+band across the top of `04`, a half-canvas image on the left of `05`, a band
+across the bottom of `06`. So the model answered `01` every time, which is the
+best answer available to anyone shown seven identical descriptions, and the
+structural matcher was no better off: its position score reads the same
+placeholders.
+
+`ai.layoutsheet` renders the master's layouts once per run and tiles them into
+one numbered contact sheet, sent with every slide. Each region is labelled
+where it falls -- a picture region, which cannot hold text, is covered with a
+labelled block -- so a tile shows both halves of what a layout is: where its
+content goes, and what is already on the page. One image rather than fourteen
+parts, because fourteen would be fourteen uploads on every call.
+
+Measured on the same 17-slide deck, against the same master:
+
+| Slide | Told about the layouts | Shown them |
+| --- | --- | --- |
+| 5, a four-card row over a landscape photo | `Title with Content 01` at 0.40, below the floor, so `Project Card` -- a title block and a picture region | `Content with Image 02` at 0.90: "a wide landscape photograph across the bottom, matching this layout's bottom image region" |
+| 8, two columns under a curved graphic | `Content with Image 01` at 0.60 -- an image layout for a slide with no image | `Title with Content 02` at 0.90: "the distinctive top-heavy curved background graphic found on this layout" |
+| 15, three cards, unfinished | no pick survived; `Project Card` | `Title with Content 01` at 0.30, taken and flagged |
+
+Confidence across the deck went from 0.30-0.60 to 0.90-1.00, and the model
+stopped hedging about missing layouts it could not see.
+
+**An image region is not a content region, in the prompt as well as the
+matcher.** The written inventory folded `PICTURE` in with the copy regions, so
+`Content with Image 01` was described as "offers 2 content, 1 title". Asked
+where a two-column text slide belonged, the model answered it and said why:
+"this layout offers a title and two content placeholders". The right deduction
+from what it had been told. `rebuild.matcher` had already been taught the
+difference; this had not.
+
+**A hesitant pick still beats a structural guess.** The confidence floor threw
+away every pick below it, which is only right while the thing underneath is
+better. On that deck four slides came back between 0.30 and 0.40, each saying
+the same true thing -- the slide runs three columns and the master has no
+three-column layout -- and the floor replaced them with structural picks
+scoring 0.03 to 0.08. That is not a weaker answer to the same question, it is
+noise; and the noise landed on `Project Card`, so text slides arrived with a
+half-page picture region nothing could fill. The floor still means something:
+above it the pick is taken outright, before any structure is measured. Below it
+the pick wins only where the structure could not reach its own floor either --
+two admissions of uncertainty, and the one that looked at the slide is the
+better of them. The match is still reported as not confident, because a slide
+placed because nothing fit is exactly the slide a designer should be shown.
+
+**What a slide SAYS it is outranks what it looks like.** Showing the model the
+layouts invites matching on appearance, and appearance is the right signal for
+"one column or two" and the wrong one for "what is this slide for". The deck's
+agenda -- title reading "Agenda", six items in two columns -- was matched to
+`Title with Content 02`, because that layout carries a decorative arc across
+its top and so did the slide. True, and the wrong answer: the master has a
+layout built to BE an agenda. So the four kinds a slide can state outright -- a
+cover, an agenda, a section divider, a closing -- keep their purpose-built
+layout where the master has one and the classifier read it off the page rather
+than off the slide's position. Everything else stays with the render, which is
+the whole point of asking.
 
 **The reading of the render now reaches the rebuild a designer actually runs.**
 `ai.layout` asks the model which layout each slide belongs on, from its
@@ -839,12 +903,137 @@ a two-digit number wrapped to "0 / 3" in a slot sized for something else. The
 item at the top left of the old slide now takes the placeholder at the top left
 of the new one -- overlap decides, distance between centres breaks ties.
 
-Two things it deliberately does not do:
+**A layout's repeated regions are filled from the slide's repeated content.**
+This used to be the thing it deliberately would not do, and the reason was
+sound: deciding which loose box belongs in which region is a judgement call,
+and getting it wrong scrambles a deck. What it cost was the whole value of
+choosing the layout. A real deck's agenda -- title reading "Agenda", five items
+across the bottom -- landed correctly on the master's `Agenda` layout, which
+then arrived with all twenty-four of its slots empty and the five items sitting
+at their old inches on top of the layout's photograph.
 
-- **It will not decide which loose text box belongs in which layout region.**
-  That is a judgement call, and getting it wrong scrambles a deck. The
-  placeholders are left empty and every one is listed, so the remaining work
-  is visible.
+**Order decides it, not position.** `builder._claim` puts a placeholder's copy
+in the slot that sits where it used to sit, which is right for a slide already
+on a layout of the same shape and no answer at all here: the slide's agenda is
+five cards across the bottom, the layout's is a twelve-item list down the right
+half, so of five items one overlaps no slot and the other four collide in
+pairs. The two arrangements are not the same picture. What maps them is that
+both sides are *runs*, and a designer fills run to run in reading order. The
+master's own sample slide settles which order: it fills the left column `01` to
+`06` and the right `07` to `12`, so a tall list reads down before it reads
+across, and a wide row of cards reads across.
+
+A run is a set of like-sized boxes filling a regular grid -- three or more of
+them on the slide, where a run stops being a coincidence. Both sides have to be
+one, and the layout's has to be long enough to take the whole of the slide's:
+nothing is filled by halves, because half an agenda in the right place and half
+in the wrong one is harder to fix than none of it. On a master offering one
+content region per layout, nothing fires at all.
+
+Two measurements it needs to get right, both of which were wrong first:
+
+- **Which regions.** The agenda layout offers twelve 3.92in labels and twelve
+  0.48in ordinal slots. Ranking them by the DIFFERENCE between aspect ratios
+  made the ordinals look nearer to the slide's 2.15in cards by four hundredths,
+  and five agenda titles went into five half-inch boxes. Compared as a ratio
+  instead: twice as wide and half as wide are equally unlike, which a
+  subtraction cannot say.
+- **What goes with the run.** A run is not only its words. That agenda was five
+  labels and also five icons above them, four rules between them and five empty
+  panels below -- one old layout's way of drawing a list. Move the words and
+  leave the drawing and the slide reads as a tidy agenda with five orphaned
+  icons floating across it: worse than before, with the copy in the right
+  place. So the drawing goes too, if it carries no copy, is no bigger than one
+  item of the run, and sits in the run's own block. Every shape it takes is
+  reported, because this deletes things.
+
+**The PowerPoint route needs a second pass for it.** Assigning a CustomLayout
+runs PowerPoint's own placeholder matching, which is why that route is
+preferred -- but that matching only ever moves a placeholder into a
+placeholder. It does instantiate the layout's empty regions onto the slide, so
+`builder.fill_runs` reopens the written file and fills them. That route
+otherwise avoids re-serialising the file at all; this re-serialisation is
+narrow (text into regions already on the slide, and the consumed boxes removed)
+and only happens on a deck where a run actually matched.
+
+**A run's icons follow it; the run's drawing does not.** The first version of
+this deleted both, and on the agenda that meant losing the five icons a
+designer had chosen along with the four rules and five blank panels between
+them. The distinction is what the shape is: an icon is content someone put
+there, a rule is the old layout's way of separating two rows, and the new
+layout draws its own rules. So pictures move and drawing goes.
+
+Where a picture moves to is the layout's own answer. A designer who draws a
+list of twelve labels usually draws twelve somethings beside them, and on this
+master each agenda label has a 0.48in box at the same row for its ordinal --
+which is exactly where that item's icon belongs. So a filled run looks for a
+second run of regions pairing one-for-one with it, row by row, and fits each
+item's icon into its partner: scaled down to fit and centred, never scaled up.
+Exactly one icon per item or none of them move, because a partial mapping
+scatters a deck's iconography across a list.
+
+**A title the layout already writes is not carried over.** The master's agenda
+layout has no title region at all; it draws the word AGENDA itself, as artwork.
+So the deck's title placeholder found no home, was transplanted at its old
+inches, and the rebuilt slide said "Agenda" twice -- once in the layout's
+display type and once in the deck's, over the layout's photograph. A shape
+whose WHOLE text matches something the layout already writes is now dropped and
+reported. Whole text, with case, punctuation and spacing taken out: a heading
+that repeats the layout's word and then says more is a heading, not an echo.
+
+**Graphics that land on the new layout's artwork are lifted onto what they
+label.** A two-track slide carried an icon above each column, sitting on the
+edge of the arc its old layout drew. The master's arc is bigger, so both icons
+came to rest well inside it: dark line art on a dark disk, still there and
+impossible to see. The geometry was right and so was the layout.
+
+Asking whether a shape sits on the artwork does not settle it -- that layout
+puts its own title and body regions inside the same arc, in reversed type, on
+purpose. What settles it is that these graphics belong to something: each is
+centred over a column of copy, and the place it belongs is directly above that
+copy. So one is lifted only when all three hold: it is small enough to be a
+label rather than content, it is sitting on artwork big enough to swallow it,
+and there is copy below that it is centred over. A ring and the glyph inside it
+move together, because one icon is often several shapes.
+
+Two measurements this needs, and the second is not obvious:
+
+- **The artwork has to be big.** A hairline rule and a 0.67in logo are what a
+  plain layout carries, and a graphic resting on one is not sitting on the
+  layout.
+- **The artwork has to be CLIPPED to the page.** The photograph inside that
+  master's arc is a 13.33in-tall picture starting five inches above the top
+  edge. Taken at its bounding box it covers everything, and every shape on
+  every slide would read as sitting on artwork.
+
+**A single box drawn on top of a region is copied into it.** Runs need three or
+more boxes, and a subtitle is one. So a real deck's layout kept its subtitle
+region empty and showing its own prompt text, with the deck's subtitle drawn
+across the top of it in a loose box: the words on the slide twice over, once as
+a prompt and once as content.
+
+One box has no order to read, but it has geometry, and here the geometry is
+unambiguous in a way it never was for the agenda. The region is 12.28in wide at
+0.69in from the edge; the box is 12.28in wide at 0.67in. The same rectangle,
+drawn twice.
+
+**Width decides it and height is deliberately ignored.** Ranking instead by how
+much of a region a box covers lets a small caption sitting inside a big empty
+content region score perfectly, and a slide of fourteen small boxes over one
+region would hand it to whichever happened to win. A box that IS a region's
+copy has the region's WIDTH, because that is what it was typed into, and it may
+be any height at all -- a one-line prompt strip on the layout holds three lines
+of real copy. So: near enough the same width, sitting over it horizontally, and
+covering the middle of it vertically. Runs get first refusal, because a run
+says what a group of boxes IS where this says only where one of them sits, and
+one region only ever takes one box.
+
+One thing it still deliberately does not do:
+
+- **It will not place a loose box that is neither part of a run nor drawn over
+  a region.** A box sitting in open space is a judgement call with nothing to
+  decide it on. Those placeholders are left empty and every one is listed, so
+  the remaining work is visible.
 - **It will not add footer placeholders to the rebuilt slides.** PowerPoint
   keeps footer, slide-number and date placeholders latent: they live on the
   layout and appear on a slide only when someone ticks them in the Header and
@@ -857,6 +1046,26 @@ behind, which makes it usable as a gate.
 
 ```powershell
 python -m formatting_tool ui --reload
+```
+
+**If uploads keep vanishing, move the working directory.** A session's uploaded
+deck, its renders and the deck written from it all live in a directory under
+the system temporary one. That is right until something else is managing it:
+Windows Storage Sense sweeps it on a schedule, and so do the remote-management
+agents an IT department installs -- neither asks whether a process is using the
+files. On one machine every session directory went while the server was
+running, and what reached the log was PowerPoint's
+
+    could not render X.pptx: (-2147352567, 'Exception occurred.',
+    (0, None, None, None, 0, -2147024893), None)
+
+which is `0x80070003`, "the system cannot find the path specified", and reads
+like a fault in the renderer. It now says which file is gone and why. To stop
+it happening, point the sessions somewhere nobody sweeps:
+
+```powershell
+$env:FORMATTING_TOOL_WORKDIR = "C:/work/formatting-tool"
+python -m formatting_tool ui
 ```
 
 **Use `--reload`.** Python imports a module once and never re-reads it, so a

@@ -588,7 +588,7 @@ class _Handler(BaseHTTPRequestHandler):
         if not decks:
             raise _BadRequest("no deck to check was sent")
 
-        workdir = Path(tempfile.mkdtemp(prefix="formatting-tool-ui-"))
+        workdir = Path(tempfile.mkdtemp(prefix="formatting-tool-ui-", dir=_workroot()))
         keep = False
         try:
             config = RunConfig(
@@ -701,6 +701,40 @@ class _Handler(BaseHTTPRequestHandler):
 # Helpers
 # --------------------------------------------------------------------------- #
 
+WORKDIR_ENV = "FORMATTING_TOOL_WORKDIR"
+
+
+def _workroot() -> Optional[str]:
+    """Where a session's uploads and renders live, or None for the default.
+
+    The default is the system temporary directory, which is right until
+    something else is managing it. On one machine every session directory
+    vanished mid-run -- an uploaded deck, its renders, and the deck that had
+    been written from it -- and PowerPoint reported it as
+    `0x80070003`, "the system cannot find the path specified", which reads like
+    a fault in the renderer. Windows Storage Sense does this on a schedule, and
+    so do the remote-management agents an IT department installs; neither asks
+    whether a process is using the files.
+
+    So it can be pointed somewhere nobody sweeps. Set FORMATTING_TOOL_WORKDIR
+    to a directory of your own and sessions are made inside it instead. A path
+    that cannot be made is a warning and the default, because a page that runs
+    in the wrong directory is better than one that will not start.
+    """
+    root = os.environ.get(WORKDIR_ENV, "").strip()
+    if not root:
+        return None
+    try:
+        Path(root).mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        log.warning(
+            "%s is set to %r, which cannot be used (%s); sessions will go in "
+            "the system temporary directory", WORKDIR_ENV, root, exc,
+        )
+        return None
+    return root
+
+
 def _outcome_id(outcome: Any) -> str:
     """The id a change is addressed by, which every change has to have.
 
@@ -782,6 +816,7 @@ def _layout_picks(session: _Session) -> list:
             model=session.ai.model,
             thinking_budget=session.ai.thinking_budget,
             api_key_env=session.ai.api_key_env,
+            master=session.master,
         )
         log.info(
             "the model chose a layout for %d of %d slide(s)",

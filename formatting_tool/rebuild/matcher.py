@@ -1,11 +1,13 @@
 """Decide which master layout a messy slide should be rebuilt onto.
 
-Three signals, in descending order of how much they are worth. An exact
-(normalized) layout-name match is taken at face value: a designer names a
-layout for its purpose, and two masters agreeing on a name is the strongest
-statement available. Failing that, the slide's *kind* decides when the kind is
-one structure cannot express -- see `formatting_tool.classify`. Failing both,
-content regions decide.
+Four signals, in descending order of how much they are worth. What somebody
+looked at comes first: `ai.layout` shows the model the rendered slide beside
+renders of the master's layouts, and a confident answer to that is taken
+outright. Failing that, the slide's *kind* decides when the kind is one
+structure cannot express -- see `formatting_tool.classify`. Failing that,
+content regions decide, with the slide's own layout name breaking ties. And
+where none of those reaches its floor, a hesitant reading of the picture is
+still preferred to a structural score that is itself a guess.
 
 Structure here means content regions, not placeholders. A messy slide keeps
 most of its content in loose text boxes -- that is what makes it messy -- so
@@ -118,26 +120,102 @@ def choose_layout(
     # at the render got both right. Measured on the five slides of that deck:
     # the model matched or beat the structural pick on four, and the one it
     # agreed on was the cover.
-    if seen is not None and seen.confidence >= seen_floor:
-        picked = _exactly(seen.layout, layouts)
-        if picked is not None:
-            return LayoutMatch(
-                layout=picked,
-                score=seen.confidence,
-                basis=(
-                    f"read off the rendered slide: {seen.why}"
-                    if seen.why else "read off the rendered slide"
-                ),
-                confident=True,
-                kind=classify_layout(picked).kind,
-                layout_kind=classify_layout(picked).kind,
-            )
+    picked = _exactly(seen.layout, layouts) if seen is not None else None
 
     # What the slide is for, when that is knowable, beats what it is built
     # from. A photo cover reads structurally as a three-region content slide,
     # and matching it on structure alone puts it on a content layout.
     fit = fit_slide(slide, deck, layouts, score_structure=structure_score, floor=floor)
-    return _with_name(slide, layouts, fit, floor)
+    match = _with_name(slide, layouts, fit, floor)
+
+    if picked is not None and _purpose_wins(fit, picked):
+        match.basis = (
+            f"{match.basis}. The render reads as {_kind_of(picked).value}, but "
+            f"the slide says what it is ({fit.classification.basis})"
+        )
+        return match
+    if picked is not None and seen.confidence >= seen_floor:
+        return _as_seen(picked, seen)
+
+    # A HESITANT PICK STILL BEATS A STRUCTURAL ONE THAT IS ITSELF A GUESS, and
+    # that is what the confidence floor was quietly doing instead. Measured on
+    # a real 17-slide deck: four slides came back between 0.30 and 0.40, every
+    # one of them saying the same true thing -- "the slide has three columns
+    # and the master has no three-column layout". The floor threw those away
+    # and took a structural pick scoring 0.03 to 0.08, which is not a weaker
+    # answer to the same question but noise; and noise on that master lands on
+    # `Project Card`, a layout that is a title block and a picture region, so
+    # text slides arrived with a half-page picture region nothing could fill.
+    #
+    # The floor still means something: above it the pick is taken outright,
+    # before any structure is measured. Below it the pick only wins where the
+    # structure could not reach its own floor either -- two admissions of
+    # uncertainty, and the one that looked at the slide is the better of them.
+    if picked is not None and not match.confident:
+        return _as_seen(picked, seen, hesitant=True)
+    return match
+
+
+def _purpose_wins(fit, picked: LayoutProfile) -> bool:
+    """Whether what the slide SAYS it is should outrank what it looks like.
+
+    Narrow on purpose, and it earns its narrowness on one slide. A deck's
+    agenda -- title reading "Agenda", six items in two columns -- was matched
+    to `Title with Content 02` because that layout carries a decorative arc
+    across its top and so does the slide, and the model said as much in its own
+    reasoning. It is a true observation and the wrong answer: the master has a
+    layout built to BE an agenda, with twenty-four regions laid out as the
+    items of one, and a slide that announces itself belongs on it.
+
+    Showing the model the layouts is what made this possible, and it is the
+    cost of it: a picture invites matching on appearance, and appearance is the
+    right signal for "one column or two" and the wrong one for "what is this
+    slide for". So the four kinds a slide can state outright -- a cover, an
+    agenda, a section divider, a closing -- keep their layout when the master
+    has one and the classifier is sure. Everything else stays with the render.
+    """
+    if fit.layout is None or fit.kind not in DISTINCTIVE:
+        return False
+    if getattr(fit.classification, "confidence", 0.0) < _STATED:
+        return False
+    # Only when the master actually has a layout for the job. `fit_slide`
+    # reports the kind it settled on, and it only reports a distinctive one
+    # where it found a layout drawn for it.
+    if fit.layout_kind is not fit.kind:
+        return False
+    return _kind_of(picked) is not fit.kind
+
+
+def _kind_of(layout: LayoutProfile) -> SlideKind:
+    return classify_layout(layout).kind
+
+
+def _as_seen(
+    picked: LayoutProfile, seen: "LayoutChoice", hesitant: bool = False
+) -> LayoutMatch:
+    """The layout the model named, as a match.
+
+    `confident` is the model's own confidence against the floor, not a flat
+    True: a pick taken only because nothing else fit is exactly the slide a
+    designer should be shown, and reporting it as a confident match is how it
+    would stop being shown.
+    """
+    reading = (
+        f"read off the rendered slide: {seen.why}"
+        if seen.why else "read off the rendered slide"
+    )
+    if hesitant:
+        reading = (
+            f"{reading}. Not a confident pick, and nothing measured better"
+        )
+    return LayoutMatch(
+        layout=picked,
+        score=seen.confidence,
+        basis=reading,
+        confident=not hesitant,
+        kind=classify_layout(picked).kind,
+        layout_kind=classify_layout(picked).kind,
+    )
 
 
 # How far below the best a named layout may score and still be taken. Small on
@@ -154,6 +232,16 @@ _NAME_MARGIN = 0.05
 # guess does not move a slide off the layout its author named -- on a real deck
 # it called the cover a section and took it off 'Title Slide'.
 _CLASSIFICATION_TRUSTED = 0.75
+
+# And how sure it has to be before its reading outranks a MODEL THAT LOOKED AT
+# THE SLIDE, which is a higher bar than outranking a name. `classify_slide`
+# grades its own evidence, and the grades divide cleanly: 0.9 is the slide's
+# own title saying what it is, 0.85 is an image covering the whole first page,
+# and 0.75 is nothing but "it is the first slide". The first two are things
+# stated on the page and worth more than a reading of it. The third is a
+# position, and a model looking at the render is better placed to judge a first
+# slide than the rule that first slides are usually covers.
+_STATED = 0.85
 
 
 def _with_name(

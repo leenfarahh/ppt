@@ -44,6 +44,9 @@ from lxml import etree
 log = logging.getLogger(__name__)
 
 _A_NS = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+# Every attribute in this namespace names a relationship, whatever the tag and
+# whatever the attribute is called. See `_relationships`.
+_R_NAMESPACE = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
 _R_LINK = (
     "{http://schemas.openxmlformats.org/officeDocument/2006/"
     "relationships}link"
@@ -465,16 +468,65 @@ def _artwork_of(layout: Any, furniture: set[str]) -> list[Any]:
     ]
 
 
+# A chart, a SmartArt diagram, an embedded OLE object: everything PowerPoint
+# writes as `p:graphicFrame`. What it draws is not in the shape, it is in parts
+# the shape points at, and those parts have their own internal structure.
+_GRAPHIC_FRAME = (
+    "{http://schemas.openxmlformats.org/presentationml/2006/main}graphicFrame"
+)
+
+
 def _loose_shapes(container: Any) -> list[Any]:
-    """Non-placeholder shapes directly on a layout.
+    """Non-placeholder shapes directly on a layout, that can actually be copied.
 
     Placeholders are excluded on purpose: one is a slot, not artwork, and the
     slide's own shape is what fills it.
+
+    AND SO IS EVERY `p:graphicFrame`, WHICH IS NOT A REFINEMENT. A real deck's
+    layouts carried embedded OLE objects -- `Objekt 4`, `Objekt 8`, `Objekt 11`
+    in a template authored in German -- and copying one onto a slide produced a
+    file PowerPoint would not open at all: `0x80070570`, "the file or directory
+    is corrupted and unreadable". Not a shape that looked wrong. A file that
+    did not open.
+
+    The damage went a long way from here. `master_apply` freezes the working
+    copy before handing it to PowerPoint, so the corruption happened first and
+    the apply failed; the rebuild fell back to recreating the file, and that
+    route drops the charts it cannot rebuild and reports them. A designer saw a
+    deck come back with its graphs missing and its titles reflowed, and none of
+    that was anywhere near the code that caused it.
+
+    Re-pointing every relationship in the subtree -- which `_copy_onto` now
+    does, and is right for its own reasons -- is not enough for these. What a
+    graphic frame draws lives in parts with their own internal structure and
+    their own expectations about the shape that hosts them, and duplicating one
+    by copying its XML is not something this module can do correctly. The rest
+    of the tool already says so about the same class of shape: the rebuild
+    leaves charts, SmartArt and embedded objects behind and names them, because
+    a silently broken chart is worse than a missing one. A file that will not
+    open is worse than both.
     """
     try:
-        return [s for s in container.shapes if not _is_placeholder(s)]
+        shapes = [s for s in container.shapes if not _is_placeholder(s)]
     except Exception:
         return []
+
+    keep, skipped = [], []
+    for shape in shapes:
+        if getattr(shape, "_element", None) is not None \
+                and shape._element.tag == _GRAPHIC_FRAME:
+            skipped.append(_name_of(shape))
+            continue
+        keep.append(shape)
+    if skipped:
+        # Debug, not info: this is asked once per slide per layout, so a deck
+        # whose every layout carries one says the same thing fifty times.
+        log.debug(
+            "not carrying %s off the layout: a chart, diagram or embedded "
+            "object cannot be copied onto a slide without breaking the file",
+            ", ".join(skipped),
+        )
+    return keep
 
 
 def _content_key(shape: Any) -> Optional[str]:
@@ -522,20 +574,62 @@ def _copy_onto(slide: Any, shape: Any, position: int) -> bool:
     try:
         element = copy.deepcopy(shape._element)
         for node in element.iter():
-            for attribute in (_R_EMBED, _R_LINK):
-                rid = node.get(attribute)
-                if not rid:
-                    continue
-                part = shape.part.related_part(rid)
-                node.set(
-                    attribute,
-                    slide.part.relate_to(part, _rel_type_of(shape.part, rid)),
-                )
+            for attribute in _relationships(node):
+                _repoint(node, attribute, shape.part, slide.part)
         slide.shapes._spTree.insert(position, element)
         return True
     except Exception:
         log.debug("could not carry a layout shape onto a slide", exc_info=True)
         return False
+
+
+def _relationships(node: Any) -> list[str]:
+    """Every attribute on this node that names a relationship.
+
+    EVERY ONE, and the list is not worth enumerating: an attribute in the
+    relationships namespace IS a relationship reference, whatever it is called
+    and whatever tag carries it.
+
+    Naming them was the bug, and it took a deck down. The two that were named
+    were `r:embed` and `r:link`, which is a picture's whole vocabulary and not
+    much else's. A layout carrying an embedded OLE object states three more:
+
+        <p14:tags  r:id="rId1"/>          the shape's tag store
+        <p:oleObj  r:id="rId3"/>          the embedded object itself
+        <a:blip    r:embed="rId4"/>       the picture it falls back to
+
+    Only the last was re-pointed. The other two were copied onto the slide
+    holding ids that mean something else there, or nothing, and a dangling
+    relationship is not a shape that looks wrong -- it is a file PowerPoint
+    refuses to open at all: `0x80070570`, "the file or directory is corrupted
+    and unreadable". Which meant the apply failed, the rebuild fell back to
+    recreating the file, and that route drops the charts it cannot rebuild. A
+    deck arrived with its graphs missing, and the cause was three characters in
+    a tuple two modules away.
+    """
+    return [name for name in node.attrib if name.startswith(_R_NAMESPACE)]
+
+
+def _repoint(node: Any, attribute: str, source: Any, target: Any) -> None:
+    """Point one relationship at the same thing, from the slide's part.
+
+    Raises if it cannot, and the caller then carries nothing. That is the point:
+    a shape whose relationships cannot all be brought across must not be
+    inserted, because the file it lands in stops opening.
+    """
+    rid = node.get(attribute)
+    if not rid:
+        return
+    rel = source.rels[rid]
+    if rel.is_external:
+        # An image or object linked rather than embedded. The target is a URL,
+        # not a part, so it is related as one -- resolving it as a part raises.
+        node.set(
+            attribute,
+            target.relate_to(rel.target_ref, rel.reltype, is_external=True),
+        )
+        return
+    node.set(attribute, target.relate_to(rel.target_part, rel.reltype))
 
 
 def _rel_type_of(part: Any, rid: str) -> str:

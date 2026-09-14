@@ -339,6 +339,7 @@ def _layout_picks(deck: DeckProfile, spec: MasterSpec, config: RunConfig):
             thinking_budget=config.ai.thinking_budget,
             api_key_env=config.ai.api_key_env,
             concurrency=config.ai_concurrency,
+            master=config.master,
         )
     finally:
         images.cleanup()

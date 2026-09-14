@@ -247,6 +247,39 @@ class NullRenderer:
 # than none. Whoever adds it should treat its findings as weaker.
 
 
+# What PowerPoint says when it is handed a path that is not there. It arrives
+# as the scode of a COM tuple, which is how `0x80070003` -- the plain Win32
+# "the system cannot find the path specified" -- reaches a log looking like a
+# fault in the renderer.
+_PATH_NOT_FOUND = -2147024893
+
+
+def _explain(exc: Exception, deck: Path, directory: Path) -> str:
+    """A renderer failure in words, where the words are knowable.
+
+    ONE CASE EARNS THIS. A deck uploaded to the page lives in the system
+    temporary directory, and so does the directory the PNGs are exported to.
+    Windows Storage Sense and the managed cleanup tools an IT department
+    installs both delete from there on a schedule, with no regard for a process
+    that is using it -- on this machine every session directory went while the
+    server was running. What the page then showed was the COM tuple, which
+    names neither the file nor the cause and reads like a bug in the tool.
+    """
+    # Searched in the text, because the code arrives NESTED: pywin32 gives
+    # `(-2147352567, 'Exception occurred.', (0, None, None, None, 0,
+    # -2147024893), None)`, so the part worth reading is two levels down inside
+    # the arguments rather than among them.
+    if str(_PATH_NOT_FOUND) in str(exc):
+        missing = deck if not deck.is_file() else directory
+        return (
+            f"PowerPoint could not find {missing}. Files in the system "
+            "temporary directory are removed on a schedule by Windows Storage "
+            "Sense and by managed cleanup tools, whether or not something is "
+            "using them. Upload the deck again"
+        )
+    return f"rendering failed: {exc}"
+
+
 def available_renderer() -> Renderer:
     for renderer in (PowerPointRenderer(),):
         if renderer.available:
@@ -282,13 +315,31 @@ def render_deck(
             ),
         )
 
+    # Checked here, where it can be said in words. PowerPoint answers a missing
+    # file with a COM tuple -- `(-2147352567, 'Exception occurred.', (0, None,
+    # None, None, 0, -2147024893), None)` -- which is 0x80070003, "the system
+    # cannot find the path specified", and reads like a fault in the renderer.
+    # It is worth the one stat call to say which file is gone instead.
+    if not deck.is_file():
+        log.warning("could not render %s: it is no longer there", deck)
+        return SlideImages(
+            renderer=renderer.name,
+            reason=(
+                f"{deck} is not there any more. A deck uploaded to this page "
+                "lives in the system temporary directory, and something has "
+                "removed it -- Windows Storage Sense and managed cleanup tools "
+                "both do. Upload it again"
+            ),
+        )
+
     directory = Path(tempfile.mkdtemp(prefix="formatting-tool-render-"))
     try:
         images = _rendered(renderer, deck, directory, slides)
     except Exception as exc:
         shutil.rmtree(directory, ignore_errors=True)
-        log.warning("could not render %s: %s", deck.name, exc)
-        return SlideImages(renderer=renderer.name, reason=f"rendering failed: {exc}")
+        reason = _explain(exc, deck, directory)
+        log.warning("could not render %s: %s", deck.name, reason)
+        return SlideImages(renderer=renderer.name, reason=reason)
 
     if not images:
         shutil.rmtree(directory, ignore_errors=True)

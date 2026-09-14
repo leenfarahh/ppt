@@ -59,6 +59,19 @@ class _Old:
         return {1: path}
 
 
+def _a_deck(tmp_path: Path) -> Path:
+    """A file on disk to point the renderer at.
+
+    It only has to exist. `render_deck` stats the deck before it drives
+    PowerPoint, so that a file removed underneath a run -- which is what a
+    managed temp cleanup does to an uploaded deck -- is reported by name
+    instead of as a COM tuple.
+    """
+    deck = tmp_path / "deck.pptx"
+    deck.write_bytes(b"not a real deck; the renderer here is a fake")
+    return deck
+
+
 # --------------------------------------------------------------------------- #
 # Asking for slides
 # --------------------------------------------------------------------------- #
@@ -66,7 +79,7 @@ class _Old:
 def test_the_renderer_is_asked_for_the_slides_wanted(tmp_path: Path) -> None:
     fake = _Fake()
 
-    images = render.render_deck(tmp_path / "deck.pptx", fake, slides=[4, 9])
+    images = render.render_deck(_a_deck(tmp_path), fake, slides=[4, 9])
 
     assert fake.asked == [[4, 9]]
     assert sorted(images.images) == [4, 9]
@@ -79,7 +92,7 @@ def test_a_renderer_that_cannot_narrow_still_works(tmp_path: Path) -> None:
     has to know which it got."""
     old = _Old()
 
-    images = render.render_deck(tmp_path / "deck.pptx", old, slides=[4, 9])
+    images = render.render_deck(_a_deck(tmp_path), old, slides=[4, 9])
 
     assert old.calls == 1
     assert sorted(images.images) == [1]
@@ -161,7 +174,7 @@ def test_only_the_missing_slides_are_rendered(tmp_path: Path, monkeypatch) -> No
     )
     monkeypatch.setattr(web, "render_deck", render.render_deck)
 
-    found = web._render_into(tmp_path / "deck.pptx", directory, [4, 9])
+    found = web._render_into(_a_deck(tmp_path), directory, [4, 9])
 
     assert fake.asked == [[9]]                 # 4 was on disk already
     assert sorted(found) == [4, 9]
@@ -179,7 +192,7 @@ def test_nothing_is_rendered_when_every_wanted_slide_is_on_disk(
     monkeypatch.setattr(render, "available_renderer", lambda: fake)
     monkeypatch.setattr(web, "render_deck", render.render_deck)
 
-    found = web._render_into(tmp_path / "deck.pptx", directory, [4, 9])
+    found = web._render_into(_a_deck(tmp_path), directory, [4, 9])
 
     assert fake.asked == []
     assert sorted(found) == [4, 9]
@@ -196,7 +209,7 @@ def test_a_renderer_that_produces_nothing_keeps_what_was_there(
     monkeypatch.setattr(render, "available_renderer", lambda: render.NullRenderer())
     monkeypatch.setattr(web, "render_deck", render.render_deck)
 
-    found = web._render_into(tmp_path / "deck.pptx", directory, [4, 9])
+    found = web._render_into(_a_deck(tmp_path), directory, [4, 9])
 
     assert sorted(found) == [4]
 

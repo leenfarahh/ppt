@@ -339,3 +339,139 @@ def test_a_layout_that_cannot_hold_the_content_still_loses() -> None:
     ])
 
     assert structure_score(slide, _image_layouts()[0]) > structure_score(slide, text_only)
+
+
+# --------------------------------------------------------------------------- #
+# A hesitant pick against a structural guess
+# --------------------------------------------------------------------------- #
+
+def _later_slide(boxes: int = 4) -> SlideProfile:
+    """The same messy slide, but not the first one in the deck. Slide 1 is
+    classified a cover on its position alone, which is a separate rule."""
+    slide = _slide(boxes=boxes)
+    slide.number = 3
+    return slide
+
+
+def test_a_hesitant_pick_still_beats_a_structural_guess() -> None:
+    """The confidence floor used to throw away every pick below it, which is
+    only right while the thing underneath is better.
+
+    Measured on a real 17-slide deck it was not. Four slides came back between
+    0.30 and 0.40, each saying the same true thing -- the slide runs three
+    columns and the master has no three-column layout -- and the floor replaced
+    them with structural picks scoring 0.03 to 0.08. That is not a weaker
+    answer to the same question, it is noise, and on that master the noise
+    landed on a layout that is a title block and a picture region: text slides
+    arriving with a half-page picture placeholder nothing could fill.
+    """
+    slide = _later_slide()
+    structural = choose_layout(slide, _layouts(), FLOOR, deck=_deck(slide))
+    assert not structural.confident          # the structure could not tell
+
+    seen = LayoutChoice(slide=3, layout="title_content", confidence=0.3,
+                        why="three columns and the master has no three-column layout")
+    picked = choose_layout(slide, _layouts(), FLOOR, deck=_deck(slide), seen=seen)
+
+    assert picked.name == "title_content"
+    assert "read off the rendered slide" in picked.basis
+    # Still reported as what it is. A pick taken only because nothing else fit
+    # is exactly the slide a designer should be shown.
+    assert not picked.confident
+
+
+def test_a_confident_structure_still_outranks_a_hesitant_pick() -> None:
+    """The floor has not been abolished. Below it the pick wins only where the
+    structure could not reach its own floor either -- two admissions of
+    uncertainty, and the one that looked at the slide is the better of them."""
+    shapes = [
+        _ph("Title", "TITLE (1)", 0.9, 0.4, 11.5, 1.4),
+        _ph("A", "BODY (2)", 0.9, 1.8, 5.6, 0.9),
+        _ph("B", "OBJECT (7)", 0.9, 2.7, 5.6, 4.0),
+        _ph("C", "BODY (2)", 6.8, 1.8, 5.6, 0.9),
+        _ph("D", "OBJECT (7)", 6.8, 2.7, 5.6, 4.0),
+    ]
+    for shape in shapes:
+        shape.paragraphs = [ParagraphProfile(text="a good deal of copy " * 8)]
+        shape.text = "a good deal of copy " * 8
+    slide = SlideProfile(number=3, layout_name=None, shapes=shapes)
+
+    # A tidy slide on a master that offers exactly its regions: the structure
+    # is not guessing here, and it says so.
+    structural = choose_layout(slide, _layouts(), FLOOR, deck=_deck(slide))
+    assert structural.confident
+    assert structural.name == "title_comparison"
+
+    seen = LayoutChoice(slide=3, layout="title_content", confidence=0.2,
+                        why="one column")
+    picked = choose_layout(slide, _layouts(), FLOOR, deck=_deck(slide), seen=seen)
+    assert picked.name == "title_comparison"
+
+
+# --------------------------------------------------------------------------- #
+# What a slide SAYS it is, against what it looks like
+# --------------------------------------------------------------------------- #
+
+def _agenda_slide() -> SlideProfile:
+    shapes = [
+        ShapeProfile(
+            shape_id=1, name="Title 1", shape_type="PLACEHOLDER (14)",
+            geometry=Geometry(left_in=0.9, top_in=0.4, width_in=11.5, height_in=1.0),
+            placeholder_type="TITLE (1)", text="Agenda",
+        )
+    ]
+    shapes[0].paragraphs = [ParagraphProfile(text="Agenda")]
+    for index in range(6):
+        box = ShapeProfile(
+            shape_id=100 + index, name=f"TextBox {index}",
+            shape_type="TEXT_BOX (17)",
+            geometry=Geometry(left_in=0.9 + (index % 2) * 5.8,
+                              top_in=2.0 + (index // 2) * 1.0,
+                              width_in=5.0, height_in=0.8),
+            text="an item",
+        )
+        box.paragraphs = [ParagraphProfile(text="an item")]
+        shapes.append(box)
+    return SlideProfile(number=2, layout_name="Title Only", shapes=shapes)
+
+
+def _with_agenda_layout():
+    layouts = _layouts()
+    layouts.append(LayoutProfile(name="Agenda", index=3, shapes=[
+        _ph(f"Item {n}", "BODY (2)", 0.9 + (n % 2) * 5.8, 2.0 + (n // 2) * 0.8,
+            5.0, 0.6)
+        for n in range(12)
+    ]))
+    return layouts
+
+
+def test_a_stated_purpose_outranks_a_resemblance() -> None:
+    """Showing the model the master's layouts invites it to match on
+    appearance, and appearance is the wrong signal for what a slide is FOR.
+
+    On a real deck the agenda -- title reading "Agenda", six items in two
+    columns -- was matched to a content layout because that layout carries a
+    decorative arc across its top and so did the slide. A true observation and
+    the wrong answer: the master has a layout built to BE an agenda.
+    """
+    slide = _agenda_slide()
+    layouts = _with_agenda_layout()
+
+    seen = LayoutChoice(slide=2, layout="title_content", confidence=0.9,
+                        why="the same arc across the top as this layout")
+    picked = choose_layout(slide, layouts, FLOOR, deck=_deck(slide), seen=seen)
+
+    assert picked.name == "Agenda"
+    # And the disagreement is said out loud, because a designer should see it.
+    assert "the render reads as" in picked.basis.lower()
+
+
+def test_only_the_kinds_a_slide_can_state_are_protected() -> None:
+    """Narrow on purpose. A content slide has no stated purpose to defend, so
+    the render decides it -- which is the whole point of asking."""
+    slide = _later_slide()                 # loose boxes, no title, no keyword
+    seen = LayoutChoice(slide=3, layout="title_content", confidence=0.9,
+                        why="one column of copy")
+    picked = choose_layout(slide, _layouts(), FLOOR, deck=_deck(slide), seen=seen)
+
+    assert picked.name == "title_content"

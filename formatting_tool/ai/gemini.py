@@ -52,18 +52,47 @@ _NOT_WORTH_WAITING = (
 # a per-minute quota needs seconds, not milliseconds, and the alternative is
 # dropping a slide's findings from the report. The total ceiling is under two
 # minutes, so a genuinely exhausted quota still fails rather than hanging.
-_RATE_LIMIT_WAITS = (5.0, 15.0, 30.0, 60.0)
+# How long to wait between attempts, and therefore how many there are. Five
+# attempts over just under two minutes.
+_RETRY_WAITS = (5.0, 15.0, 30.0, 60.0)
+
+# Server-side failures worth asking again about. All of them mean the request
+# was fine and the service was not ready to take it: 503 is the one that turns
+# up in practice, and it says so in words -- "spikes in demand are usually
+# temporary".
+_RETRY_CODES = frozenset({500, 502, 503, 504})
+
+
+# How long one request may take before it is abandoned.
+#
+# THE SDK'S OWN DEFAULT IS NONE, WHICH MEANS FOREVER, and that is not a
+# theoretical risk. On a real 22-slide deck the review layer sent seven batches
+# and six came back; the seventh never did, and the run stopped there --
+# no error, no report, no way to tell a stalled connection from a model still
+# thinking. The pool joins its threads on the way out, so one request that
+# never returns holds the whole run, and the page waits on it until somebody
+# gives up and presses Ctrl+C.
+#
+# Ten minutes is far longer than any call measured here: a review batch with
+# full thinking on a dense slide runs about ninety seconds, and the layout
+# pass about twenty-five. A request still open after ten minutes is not slow,
+# it is stuck, and failing it lets the retry -- or the report without that
+# batch -- actually happen.
+REQUEST_TIMEOUT_MS = 10 * 60 * 1000
 
 
 def build_client(api_key_env: str = "GEMINI_API_KEY") -> Any:
     from google import genai  # noqa: PLC0415
+    from google.genai import types  # noqa: PLC0415
 
     # A bare constructor also resolves GOOGLE_API_KEY and an application
     # default credential, so an unset GEMINI_API_KEY is not proof of no
     # credentials.
     if not os.environ.get(api_key_env):
         log.debug("%s is unset; falling back to the SDK credential chain", api_key_env)
-    return genai.Client()
+    return genai.Client(
+        http_options=types.HttpOptions(timeout=REQUEST_TIMEOUT_MS)
+    )
 
 
 def generate_json(
@@ -95,9 +124,10 @@ def generate_json(
     import time  # noqa: PLC0415
 
     last: Exception | None = None
-    for attempt, wait in enumerate((0.0,) + _RATE_LIMIT_WAITS):
+    why = "rate limited"
+    for attempt, wait in enumerate((0.0,) + _RETRY_WAITS):
         if wait:
-            log.info("rate limited; waiting %.0fs before retrying", wait)
+            log.info("%s; waiting %.0fs before retrying", why, wait)
             time.sleep(wait)
         try:
             response = client.models.generate_content(
@@ -121,16 +151,33 @@ def generate_json(
                 raise translated from exc
             last = translated
         except errors.ServerError as exc:
-            raise AIValidationError(
-                f"API error {getattr(exc, 'code', None)}: "
-                f"{getattr(exc, 'message', exc)}"
-            ) from exc
+            # WAITED OUT, NOT RAISED, and this is the correction. A 503 from
+            # this API says "this model is currently experiencing high demand.
+            # Spikes in demand are usually temporary. Please try again later"
+            # -- the server asking to be asked again -- and it was being
+            # treated as a permanent failure. On a real 22-slide deck one batch
+            # of seven took a 503 and two slides silently lost their findings,
+            # while the report gave no sign that anything was missing from
+            # them. A preview model under load does this often enough that it
+            # is a normal condition, not an exception.
+            code = getattr(exc, "code", None)
+            translated = AIValidationError(
+                f"API error {code}: {getattr(exc, 'message', exc)}"
+            )
+            if code not in _RETRY_CODES:
+                raise translated from exc
+            why = f"the API is busy ({code})"
+            last = translated
         except errors.APIError as exc:
             raise AIValidationError(f"API call failed: {exc}") from exc
         except httpx.HTTPError as exc:
-            raise AIValidationError(f"could not reach the API: {exc}") from exc
+            # Transport, which includes a request that ran past
+            # REQUEST_TIMEOUT_MS. Nothing about the call is wrong, so it is
+            # worth asking again rather than losing the slides it carried.
+            why = "could not reach the API"
+            last = AIValidationError(f"could not reach the API: {exc}")
     else:
-        raise last or AIValidationError("rate limited")
+        raise last or AIValidationError("the API could not be reached")
 
     check_refusal(response)
     return parse_json(response), response

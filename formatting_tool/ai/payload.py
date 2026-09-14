@@ -37,7 +37,22 @@ DEFAULT_BATCH_SIZE = 8
 # them with room beside it, or four or five ordinary ones. Big enough that the
 # long tail of simple slides stops costing a call each; small enough that a
 # dense slide still travels nearly alone.
-DEFAULT_BATCH_TOKENS = 24000
+# HALVED, AND THE REASON IS WALL CLOCK RATHER THAN COST. The batches run all
+# at once, so a run does not take the sum of them -- it takes the SLOWEST one.
+# Measured on a 22-slide deck: seven batches, every one in flight together, and
+# the review took 153-201s because the biggest batch did. Those batches came
+# back having spent 16546 thinking tokens against a 16384 budget, so they are
+# thinking-bound, and how long the longest one thinks is set by how much is in
+# it.
+#
+# Half the payload per call is therefore about half the wall clock, for the
+# same slides at the same effort -- nothing is reviewed less carefully, it is
+# only spread wider. The floor is per-call latency, about 25s whatever is
+# asked, so there is no point going much below this.
+#
+# It only works while the batches still fit in one round: see
+# `RunConfig.ai_concurrency`, raised with it.
+DEFAULT_BATCH_TOKENS = 12000
 
 
 # cached half: guidelines and expected values

@@ -815,6 +815,9 @@ def _apply_one_uninstrumented(
 
     geometric = is_geometric(issue)
     before = (shape.left, shape.top) if geometric else None
+    # The whole box as it stands, INHERITED VALUES INCLUDED, so a fix that
+    # writes only half a transform can be completed from it. See `_whole_box`.
+    inherited = (shape.left, shape.top, shape.width, shape.height)
     neighbours = (
         _neighbours(presentation, issue, shape, context)
         if geometric or (issue.rule_id or "") in _NEEDS_NEIGHBOURS
@@ -851,6 +854,8 @@ def _apply_one_uninstrumented(
         # with whatever did apply, and this finding is reported as skipped.
         log.exception("fixer for %s failed", issue.rule_id)
         return FixOutcome(issue, False, f"the fix failed: {exc}")
+
+    _whole_box(shape, inherited)
 
     if not detail:
         return FixOutcome(issue, False, "already correct, nothing to change")
@@ -1442,6 +1447,55 @@ class CohortMove:
         return max(0, len(self.shapes) - 1)
 
 
+_A_NS = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+
+
+def _whole_box(shape: Any, inherited: tuple) -> None:
+    """Finish a transform a fix left half-written, from what it used to inherit.
+
+    A PLACEHOLDER THAT STATES NOTHING TAKES EVERYTHING FROM ITS LAYOUT, and the
+    moment anything is written onto it that stops being true for the part that
+    was written -- and stays true for the part that was not, only now there is
+    an `a:xfrm` saying otherwise. Set a placeholder's height and python-pptx
+    writes:
+
+        <a:xfrm><a:ext cx="11233150" cy="813816"/></a:xfrm>
+
+    an extent with no offset. PowerPoint reads the missing offset as (0, 0), so
+    the shape jumps to the top-left corner of the slide. On a real deck the
+    title of a page did exactly that: `space.text_overflow` grew it to fit its
+    own copy, and it arrived in the corner with its first letter off the edge.
+
+    NOTHING COULD SEE IT, which is the part worth remembering. python-pptx
+    resolves a missing offset by walking to the layout, so every check made
+    through it -- including the ones that compared this title before and after
+    and found it unchanged -- read the inherited 0.68in and reported no
+    movement. The file said one thing and the object model said another, and
+    only the render disagreed.
+
+    So whenever a shape is left stating half a box, the other half is written
+    from what it was inheriting a moment ago. That is exactly what it had, so
+    nothing moves; it is only now said out loud.
+    """
+    element = getattr(shape, "_element", None)
+    spPr = getattr(element, "spPr", None) if element is not None else None
+    if spPr is None:
+        return
+    xfrm = spPr.find(_A_NS + "xfrm")
+    if xfrm is None:
+        return                      # states nothing, inherits everything: fine
+
+    left, top, width, height = inherited
+    if xfrm.find(_A_NS + "off") is None and left is not None and top is not None:
+        off = xfrm.makeelement(_A_NS + "off", {"x": str(int(left)), "y": str(int(top))})
+        xfrm.insert(0, off)
+    if xfrm.find(_A_NS + "ext") is None and width is not None and height is not None:
+        ext = xfrm.makeelement(
+            _A_NS + "ext", {"cx": str(int(width)), "cy": str(int(height))}
+        )
+        xfrm.append(ext)
+
+
 def _cohort_outside_the_frame(move: "CohortMove", context: FixContext) -> int:
     """How many of a moved set now sit outside the page's margins.
 
@@ -1473,6 +1527,15 @@ def _cohort_outside_the_frame(move: "CohortMove", context: FixContext) -> int:
     right = context.width_emu - _emu(margins.get("right", 0.0))
     bottom = context.height_emu - _emu(margins.get("bottom", 0.0))
 
+    def beyond(x, y, width, height) -> bool:
+        return x < left or y < top or x + width > right or y + height > bottom
+
+    # COUNTED AS A CHANGE, not as a state, for the same reason `_cohort_worsened`
+    # asks whether an overlap got worse rather than whether one exists. A row of
+    # status bars sitting below the master's bottom margin is already outside it,
+    # and nudging that row clear of the copy over it leaves it exactly as far
+    # outside as it was. Refusing there would block the fix this whole mechanism
+    # was built for, to protect a frame the move never touched.
     outside = 0
     for shape in move.shapes:
         try:
@@ -1482,7 +1545,10 @@ def _cohort_outside_the_frame(move: "CohortMove", context: FixContext) -> int:
             continue
         if x is None or y is None:
             continue
-        if x < left or y < top or x + width > right or y + height > bottom:
+        was = move.origin.get(id(shape))
+        if was is None:
+            continue
+        if beyond(x, y, width, height) and not beyond(was[0], was[1], width, height):
             outside += 1
     return outside
 

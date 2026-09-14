@@ -450,3 +450,50 @@ def find_issue_by_ref(
         if ref_for(index) == ref:
             return issue
     return None
+
+def split_batch(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Halve a batch, keeping each slide with its own findings.
+
+    WHY A BATCH EVER NEEDS HALVING. Calls are packed to a budget of INPUT
+    tokens, and nothing measures the answer. The answer is as long as the model
+    has things to say, which on a dense slide is a great deal, so a batch that
+    is a comfortable size going out can be cut off coming back -- and a cut-off
+    answer is not partial, it is unparseable, so every slide in that batch
+    loses its findings at once. On a real deck that was four slides at a time,
+    reported as "the AI layer did not run".
+
+    Splitting costs one more call and answers the same question in two halves
+    that each fit. It is the only fix that does not depend on guessing a number
+    in advance, which is what the budget already is.
+
+    Returns [] when there is nothing left to split -- a single slide whose
+    answer does not fit is a real limit, and the caller reports it.
+    """
+    numbers = list(payload.get("batch", {}).get("slides") or [])
+    if len(numbers) < 2:
+        return []
+
+    middle = len(numbers) // 2
+    halves = (numbers[:middle], numbers[middle:])
+    digests = {
+        digest.get("slide"): digest for digest in payload.get("slides") or []
+    }
+    # Deck-level findings name no slide and belong to both halves: they are
+    # the context every call carries, not content being divided up.
+    deck_level = [
+        f for f in payload.get("rule_findings") or [] if f.get("slide") is None
+    ]
+
+    out = []
+    for index, half in enumerate(halves, start=1):
+        kept = set(half)
+        out.append({
+            **payload,
+            "batch": {"index": index, "of": 2, "slides": sorted(half)},
+            "rule_findings": deck_level + [
+                f for f in payload.get("rule_findings") or []
+                if f.get("slide") in kept
+            ],
+            "slides": [digests[n] for n in half if n in digests],
+        })
+    return out

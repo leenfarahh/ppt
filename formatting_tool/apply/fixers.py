@@ -101,6 +101,11 @@ RELATIVE = frozenset({"space.satellite_offset"})
 # that reads from the right is ONE column in the wrong place. Moving the first
 # of them alone breaks the column, so the guard would refuse every one of them
 # and the deck would keep reading backwards.
+# The DrawingML namespace, for the few places a fixer has to read the XML
+# directly rather than through python-pptx.
+_A_NS = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+
+
 COHORT = frozenset(
     {
         "space.safe_margin",
@@ -1964,6 +1969,69 @@ def fix_arabic_font(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[str
     return f"set {changed} Arabic run(s) in {wanted!r}" if changed else None
 
 
+# The script slots a run can pin a typeface in, besides the Latin one the
+# finding is about.
+_SCRIPT_SLOTS = ("cs", "ea", "sym")
+
+
+def _other_script_faces(shape: Any, latin: str) -> set[str]:
+    """Explicit typefaces this shape pins for scripts other than Latin.
+
+    WHY CLEARING THE LATIN FACE IS NOT ALWAYS A NO-OP. The finding says the run
+    hardcodes the theme's own typeface, so removing the hardcode should change
+    nothing. That is true only when the Latin face is the whole of what the run
+    says about its typeface. On a real deck it was not:
+
+        <a:latin typeface="Cambria" .../>      <- removed
+        <a:cs    typeface="Arial"   .../>      <- left behind
+
+    With no Latin face declared, PowerPoint stops resolving the run to one font
+    at all. Asked directly, it reported the range's font as Cambria before and
+    as EMPTY -- meaning mixed -- afterwards, and the text grew from one line of
+    232.5pt to two of 170.9pt. A heading that fitted its box stopped fitting
+    it, and the collision that followed moved a column of shapes off the page.
+
+    `a:cs` is also the face that actually renders Arabic, so clearing it to
+    make the Latin case tidy would be a change to the wrong script in a
+    bilingual deck. Neither half is safe on its own, so the run is left alone
+    and reported: what it needs is a decision about both faces, which is a
+    designer's call.
+
+    Theme references (`+mn-ea`, `+mj-cs`) are not pins -- they already say
+    "inherit" -- and a slot naming the same face as the Latin one is not a
+    conflict either.
+    """
+    faces: set[str] = set()
+    try:
+        paragraphs = shape.text_frame.paragraphs
+    except Exception:
+        return faces
+    for paragraph in paragraphs:
+        for run in paragraph.runs:
+            rPr = run._r.find(f"{_A_NS}rPr")
+            if rPr is None:
+                continue
+            if not _names(rPr, "latin", latin):
+                continue          # this run is not the one being changed
+            for slot in _SCRIPT_SLOTS:
+                node = rPr.find(f"{_A_NS}{slot}")
+                if node is None:
+                    continue
+                face = (node.get("typeface") or "").strip()
+                if not face or face.startswith("+"):
+                    continue      # already says "inherit"
+                if face.casefold() != latin.casefold():
+                    faces.add(face)
+    return faces
+
+
+def _names(rPr: Any, slot: str, face: str) -> bool:
+    node = rPr.find(f"{_A_NS}{slot}")
+    if node is None:
+        return False
+    return (node.get("typeface") or "").casefold() == face.casefold()
+
+
 def fix_theme_font_drift(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[str]:
     """Clear a run-level typeface so the run inherits from the layout again.
 
@@ -1974,6 +2042,14 @@ def fix_theme_font_drift(shape: Any, issue: Issue, ctx: "FixContext") -> Optiona
     wanted = _font_name(issue.found)
     if not wanted or not _has_text(shape):
         return None
+
+    pinned = _other_script_faces(shape, wanted)
+    if pinned:
+        raise LeaveAlone(
+            f"clearing {wanted!r} would not leave this inheriting the theme: "
+            f"the same run also pins {', '.join(sorted(pinned))} for another "
+            "script, and that is what PowerPoint would fall back to"
+        )
 
     cleared = 0
     for paragraph in shape.text_frame.paragraphs:

@@ -78,6 +78,14 @@ _ADVICE = {
         "with /AUTOMATION and has no window, so closing PowerPoint normally "
         "does not touch it: end POWERPNT.EXE in Task Manager, then try again."
     ),
+    # 0x80080005 CO_E_SERVER_EXEC_FAILURE
+    -2146959355: (
+        "PowerPoint would not start for automation. This is usually a "
+        "pending Document Recovery from a PowerPoint that crashed or was "
+        "force-quit: the recovery pane cannot be shown to a windowless "
+        "instance, so every automated launch dies. Open PowerPoint normally, "
+        "dismiss the Document Recovery pane, close it, then try again."
+    ),
     # 0x80040154 REGDB_E_CLASSNOTREG
     -2147221164: (
         "Windows has no PowerPoint registered for automation. Applying a "

@@ -1048,32 +1048,6 @@ behind, which makes it usable as a gate.
 python -m formatting_tool ui --reload
 ```
 
-**Every placeholder is handed back to its layout, last of all.** A layout
-supplies a placeholder's position and size only while the placeholder does not
-state its own, and a messy deck states its own everywhere. Re-pointing a slide
-at a new layout does not clear those, so a title 4.4in wide on its old layout
-stays 4.4in wide on one that gives titles the full width, and a narrow one
-stays narrow and reflows to a word a line down the side of the page. So
-`builder.reset_layouts` strips each placeholder's own `a:xfrm` -- PowerPoint's
-Reset Slide, done to the file -- for every slot the new layout actually
-defines. A slot it does not define inherits nothing, so clearing it would not
-reset the placeholder, it would send it to the origin at a default size.
-
-**It runs after the second round, not at the end of the rebuild.** That
-distinction is the whole of it. `rebuild()` looks like the last step and is
-not: `_second_round` measures the rebuilt deck, applies what it finds and
-re-saves it through python-pptx, so every geometry fix it makes writes an
-explicit position straight back onto a placeholder the reset had just cleared.
-A designer got a deck back still on the old boxes and reset it by hand. Only
-`_copy_notes` follows it now, and that has to stay last for its own reason: it
-writes comments through COM, and a python-pptx save after it throws them away.
-
-What it costs, said plainly: a second-round fix that moved a placeholder to
-clear an overlap is undone with the rest. That is what resetting to the layout
-means, and once a master has been applied the master's geometry is the
-authority. It is skipped on a right-to-left deck, where the mirror IS a set of
-explicit positions, and it does nothing at all when no master was applied.
-
 **If uploads keep vanishing, move the working directory.** A session's uploaded
 deck, its renders and the deck written from it all live in a directory under
 the system temporary one. That is right until something else is managing it:

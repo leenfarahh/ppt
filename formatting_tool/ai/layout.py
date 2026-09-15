@@ -61,22 +61,6 @@ log = logging.getLogger(__name__)
 # for it; what it cannot also pay for is the reasoning.
 _ANSWER_TOKENS = 1024
 
-# How many of these to have in flight. Higher than the review layer's, and
-# measured rather than guessed: on a 22-slide deck the pass takes 80.6s at six,
-# 51.4s at twenty-two, and nothing was rate-limited at either.
-#
-# WHAT IS NOT THE LEVER, because it looked like it: the thinking budget. Cut
-# from 16384 to 2048 -- the whole of the reasoning this pass is allowed -- the
-# same deck went from 80.6s to 76.9s. The cost is per-call latency, about
-# twenty-five seconds whatever the model is asked to do, so what decides the
-# wall clock is how many ROUNDS of calls there are and nothing else. Twenty-two
-# slides at six concurrent is four rounds; at sixteen it is two.
-#
-# Safe to raise because the answers are tiny and independent, and because a
-# rate limit is waited out rather than dropped -- see `gemini.generate_json`.
-# The worst case of setting this too high is a pause, not a lost slide.
-DEFAULT_CONCURRENCY = 16
-
 _RESPONSE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {"layout_choices": {"type": "array", "items": LAYOUT_CHOICE_SCHEMA}},
@@ -132,7 +116,7 @@ def choose_layouts(
     model: str,
     thinking_budget: int,
     api_key_env: str = "GEMINI_API_KEY",
-    concurrency: int = DEFAULT_CONCURRENCY,
+    concurrency: int = 6,
     master: Optional[Path] = None,
 ) -> list[LayoutChoice]:
     """One pick per rendered slide. Never raises; an empty list means the

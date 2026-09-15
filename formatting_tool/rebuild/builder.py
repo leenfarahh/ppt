@@ -617,18 +617,6 @@ def claim_runs(
     spare: list[Any] = []
     moves: dict[int, tuple[int, int, int, int]] = {}
     for run, slots in pairs:
-        # Checked per run, not once up front: the run's own members are the
-        # only shapes that may be sitting in the regions they are moving into,
-        # and a blanket filter that exempted every loose shape exempted the
-        # very content the regions were already covered by.
-        wanted = slots.shapes[:len(run)]
-        if len(_unoccupied(wanted, candidates, run.shapes)) < len(wanted):
-            log.info(
-                "not filling %d region(s) from a run of %d: the slide already "
-                "draws its own content there",
-                len(wanted), len(run),
-            )
-            continue
         for shape, target in zip(run.shapes, slots.shapes):
             claims[id(shape)] = target
             pool.remove(target)
@@ -679,145 +667,14 @@ def claim_drawn_over(loose: Sequence[Any], pool: list[Any]) -> dict[int, Any]:
 
     from .series import pair_over  # noqa: PLC0415 - cycle
 
-    # A BOX THAT BELONGS TO A ROW IS NOT A LONE BOX. This places one shape at a
-    # time, which is right for a subtitle and wrong for one of three cards: the
-    # first wave heading sat over a content region, so it was moved into it
-    # while the second and third stayed where they were, and a row of three
-    # became a row of one and two.
-    #
-    # NOT "is it in a series", which is what this tried first and why the row
-    # above survived it. `series.find_series` groups by SIZE, and those three
-    # headings are 3.14, 2.55 and 2.77in wide -- a row a reader sees instantly
-    # and a run the size test will never find. What makes them peers is that
-    # they sit at the same height, which is the same thing the applier's
-    # alignment guard reads, and it is enough: a box with company on its own
-    # line is one of several, and moving one of several is what breaks a slide.
-    # `claim_runs` is what moves a row, and it moves all of it or none.
-    loose = [shape for shape in loose if not _has_row_peers(shape, loose)]
-    if not loose:
-        return {}
-
     claims: dict[int, Any] = {}
     for shape, region in pair_over(loose, free):
-        # The box on its way in does not count against the region it is drawn
-        # over -- that overlap is the whole signal here -- but anything else
-        # already drawn there does.
-        if not _unoccupied([region], loose, [shape]):
-            log.info(
-                "not filling %r from the box drawn over it: the slide already "
-                "draws other content there", _name_of(region),
-            )
-            continue
         claims[id(shape)] = region
         pool.remove(region)
         log.info(
             "filled %r from the box drawn over it", _name_of(region),
         )
     return claims
-
-
-# How much of a region the slide's own content may already cover before that
-# region stops counting as free. A quarter is well above the incidental
-# clipping of a neighbouring box and well below anything that reads as "there
-# is already something here".
-_OCCUPIED_SHARE = 0.25
-
-
-# How close two tops have to be to read as the same line of a slide. The same
-# band width `series` groups rows by, for the same reason: a row a designer
-# drew by hand is never aligned to the thousandth.
-_ROW_BAND_IN = 0.15
-
-
-def _has_row_peers(shape: Any, others: Sequence[Any]) -> bool:
-    """Whether this box shares its line with other content that is staying put.
-
-    Company on the same line makes a box one of several, and one of several
-    cannot be moved on its own without breaking the arrangement a reader can
-    see. Measured on the top edge, which is what a row of headings shares even
-    when their widths differ -- and their widths routinely do.
-    """
-    box = _box_in(shape)
-    if box is None:
-        return False
-    for other in others:
-        if other is shape:
-            continue
-        peer = _box_in(other)
-        if peer is None:
-            continue
-        if abs(peer[1] - box[1]) <= _ROW_BAND_IN:
-            return True
-    return False
-
-
-def _unoccupied(
-    regions: Sequence[Any], everything: Sequence[Any], moving: Sequence[Any]
-) -> list[Any]:
-    """The regions nothing is already drawn in.
-
-    EMPTY IS NOT THE SAME AS FREE, and the difference cost a slide its layout.
-    A deck's three wave columns each ended with a "Timing / Total Headcount"
-    box at the foot of the page, and the layout it moved to offers three
-    content regions near the top. The regions held no copy, so they were taken
-    as free, and the three boxes were filled into them -- on top of the wave
-    headings and the lists that were already there. Nothing was duplicated and
-    nothing was lost; three blocks of copy were simply moved onto three others.
-
-    A placeholder is empty when it has no text OF ITS OWN. It is free when
-    nothing on the slide is drawn where it sits, which is a different question
-    and the one that decides whether filling it is safe.
-
-    The shapes being moved are not counted against it: a run on its way into a
-    region cannot be the reason the region is unavailable, and the box drawn
-    directly over a region is the whole case `claim_drawn_over` exists for.
-    """
-    if not regions:
-        return []
-    coming = {id(shape) for shape in moving}
-    content = [
-        shape for shape in everything
-        if id(shape) not in coming
-        and not _is_placeholder(shape)
-        and (_has_copy(shape) or _is_imagery(shape))
-    ]
-    if not content:
-        return list(regions)
-
-    kept = []
-    for region in regions:
-        box = _box_in(region)
-        if box is None:
-            continue
-        area = (box[2] - box[0]) * (box[3] - box[1])
-        if area <= 0:
-            continue
-        covered = 0.0
-        for shape in content:
-            other = _box_in(shape)
-            if other is None:
-                continue
-            across = min(box[2], other[2]) - max(box[0], other[0])
-            down = min(box[3], other[3]) - max(box[1], other[1])
-            if across > 0 and down > 0:
-                covered += across * down
-        if covered / area < _OCCUPIED_SHARE:
-            kept.append(region)
-    return kept
-
-
-def _box_in(shape: Any):
-    """A shape's box in inches as (left, top, right, bottom), or None."""
-    try:
-        left = (shape.left or 0) / 914400
-        top = (shape.top or 0) / 914400
-        width = (shape.width or 0) / 914400
-        height = (shape.height or 0) / 914400
-    except Exception:
-        return None
-    if width <= 0 or height <= 0:
-        return None
-    return (left, top, left + width, top + height)
 
 
 def _is_imagery(shape: Any) -> bool:

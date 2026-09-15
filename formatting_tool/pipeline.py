@@ -47,12 +47,11 @@ from pathlib import Path
 from typing import Optional
 
 from .ai.client import AIConfig, AIResult, AIValidationError, AIValidator
-from .ai.gemini import Exhausted, Truncated
+from .ai.gemini import Exhausted
 from .ai.payload import (
     DEFAULT_BATCH_SIZE,
     DEFAULT_BATCH_TOKENS,
     build_batches,
-    split_batch,
     estimate_tokens,
     payload_to_text,
     ref_for,
@@ -563,32 +562,6 @@ def _review_one(
     batch = images.for_slides(payload.get("batch", {}).get("slides", []))
     try:
         return validator.validate_batch(payload, deck.name, batch)
-    except Truncated as exc:
-        # Not a failure of the request, only of the room to answer it. Ask the
-        # same question in two halves; each has less to say and fits.
-        halves = split_batch(payload)
-        if not halves:
-            log.error(
-                "AI layer failed on %s slide %s: %s, and the batch is a single "
-                "slide so there is nothing left to split -- reporting rule "
-                "findings for it",
-                deck.name, payload.get("batch", {}).get("slides"), exc,
-            )
-            return None
-        log.info(
-            "the answer for %s slide(s) %s was cut off; asking again in two "
-            "halves", deck.name, payload.get("batch", {}).get("slides"),
-        )
-        merged: Optional[AIResult] = None
-        for half in halves:
-            part = _review_one(validator, deck, half, images, spent)
-            if part is None:
-                continue
-            if merged is None:
-                merged = part
-            else:
-                merged.merge(part)
-        return merged
     except Exhausted as exc:
         # Recorded once and reported once by the caller. Nothing here is worth
         # retrying and nothing else will succeed either.

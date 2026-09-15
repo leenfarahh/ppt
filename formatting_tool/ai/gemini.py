@@ -23,16 +23,6 @@ class RateLimited(AIValidationError):
     that is worth simply waiting out."""
 
 
-class Truncated(AIValidationError):
-    """The answer was cut off by the output budget, not by anything wrong.
-
-    Its own class because the caller can do something about this one and can
-    do nothing about the rest: the request was fine, the model was answering,
-    and it ran out of room. Ask for less in one call and the same question
-    succeeds. See `pipeline._review_one`, which splits the batch and retries.
-    """
-
-
 class Exhausted(AIValidationError):
     """The account is out: a spend cap reached, or a daily quota spent.
 
@@ -261,27 +251,15 @@ def parse_json(response: Any) -> dict[str, Any]:
     reason = finish_reason(response)
     text = response_text(response)
     if not text:
-        if reason == "MAX_TOKENS":
-            raise Truncated(
-                "the budget was spent before the answer began, so the whole "
-                "of it went on thinking"
-            )
         raise AIValidationError(
             f"response contained no text part (finish_reason={reason})"
         )
     try:
         data = json.loads(text)
     except json.JSONDecodeError as exc:
-        # `response_schema` makes malformed JSON near-impossible, so in
-        # practice this is always the answer being cut off mid-string. Said as
-        # its own error, because the caller can fix this one by asking for
-        # less -- and used to be indistinguishable from a real parse failure,
-        # which cost four slides their findings with nothing to be done about
-        # it.
-        if reason == "MAX_TOKENS":
-            raise Truncated(
-                f"the answer was cut off by the output budget: {exc}"
-            ) from exc
+        # response_schema makes this near-impossible; if it happens, the
+        # response was truncated by max_output_tokens, most likely because
+        # thinking ate the budget. Lower the effort or raise max_tokens.
         raise AIValidationError(
             f"response was not valid JSON (finish_reason={reason}): {exc}"
         ) from exc

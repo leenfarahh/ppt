@@ -34,7 +34,6 @@ from ..models import Issue, RuleTuning, Tolerances
 from .fixers import (
     COHORT,
     GEOMETRIC,
-    _emu,
     is_geometric,
     RELATIVE,
     LeaveAlone,
@@ -889,15 +888,6 @@ def _apply_one_uninstrumented(
                     False,
                     f"left alone: moving it would break its alignment with {names}",
                 )
-            outside = _cohort_outside_the_frame(move, context)
-            if outside:
-                move.revert()
-                return FixOutcome(
-                    issue,
-                    False,
-                    "left alone: moving the set it belongs to would take "
-                    f"{outside} of them outside the page's margins",
-                )
             worse = _cohort_worsened(move, neighbours)
             if worse:
                 move.revert()
@@ -1440,51 +1430,6 @@ class CohortMove:
     def carried(self) -> int:
         """Shapes that came along, not counting the one the finding named."""
         return max(0, len(self.shapes) - 1)
-
-
-def _cohort_outside_the_frame(move: "CohortMove", context: FixContext) -> int:
-    """How many of a moved set now sit outside the page's margins.
-
-    THE GUARD THIS ADDS, and the slide that needed it. A heading's hardcoded
-    typeface was cleared so the theme's would apply; the theme face is wider,
-    the heading no longer fitted its box, and the recheck saw the spilled text
-    drawn across the rule beneath it. `space.text_collision` is allowed to move
-    a set -- rightly, because nudging one status bar out of a row of four
-    breaks the row -- and the set it found was a column: the rule, the line of
-    copy above it, the first of three cards, and the band below them. So all
-    four moved 0.55in to the left, out of the 0.61in margin every other shape
-    on the slide sits against, and the card slid out from under its own
-    heading.
-    
-    Nothing already there could see it. The move broke no alignment -- the
-    whole column moved together, which is the point of a cohort -- and it
-    landed on nothing, because the space it moved into was empty. It was still
-    wrong, and what made it wrong is the one thing nobody was measuring: the
-    set left the page's frame.
-
-    Counted rather than named: a set move is reported as a set, and "three of
-    them" is what a reader needs. The frame is the master's own safe margins
-    where there are any, and the canvas where there are none, so a deck
-    checked without a master keeps the weaker check rather than none.
-    """
-    margins = context.margins or {}
-    left = _emu(margins.get("left", 0.0))
-    top = _emu(margins.get("top", 0.0))
-    right = context.width_emu - _emu(margins.get("right", 0.0))
-    bottom = context.height_emu - _emu(margins.get("bottom", 0.0))
-
-    outside = 0
-    for shape in move.shapes:
-        try:
-            x, y = shape.left, shape.top
-            width, height = shape.width or 0, shape.height or 0
-        except Exception:
-            continue
-        if x is None or y is None:
-            continue
-        if x < left or y < top or x + width > right or y + height > bottom:
-            outside += 1
-    return outside
 
 
 def _cohort_move(

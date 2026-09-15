@@ -92,6 +92,11 @@ class _Session:
     # then meant reading a file in a temp directory that may no longer be
     # there -- and, where it is, may not be the file the report describes.
     spec: Any = None
+    # The model's reading of which off-palette colours mean something, carried
+    # as objects rather than through the report dict for the reason `spec` is:
+    # an undo replays the whole run, and re-deriving this each time would let
+    # a take-back change a verdict nobody revisited.
+    color_intents: list = field(default_factory=list)
     created: float = field(default_factory=time.time)
     # The last apply, kept so an undo can replay it without the page having to
     # send the whole tick list back. `selection` is None for "everything
@@ -378,6 +383,7 @@ class _Handler(BaseHTTPRequestHandler):
                 spec=session.spec,
                 undone=session.undone,
                 layout_choices=_layout_picks(session) if session.rebuild else None,
+                color_intents=session.color_intents,
             )
             elapsed = time.perf_counter() - started
         session.applied_once = True
@@ -388,6 +394,22 @@ class _Handler(BaseHTTPRequestHandler):
 
         return {
             "session": session.id,
+            # Colour fixes left alone because the model read the colours as
+            # carrying meaning. Listed, not silent: a correction that did not
+            # happen has to be as visible as one that did, or the page is a
+            # list that lies by omission.
+            "kept_colors": [
+                {
+                    "id": issue.id,
+                    "slide": issue.slide,
+                    "shape": issue.shape,
+                    "detail": issue.message,
+                    "scheme": intent.scheme,
+                    "why": intent.why,
+                    "confidence": intent.confidence,
+                }
+                for issue, intent in result.kept_colors
+            ],
             # Listed apart from the rest: a removal is the one change with
             # nothing left on the slide to check it against.
             "removed": [
@@ -623,6 +645,7 @@ class _Handler(BaseHTTPRequestHandler):
                 deck=config.decks[0],
                 report=report.to_dict(),
                 spec=report.spec,
+                color_intents=list(report.color_intents),
                 ai=config.ai,
                 use_ai=config.use_ai,
             )

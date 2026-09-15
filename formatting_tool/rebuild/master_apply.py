@@ -84,6 +84,17 @@ _ADVICE = {
         "master runs PowerPoint's own placeholder matching, so it needs "
         "desktop PowerPoint installed on this machine."
     ),
+    # 0x80070570 ERROR_FILE_CORRUPT, as PowerPoint reports it. Reached here
+    # wrapped in DISP_E_EXCEPTION, which is why `advice` unwraps.
+    -2147023504: (
+        "PowerPoint says the file is corrupt and unreadable. It usually is "
+        "not: the archive this was seen on opened cleanly, and the deck it "
+        "came from was 172MB with 360 images, several over 10MB. Treat it as "
+        "PowerPoint refusing a file it found too big or too complex to open "
+        "for automation, and compress the images in the deck or the master "
+        "before rebuilding. The rebuild below ran instead and says what it "
+        "could not carry across."
+    ),
     # 0x80080005 CO_E_SERVER_EXEC_FAILURE
     -2146959355: (
         "PowerPoint would not start. Check Task Manager for a POWERPNT.EXE "
@@ -186,6 +197,13 @@ def apply_master(
         return MasterApplyResult(fatal=advice(exc))
 
 
+# 0x80020009 DISP_E_EXCEPTION. Not a fault in itself: the automation layer
+# saying the application raised, with the real code buried in the EXCEPINFO
+# tuple that follows. Looking only at args[0] reads every one of these as the
+# same unknown error and throws away the only part worth reading.
+_WRAPPER = -2147352567
+
+
 def advice(exc: Exception) -> str:
     """One sentence a person can act on, with the raw error kept.
 
@@ -193,10 +211,28 @@ def advice(exc: Exception) -> str:
     guess: a wrong instruction wastes more time than no instruction.
     """
     args = getattr(exc, "args", ())
-    known = _ADVICE.get(args[0] if args else None)
+    known = _ADVICE.get(_code(args))
     if not known:
         return f"PowerPoint automation failed: {exc}"
     return f"{known} (The error itself: {exc}.)"
+
+
+def _code(args) -> Optional[int]:
+    """The HRESULT worth looking up, unwrapping DISP_E_EXCEPTION.
+
+    A wrapped failure arrives as (-2147352567, 'Exception occurred.',
+    (wcode, source, text, help, helpid, scode), argerr). The scode at the end
+    of the EXCEPINFO is the application's own error and the only part that
+    distinguishes one of these from another.
+    """
+    if not args:
+        return None
+    if args[0] != _WRAPPER:
+        return args[0]
+    info = args[2] if len(args) > 2 else None
+    if isinstance(info, tuple) and len(info) >= 6 and isinstance(info[5], int):
+        return info[5]
+    return args[0]
 
 
 def _retry(call):

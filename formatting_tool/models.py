@@ -236,6 +236,37 @@ class LayoutChoice:
 
 
 @dataclass
+class ColorIntent:
+    """Whether a slide's off-palette colours are carrying meaning.
+
+    Separate from Issue for the reason LayoutChoice is: it is not a finding.
+    It is a reading of what the colours on a slide are FOR, and its effect is
+    to hold a correction back rather than to propose one.
+
+    The case it exists for, from a real deck: four cards each showing the same
+    concentric diagram, one ring picked out in orange and the rest greyed, so
+    that reading across the row shows the scope widening. Every grey is
+    off-palette and every grey is deliberate, and recolouring them to the
+    nearest brand neutral would leave four identical diagrams and destroy the
+    only thing the row was saying. A traffic-light status column is the same
+    shape of problem: the red is wrong by the palette and right by the reader.
+
+    `keep` does NOT dismiss the findings. They stay on the report, where a
+    designer can still act on them; what it does is stop the tool applying
+    them unasked. That line is the one the response schema draws, and it is
+    drawn there because a model that could delete findings would quietly be
+    deciding what a deck is allowed to be checked for.
+    """
+
+    slide: int                   # 1-based
+    keep: bool                   # True = an intentional system, hold the fixes
+    scheme: str = ""             # what the system is, in a few words
+    shape_ids: list[int] = field(default_factory=list)
+    confidence: float = 0.0
+    why: str = ""
+
+
+@dataclass
 class SkippedRule:
     """A check that never ran, and what it was waiting for.
 
@@ -266,6 +297,10 @@ class ValidationReport:
     # The checks that never ran. Nothing else stands between what the rules
     # found and what is printed: no layer can remove a finding.
     skipped_rules: list[SkippedRule] = field(default_factory=list)
+    # Slides whose off-palette colours the model read as deliberate. Carried
+    # on the report because that is what survives to the apply step, where
+    # the holding happens; no finding is removed on the strength of one.
+    color_intents: list[ColorIntent] = field(default_factory=list)
     # What the AI layer was sent and what it returned, verbatim, per batch.
     # Populated on request: it is the only way to tell a model that missed
     # something from a payload that never described it.

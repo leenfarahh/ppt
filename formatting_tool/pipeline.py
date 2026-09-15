@@ -228,6 +228,17 @@ def run(config: RunConfig) -> ValidationReport:
             min_confidence=config.min_confidence,
         )
         all_issues.extend(merged)
+        if ai_result.color_intents:
+            report.color_intents.extend(ai_result.color_intents)
+            log.info(
+                "%s: the model read the colours on %d slide(s) as deliberate "
+                "(%s); their colour fixes are held back",
+                deck.name,
+                len(ai_result.color_intents),
+                "; ".join(
+                    sorted({c.scheme for c in ai_result.color_intents if c.scheme})
+                ) or "no scheme named",
+            )
         if config.ai_debug and ai_result.exchanges:
             report.ai_exchanges.extend(ai_result.exchanges)
 

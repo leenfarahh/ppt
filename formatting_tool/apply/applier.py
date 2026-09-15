@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
-from ..models import Issue, RuleTuning, Tolerances
+from ..models import Category, Issue, RuleTuning, Tolerances
 from .fixers import (
     COHORT,
     GEOMETRIC,
@@ -262,6 +262,12 @@ class ApplyResult:
     # One entry per deleted production note, saying whether its text made it
     # into a PowerPoint comment. See apply.notes.
     notes_copied: list[Any] = field(default_factory=list)
+    # Colour findings left alone because the model read the colours as
+    # deliberate: (issue, the ColorIntent that spared it). Reported, never
+    # silent -- a correction that does not happen has to be as visible as one
+    # that does, or the designer is reading a list that lies by omission.
+    kept_colors: list = field(default_factory=list)
+
     # The findings held back on this run, and the ids asked for that matched
     # nothing. See `apply_fixes(undone=...)`: undoing a fix is replaying the
     # run without it, so what is undone is a property of the run rather than
@@ -322,6 +328,7 @@ def apply_fixes(
     spec: Optional[Any] = None,
     undone: Optional[Iterable[str]] = None,
     layout_choices: Optional[Sequence[Any]] = None,
+    color_intents: Optional[Sequence[Any]] = None,
 ) -> ApplyResult:
     """Apply the selected findings to `deck` and write the result to `out`.
 
@@ -355,6 +362,14 @@ def apply_fixes(
     file -- a fast undo that leaves debris is worse than a slow one that does
     not -- and it is what makes undoing several, in any order, safe.
 
+    `color_intents` is the model's reading of which off-palette colours are
+    carrying meaning, and it holds the colour fixes on those shapes back. A
+    traffic-light status column and a diagram greyed out except for the part
+    under discussion are both off palette and both correct; recolouring them
+    tidies away the only thing they were saying. The findings are NOT removed
+    -- they stay on the report where a designer can still act on them -- so
+    what this decides is whether the tool acts unasked. See ColorIntent.
+
     With `master`, the corrected deck is then rebuilt onto that master's
     layouts, and `layout_choices` is which layout each slide belongs on as read
     off its rendered picture. Without them the structural matcher decides
@@ -369,6 +384,11 @@ def apply_fixes(
         raise ApplyError(f"deck not found: {deck}")
 
     wanted = _wanted(issues, selected)
+    # Colour fixes the model read as deliberate. Filtered out of `wanted`
+    # rather than added to `held`, because `held` means "the designer took
+    # this back" and drives the undo list in the page; these were never
+    # applied and there is nothing to take back.
+    kept, wanted = _keep_intentional_colors(wanted, color_intents)
     held = list(dict.fromkeys(str(key) for key in (undone or ())))
     # The shapes a change has been taken back on. Held back BY SHAPE as well as
     # by id, because the second round would otherwise put the change straight
@@ -417,6 +437,7 @@ def apply_fixes(
     )
     result = ApplyResult(deck=deck.name, output=out)
     result.undone = held
+    result.kept_colors = kept
 
     # Shapes the report already faults geometrically. An alignment with one of
     # these is not a relationship worth protecting: it is two shapes wrong the
@@ -1330,6 +1351,67 @@ def _walk(shapes: Any) -> Iterable[Any]:
         yield from _walk(children)
 
 
+# Categories whose fix changes what a colour IS. A colour system survives a
+# shape being moved or a heading being rewrapped; it does not survive being
+# recoloured, so only these are held.
+_COLOUR_WORK = frozenset({Category.COLOR})
+
+
+def _keep_intentional_colors(
+    wanted: list[Issue],
+    intents: Optional[Sequence[Any]],
+) -> tuple[list, list[Issue]]:
+    """Split off the colour fixes the model read as meaning something.
+
+    Returns the pairs spared and the findings still to apply.
+
+    Narrow on purpose, in three ways, because this is the one place a model's
+    opinion stops a proven finding being corrected:
+
+    - Only colour categories. A slide whose greys are deliberate still has its
+      text reflowed and its shapes aligned.
+    - Only the shapes named. `shape_ids` is how a slide carries a real colour
+      system AND a heading somebody typed the wrong blue into; an empty list
+      falls back to the whole slide, which is blunter and is the model saying
+      the system is the slide.
+    - Only where a verdict exists. No verdict is not a keep. The default is
+      and stays "correct it".
+    """
+    if not intents:
+        return [], wanted
+
+    by_slide: dict[int, Any] = {}
+    for intent in intents:
+        if getattr(intent, "keep", False) and intent.slide is not None:
+            by_slide[int(intent.slide)] = intent
+
+    if not by_slide:
+        return [], wanted
+
+    kept: list = []
+    remaining: list[Issue] = []
+    for issue in wanted:
+        intent = by_slide.get(issue.slide) if issue.slide is not None else None
+        if (
+            intent is not None
+            and issue.category in _COLOUR_WORK
+            and (not intent.shape_ids or issue.shape_id in set(intent.shape_ids))
+        ):
+            kept.append((issue, intent))
+            continue
+        remaining.append(issue)
+
+    if kept:
+        log.info(
+            "left %d colour fix(es) alone on %d slide(s): the colours read as "
+            "deliberate (%s)",
+            len(kept),
+            len({i.slide for i, _ in kept}),
+            "; ".join(sorted({t.scheme for _i, t in kept if t.scheme})) or "no scheme named",
+        )
+    return kept, remaining
+
+
 def _wanted(
     issues: Sequence[Issue], selected: Optional[Iterable[str]]
 ) -> list[Issue]:
@@ -1376,12 +1458,25 @@ def _rebuild_in_place(
 
     staged = target.with_suffix(".prefix.pptx")
     shutil.move(str(target), str(staged))
+    result = None
     try:
-        return rebuild(
+        result = rebuild(
             master, staged, target, tuning=tuning, seen=layout_choices or None
         )
+        return result
     finally:
-        staged.unlink(missing_ok=True)
+        # Kept when PowerPoint refused the file, thrown away otherwise. This
+        # is the file PowerPoint was asked to open, so on a failure it is the
+        # only copy of the evidence -- and deleting it regardless is how a
+        # real ERROR_FILE_CORRUPT arrived with nothing left to examine, on a
+        # deck too large to reproduce cheaply.
+        if result is not None and getattr(result, "fatal", None):
+            log.warning(
+                "kept %s, the file PowerPoint would not open, for diagnosis",
+                staged.name,
+            )
+        else:
+            staged.unlink(missing_ok=True)
 
 
 # --------------------------------------------------------------------------- #

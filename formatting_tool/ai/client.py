@@ -6,7 +6,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from ..models import Issue, LayoutChoice, MasterSpec
+from ..models import ColorIntent, Issue, LayoutChoice, MasterSpec
 from .gemini import (
     AIValidationError,
     finish_reason as _finish_reason,
@@ -19,6 +19,7 @@ from .payload import build_reference_block, payload_to_text
 from .schema import (
     AI_RESPONSE_SCHEMA,
     issues_from_response,
+    color_intents_from_response,
     layout_choices_from_response,
     to_gemini_schema,
 )
@@ -198,6 +199,30 @@ picture of:
   content regions from the slide's own text boxes, and a messy slide has many
   loose ones, so it reads a table of contents as a four-region comparison. You
   can see that it is a list.
+
+Judging whether colour means something, in `color_intent`, one entry per slide
+you were given a picture of that has off-palette colours on it:
+
+- The question is not whether a colour is on the palette. A rule already knows
+  that and it is right. The question is WHY the colour is there, which a rule
+  cannot see and you can.
+- Answer `keep` only when the colours are doing work the palette cannot do and
+  correcting them would destroy meaning rather than tidy it. What qualifies: a
+  red/amber/green status column, where the red is the point; a diagram greyed
+  out except for the part under discussion, so that reading across a row shows
+  the scope change; a legend keyed to a chart; the real brand colours of
+  companies being named; a heat map or any scale.
+- Answer `change` for drift, which is most of what you will see: a colour
+  pasted in from another deck, a near miss of a brand colour, an accent nobody
+  chose, one heading a different blue from the three beside it. If you are
+  weighing it up, the answer is `change`.
+- Name the shapes in `shape_ids`. A slide can carry a real colour system AND a
+  mistake, and holding the whole slide protects both.
+- Be honest in `confidence`. A `keep` below 0.6 is discarded, which is the
+  intended outcome: an uncertain keep leaves a real defect in a deck nobody
+  will look at again, while an uncertain change is one click to undo.
+- `keep` deletes nothing. The findings still reach the designer. What you are
+  deciding is whether the tool corrects them without being asked.
 - Set a low confidence when the master offers nothing that fits, and say so in
   `why`. That is a fact about the master worth having; a confident guess is
   not.
@@ -229,6 +254,9 @@ class AIResult:
     # Not findings, so not in `issues`: an input to applying the master rather
     # than something a designer ticks.
     layout_choices: list[LayoutChoice] = field(default_factory=list)
+    # Slides whose off-palette colours the model reads as deliberate. Holds
+    # a correction back; never removes a finding. See ColorIntent.
+    color_intents: list[ColorIntent] = field(default_factory=list)
     # What each batch actually sent and got back. The AI layer is the part of
     # this tool you cannot read the source of to find out why it said
     # something, so the exchange is kept rather than discarded.
@@ -247,6 +275,7 @@ class AIResult:
         self.issues.extend(other.issues)
         self.summaries.extend(other.summaries)
         self.layout_choices.extend(other.layout_choices)
+        self.color_intents.extend(other.color_intents)
         self.exchanges.extend(other.exchanges)
         self.calls += other.calls
         self.input_tokens += other.input_tokens
@@ -357,7 +386,9 @@ class AIValidator:
             api_key_env=self.config.api_key_env,
         )
 
-        result = self._build_result(data, response, deck_name)
+        result = self._build_result(
+            data, response, deck_name, rendered={n for n, _ in (images or [])}
+        )
         result.exchanges = [
             {
                 "batch": payload.get("batch", {}),
@@ -397,7 +428,11 @@ class AIValidator:
     # -- response handling -------------------------------------------------- #
 
     def _build_result(
-        self, data: dict[str, Any], response: Any, deck_name: str
+        self,
+        data: dict[str, Any],
+        response: Any,
+        deck_name: str,
+        rendered: Optional[set[int]] = None,
     ) -> AIResult:
         issues, summary = issues_from_response(data, deck_name)
         # Validated against the master's real layout names here, where the
@@ -405,12 +440,17 @@ class AIValidator:
         # dropped, and the slide keeps whatever the deterministic matcher
         # chose.
         picks = layout_choices_from_response(data, set(self.spec.layout_names))
+        # Bounded to the slides this batch carried a picture of. A verdict
+        # about a slide the model never saw is not a judgement, and acting
+        # on it would protect a defect nobody reviewed.
+        intents = color_intents_from_response(data, rendered)
         usage = getattr(response, "usage_metadata", None)
         cached = _count(usage, "cached_content_token_count")
         return AIResult(
             issues=issues,
             summaries=[summary] if summary else [],
             layout_choices=picks,
+            color_intents=intents,
             calls=1,
             # prompt_token_count already includes the cached prefix, so it
             # comes back out here to keep the two fields disjoint.

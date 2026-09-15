@@ -9,6 +9,7 @@ from ..models import (
     Category,
     FixAction,
     Issue,
+    ColorIntent,
     LayoutChoice,
     Severity,
     Source,
@@ -172,6 +173,62 @@ LAYOUT_CHOICE_SCHEMA: dict[str, Any] = {
 }
 
 
+COLOR_INTENT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "slide": {"type": "integer", "description": "1-based slide number."},
+        "verdict": {
+            "type": "string",
+            "enum": ["change", "keep"],
+            "description": (
+                "'keep' when the off-palette colours on this slide are "
+                "carrying meaning and correcting them would destroy it. "
+                "'change' when they are drift: a colour pasted in from "
+                "another deck, a near-miss of a brand colour, an accent "
+                "nobody chose. 'change' is the default and the common answer."
+            ),
+        },
+        "scheme": {
+            "type": "string",
+            "description": (
+                "What the system IS, in a few words, when the verdict is "
+                "'keep': 'traffic-light RAG status', 'greyed out to "
+                "de-emphasise', 'category colours keyed to the legend', "
+                "'brand colours of the companies named'. Empty for 'change'."
+            ),
+        },
+        "shape_ids": {
+            "type": "array",
+            "items": {"type": "integer"},
+            "description": (
+                "The ids of the shapes carrying the system, from the payload. "
+                "Only these are held back, so a slide can have a meaningful "
+                "colour system AND a heading somebody typed the wrong blue "
+                "into. Empty with 'keep' holds the whole slide, which is "
+                "blunter than naming the shapes and should be a last resort."
+            ),
+        },
+        "confidence": {
+            "type": "number",
+            "description": (
+                "0.0-1.0. Below 0.6 is not acted on: an uncertain 'keep' "
+                "leaves a real defect in the deck, so the doubt is spent on "
+                "correcting rather than on keeping."
+            ),
+        },
+        "why": {
+            "type": "string",
+            "description": (
+                "One sentence: what the colours are doing that the palette "
+                "cannot say, and what correcting them would cost."
+            ),
+        },
+    },
+    "required": ["slide", "verdict", "scheme", "shape_ids", "confidence", "why"],
+    "additionalProperties": False,
+}
+
+
 AI_RESPONSE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -201,8 +258,26 @@ AI_RESPONSE_SCHEMA: dict[str, Any] = {
                 "image. Omit a slide you were given no picture of."
             ),
         },
+        # Whether this slide's off-palette colours mean something. Asked of
+        # the model for the same reason layout_choices is: it is a coarse
+        # categorical judgement about what a slide IS, read off a picture,
+        # which is what a render is good for. A palette rule can prove a
+        # colour is not on the palette and can never tell why it is there.
+        #
+        # It does not dismiss anything. See ColorIntent, and the note above
+        # on why there is no way to dismiss a rule finding.
+        "color_intent": {
+            "type": "array",
+            "items": COLOR_INTENT_SCHEMA,
+            "description": (
+                "One entry per slide in this batch that carried a rendered "
+                "image AND has off-palette colours on it. Omit a slide you "
+                "were given no picture of, and omit one whose colours are all "
+                "on palette: there is nothing to judge."
+            ),
+        },
     },
-    "required": ["issues", "summary", "layout_choices"],
+    "required": ["issues", "summary", "layout_choices", "color_intent"],
     "additionalProperties": False,
 }
 
@@ -269,6 +344,54 @@ def layout_choices_from_response(
                 slide=number,
                 layout=name,
                 confidence=_confidence(raw.get("confidence")) or 0.0,
+                why=str(raw.get("why") or "").strip(),
+            )
+        )
+    return out
+
+
+# Below this a "keep" is not acted on. An uncertain keep leaves a real defect
+# in a deck nobody will look at again, while an uncertain change is visible in
+# the list and one click to undo, so the doubt is spent on correcting.
+KEEP_CONFIDENCE = 0.6
+
+
+def color_intents_from_response(
+    payload: dict[str, Any],
+    slides: Optional[set[int]] = None,
+) -> list[ColorIntent]:
+    """The model's reading of which colours mean something.
+
+    Only "keep" survives. A "change" verdict is the default the tool already
+    follows, so recording it would add a row to every report that says
+    nothing; and an unconfident "keep" is dropped here rather than weighed
+    later, so there is one place where the bar lives.
+
+    A verdict for a slide outside this batch is dropped too. The model is
+    shown a handful of slides and asked about those; a judgement about one it
+    was not given is not a judgement, and holding a fix on the strength of it
+    would silently protect a defect on a slide nobody reviewed.
+    """
+    out: list[ColorIntent] = []
+    for raw in payload.get("color_intent") or []:
+        number = raw.get("slide")
+        if not isinstance(number, int):
+            continue
+        if slides is not None and number not in slides:
+            continue
+        if str(raw.get("verdict") or "").strip().lower() != "keep":
+            continue
+        confidence = _confidence(raw.get("confidence")) or 0.0
+        if confidence < KEEP_CONFIDENCE:
+            continue
+        ids = [i for i in (raw.get("shape_ids") or []) if isinstance(i, int)]
+        out.append(
+            ColorIntent(
+                slide=number,
+                keep=True,
+                scheme=str(raw.get("scheme") or "").strip(),
+                shape_ids=ids,
+                confidence=confidence,
                 why=str(raw.get("why") or "").strip(),
             )
         )

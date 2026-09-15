@@ -215,13 +215,31 @@ class ManualLineBreakRule(Rule):
     With one exception, and it is the tool's own doing: `heading_balance`
     breaks a short heading across two lines to square up a row, and a soft
     return is the only way to choose WHERE that break falls. Reporting those
-    would be the tool filing a defect against its own fix, so a shape in a row
-    whose headings all take the same number of lines is left alone -- the
-    break is doing the job the rule is otherwise warning about the absence of.
+    would be the tool filing a defect against its own fix, so a break holding
+    a heading at its row's line count is left alone -- it is doing the job
+    this rule otherwise warns about the absence of.
 
     Judged on the row rather than on a marker in the file, because a designer
     who balances a row by hand has done the same correct thing and should not
     be told off for it either.
+
+    SPARED AT THE ROW'S LONGEST, not only where the row already agrees. The
+    narrower test was "every heading takes the same number of lines", and it
+    let the rule take a row apart on the way to squaring it up. A real row of
+    four chevrons ran 1, 2, 2, 2: not uniform, so nothing was spared, and the
+    two headings that reached two lines with a soft return had it removed. The
+    row came out 1, 2, 1, 1 -- raggeder than it went in, and every removal
+    correct on its own terms.
+
+    So the row is levelled UP, which is the same direction `heading_balance`
+    equalises in and for the same reason: a break can be added to a short
+    heading, while a long one needs a wider box or smaller type, and those are
+    the designer's to give. A heading below its row's longest still has its
+    breaks reported; there is nothing for them to hold it at.
+
+    Capped at `_BALANCE_TO`, so both rules agree about which rows are worth
+    squaring up at all. Past that the heading is a paragraph, no break is
+    holding a row together, and unwrapping it may be the better answer.
     """
 
     id = "typography.manual_line_break"
@@ -252,20 +270,31 @@ class ManualLineBreakRule(Rule):
                 )
 
     def _balanced_shapes(self, slide: SlideProfile) -> set:
-        """Shapes in a row of headings that all take the same line count."""
+        """Shapes whose break is holding them at their row's line count.
+
+        The longest in each row, not the whole of a row that already agrees.
+        A row that does not yet agree is the one being squared up, and taking
+        the breaks out of its longest headings squares it up downwards.
+        """
         if not self.metrics.available:
             return set()
         balanced = set()
         for row in _heading_rows(slide):
-            counts = []
+            counts: dict = {}
             for shape in row:
                 lines = self.metrics.lines(ShapeKey(slide.number, shape.shape_id))
                 if not lines:
-                    counts = []
+                    counts = {}
                     break
-                counts.append(len(lines))
-            if counts and len(set(counts)) == 1 and counts[0] > 1:
-                balanced.update(shape.shape_id for shape in row)
+                counts[shape.shape_id] = len(lines)
+            if not counts:
+                continue
+            longest = max(counts.values())
+            if not 1 < longest <= _BALANCE_TO:
+                continue
+            balanced.update(
+                shape_id for shape_id, n in counts.items() if n == longest
+            )
         return balanced
 
 

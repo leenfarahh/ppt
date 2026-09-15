@@ -21,6 +21,8 @@ deck nobody looks at again; an uncertain change is one click to undo.
 
 from __future__ import annotations
 
+import pathlib
+
 from formatting_tool.ai.schema import (
     AI_RESPONSE_SCHEMA,
     KEEP_CONFIDENCE,
@@ -162,3 +164,43 @@ def test_the_finding_is_kept_not_deleted() -> None:
     held_issue, intent = kept[0]
     assert held_issue is issue
     assert intent.scheme and intent.why
+
+
+# --------------------------------------------------------------------------- #
+# The precondition, which is the part that actually failed
+# --------------------------------------------------------------------------- #
+
+def test_the_page_asks_for_renders() -> None:
+    """Every render-based check is inert without this, and silently so.
+
+    The page posted `guidelines`, `use_ai`, `model`, `effort`,
+    `min_confidence` and `batch_size`, and never `render`. So
+    `RunConfig.render` was False on every run from the UI, `_render` returned
+    "rendering was not requested", and the AI layer saw geometry only. Nothing
+    reported it: the prompt still described the pictures, the model still
+    answered, and the answers were simply poorer. Colour intent could not fire
+    at all, because a verdict about a slide the model was not shown is dropped.
+
+    Asserted against the file rather than through a request because that is
+    where the omission was, and a mock of the page would have agreed with the
+    bug.
+    """
+    page = pathlib.Path("formatting_tool/web/static/index.html").read_text(
+        encoding="utf-8"
+    )
+    options = page.split('form.append("options"', 1)[1].split("}));", 1)[0]
+    assert "render: true" in options
+
+
+def test_a_held_colour_is_not_in_the_plans_selection() -> None:
+    """The colour plan is built from `wanted`, so holding has to happen first.
+
+    A held colour stays in `issues`, which is what makes this safe rather
+    than merely quiet: the plan still sees the colour and reserves it, so
+    nothing else on the deck is recoloured into it.
+    """
+    system, mistake = _issue(19, 4), _issue(19, 88)
+    _kept, remaining = _keep_intentional_colors(
+        [system, mistake], [_keep(19, [4])]
+    )
+    assert system not in remaining and mistake in remaining

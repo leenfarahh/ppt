@@ -264,13 +264,29 @@ def test_a_balanced_row_is_exempt_from_the_manual_break_warning(
     balanced = list(
         ManualLineBreakRule(_counts(ids, [2, 2, 2, 2])).check(_ctx(deck))
     )
+    assert balanced == []
+
+    # A ragged row is levelled UP, so the breaks holding its longest headings
+    # there are spared too. This asserted the opposite until a real deck
+    # showed the cost: four chevron headings ran 1, 2, 2, 2, the row was not
+    # uniform so nothing was exempt, and the two that reached two lines with a
+    # soft return had it removed. The row came out 1, 2, 1, 1 -- raggeder than
+    # it arrived, by a sequence of individually correct removals.
+    #
+    # Up is the direction `heading_balance` already equalises in, for its
+    # reason: a break can be added to a short heading, while a long one needs
+    # a wider box or smaller type, and those are the designer's to give.
     ragged = list(
         ManualLineBreakRule(_counts(ids, [2, 1, 2, 1])).check(_ctx(deck))
     )
+    assert ragged == []
 
-    assert balanced == []
-    # Still reported where the breaks are not squaring anything up.
-    assert {i.shape for i in ragged} == {"Heading 1", "Heading 3"}
+    # Sparing is for breaks doing work. One that leaves a heading a line short
+    # of its row is holding nothing together and is still reported.
+    short = list(
+        ManualLineBreakRule(_counts(ids, [2, 3, 2, 3])).check(_ctx(deck))
+    )
+    assert {i.shape for i in short} == {"Heading 1", "Heading 3"}
 
 
 def test_the_second_round_cannot_undo_the_balance() -> None:

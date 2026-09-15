@@ -710,6 +710,12 @@ async function runCheck() {
   form.append("options", JSON.stringify({
     guidelines: $("#guidelines").value,
     use_ai: state.useAI,
+    // Always on from the page. Half of what the AI layer is asked to do can
+    // only be read off a picture -- text clipped by its box, a shape hidden
+    // behind another, whether a slide's off-palette colours are carrying
+    // meaning -- and this was never sent, so every review from here ran on
+    // geometry alone and those checks were quietly inert.
+    render: true,
     model: $("#model").value,
     effort: $("#effort").value,
     min_confidence: Number($("#confidence").value) || 0,

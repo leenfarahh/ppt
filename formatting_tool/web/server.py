@@ -799,7 +799,10 @@ def _layout_picks(session: _Session) -> list:
         return session.layout_picks
 
     try:
-        from ..ai.layout import choose_layouts  # noqa: PLC0415 - lazy, optional
+        from ..ai.layout import (  # noqa: PLC0415 - lazy, optional
+            DEFAULT_CONCURRENCY as DEFAULT_AI_CONCURRENCY,
+            choose_layouts,
+        )
 
         directory = session.directory / "before"
         rendered = _render_into(session.deck, directory)
@@ -817,6 +820,9 @@ def _layout_picks(session: _Session) -> list:
             thinking_budget=session.ai.thinking_budget,
             api_key_env=session.ai.api_key_env,
             master=session.master,
+            # The page never passed this, so the pass ran at the function's
+            # own default while the rest of the run used the configured one.
+            concurrency=DEFAULT_AI_CONCURRENCY,
         )
         log.info(
             "the model chose a layout for %d of %d slide(s)",

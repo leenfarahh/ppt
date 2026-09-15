@@ -36,7 +36,6 @@ import logging
 import os
 import queue
 import threading
-import time
 from typing import Optional
 
 log = logging.getLogger(__name__)
@@ -51,98 +50,18 @@ def available() -> bool:
     return os.name == "nt"
 
 
-# 0x80080005 CO_E_SERVER_EXEC_FAILURE. Windows would not launch the server.
-# Against an Office singleton the ordinary cause is a launch already in
-# flight: the second activation collides with the first and is refused.
-_EXEC_FAILURE = -2146959355
-
-# A cold PowerPoint takes something over twenty seconds to become usable on a
-# laptop with the deck on OneDrive. A warm one answers in well under a second,
-# so the wait is paid once a session and almost never in full.
-_READY_TIMEOUT_S = 90
-_READY_POLL_S = 0.5
-
-
-def _ready(app) -> bool:
-    """Whether this instance can actually serve a call yet.
-
-    PowerPoint enters the Running Object Table early in its startup, well
-    before it can answer, so an instance that exists is not yet an instance
-    that works. What makes the gap hard to recognise is how win32com reports
-    it: dynamic dispatch asks GetIDsOfNames for the member, a starting
-    PowerPoint refuses, and `__getattr__` has nowhere to go but AttributeError.
-    The symptom is `AttributeError: PowerPoint.Application.Presentations`,
-    which reads like a missing method on the wrong kind of object rather than
-    like a slow start, and sends whoever reads it looking in the wrong place.
-
-    Touching Presentations is the cheapest call that settles it.
-    """
-    try:
-        app.Presentations.Count
-    except Exception:
-        return False
-    return True
-
-
 def _connect():
-    """The PowerPoint already running, or a new one, once it can answer.
+    """The PowerPoint already running, or a new one.
 
     Returns the instance and whether we started it, because that is what says
     whether we are allowed to quit it later.
-
-    Nothing unready is handed back. A half-started PowerPoint fails every call
-    made against it, and those failures land a long way from here -- a render
-    that produced no images, a master that could not be applied so the deck
-    was rebuilt instead, notes that never became comments. Each one is caught
-    and logged by the step that hit it, so the run finishes and reports
-    success while quietly having done less. Waiting the few seconds PowerPoint
-    needs costs less than any one of those.
     """
     import win32com.client  # noqa: PLC0415
 
-    started = False
-    last: Exception | None = None
-    deadline = time.monotonic() + _READY_TIMEOUT_S
-
-    while True:
-        app = None
-        try:
-            app = win32com.client.GetActiveObject("PowerPoint.Application")
-        except Exception as exc:          # not in the table: nothing running yet
-            last = exc
-
-        if app is None:
-            try:
-                app = win32com.client.Dispatch("PowerPoint.Application")
-                started = True
-            except Exception as exc:
-                args = getattr(exc, "args", ())
-                if not (args and args[0] == _EXEC_FAILURE):
-                    raise                 # a real fault; retrying only delays it
-                # Someone is already starting PowerPoint, possibly us on an
-                # earlier pass round this loop. Wait for that one instead of
-                # racing it with another launch.
-                last = exc
-                app = None
-
-        if app is not None and _ready(app):
-            return app, started
-
-        if time.monotonic() >= deadline:
-            break
-        time.sleep(_READY_POLL_S)
-
-    raise RuntimeError(
-        f"PowerPoint would not start for automation within {_READY_TIMEOUT_S}s. "
-        "Almost always this is Document Recovery: a PowerPoint that crashed or "
-        "was force-quit leaves a recovery entry behind, and every later "
-        "/AUTOMATION launch tries to show the recovery pane, cannot show it "
-        "without a window, and dies without registering. Nothing clears it "
-        "except a person: open PowerPoint normally, dismiss the Document "
-        "Recovery pane, close it again, then re-run. End any windowless "
-        "POWERPNT.EXE in Task Manager first, since those are the failed "
-        f"launches and they keep colliding with new ones. (Last error: {last}.)"
-    ) from last
+    try:
+        return win32com.client.GetActiveObject("PowerPoint.Application"), False
+    except Exception:
+        return win32com.client.Dispatch("PowerPoint.Application"), True
 
 
 class _PowerPointHost:

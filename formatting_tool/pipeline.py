@@ -36,8 +36,11 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as FuturesTimeout
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -127,7 +130,12 @@ class RunConfig:
     # fourteen. Rate limits are waited out rather than raised (see
     # `ai.gemini.generate_json`), so the cost of setting it too high is a
     # pause, not a lost slide.
-    ai_concurrency: int = 8
+    # Raised with `DEFAULT_BATCH_TOKENS`, and for the same reason: smaller
+    # batches only make a run faster while they all still go at once. Twenty-
+    # two slides come to about fourteen batches now where they came to seven,
+    # and sixteen keeps that one round. A rate limit is waited out and a busy
+    # server retried, so setting this high costs a pause at worst.
+    ai_concurrency: int = 16
     # How much payload one AI call may carry, in tokens. Slides are packed up
     # to it rather than sent one per call: a cover costs a fraction of a
     # diagram, and spending a whole call's latency on the cover is what made a
@@ -139,11 +147,40 @@ class RunConfig:
     master_out: Optional[Path] = None
 
 
+# How long the whole review layer may take before the report is written
+# without whatever has not come back. Above the per-request timeout in
+# `ai.gemini`, because a batch that times out is retried, and well above any
+# real run: the slowest measured here is a 22-slide deck at 153s.
+_AI_LAYER_DEADLINE_S = 30 * 60
+
+
+@contextmanager
+def stage(name: str, *args):
+    """Time one stage of a run and say how long it took.
+
+    WHY THIS IS IN THE PRODUCT AND NOT IN A PROFILER. "The run is slow" is the
+    commonest thing anybody says about this tool, and the log could not answer
+    it: it recorded what happened and never how long any of it took, so every
+    answer started by reproducing the run under instrumentation. The stages are
+    few and the cost of timing them is a `perf_counter` call each.
+
+    Logged at INFO, in seconds, and the line is the stage's own name so a
+    reader can see the shape of a run without knowing the code.
+    """
+    started = time.perf_counter()
+    try:
+        yield
+    finally:
+        log.info("%s took %.1fs", name % args if args else name,
+                 time.perf_counter() - started)
+
+
 def run(config: RunConfig) -> ValidationReport:
     """Run the full workflow and return the merged report."""
     guidelines = load_guidelines(config.guidelines)
-    master = read_deck(config.master)
-    spec = derive_master_spec(master, guidelines)
+    with stage("reading the master"):
+        master = read_deck(config.master)
+        spec = derive_master_spec(master, guidelines)
     log.info(
         "master %s: %d slides, %d palette entries, %d approved fonts",
         master.name,
@@ -171,7 +208,8 @@ def run(config: RunConfig) -> ValidationReport:
     # The master's own layouts are checked once, not once per deck: an
     # incomplete layout is a defect in the template, and repeating it for
     # every deck under review would bury the deck findings.
-    all_issues: list[Issue] = _run_master_layer(master, spec)
+    with stage("checking the master's own layouts"):
+        all_issues: list[Issue] = _run_master_layer(master, spec)
     log.info("%s: %d master layout finding(s)", master.name, len(all_issues))
     summaries: list[str] = []
 
@@ -201,24 +239,28 @@ def run(config: RunConfig) -> ValidationReport:
         )
 
     for deck_path in config.decks:
-        deck = read_deck(deck_path)
+        with stage("reading %s", Path(deck_path).name):
+            deck = read_deck(deck_path)
         _warn_on_size_mismatch(deck, spec)
         _warn_on_foreign_theme(deck, spec)
 
         if config.apply_master:
-            deck, applied = _apply_master_first(
-                deck, deck_path, spec, config, master_profile=master
-            )
+            with stage("putting %s on the master's layouts", deck.name):
+                deck, applied = _apply_master_first(
+                    deck, deck_path, spec, config, master_profile=master
+                )
             if applied is not None:
                 report.master_applied.append(applied)
 
-        rule_issues = _run_rule_layer(
-            deck, spec,
-            metrics=None if config.line_metrics else NullLineMetrics(),
-        )
+        with stage("the deterministic rules on %s", deck.name):
+            rule_issues = _run_rule_layer(
+                deck, spec,
+                metrics=None if config.line_metrics else NullLineMetrics(),
+            )
         log.info("%s: %d rule finding(s)", deck.name, len(rule_issues))
 
-        ai_result = _run_ai_layer(deck, spec, rule_issues, config)
+        with stage("the AI review of %s", deck.name):
+            ai_result = _run_ai_layer(deck, spec, rule_issues, config)
         if ai_result.summary:
             summaries.append(f"{deck.name}: {ai_result.summary}")
 
@@ -288,13 +330,15 @@ def _apply_master_first(
 
     # What the model reads off the picture, before anything is changed. Only
     # what a layout should be; the review of the restyled deck comes later.
-    seen = _layout_picks(deck, spec, config)
+    with stage("choosing layouts for %s", deck.name):
+        seen = _layout_picks(deck, spec, config)
 
     try:
-        result = rebuild(
-            config.master, deck_path, out, tuning=spec.guidelines.tuning,
-            seen=seen, master_profile=master_profile, deck_profile=deck,
-        )
+        with stage("rebuilding %s onto the master", deck.name):
+            result = rebuild(
+                config.master, deck_path, out, tuning=spec.guidelines.tuning,
+                seen=seen, master_profile=master_profile, deck_profile=deck,
+            )
     except Exception as exc:
         log.error(
             "could not put %s on %s's layouts (%s); measuring the deck as it "
@@ -326,7 +370,8 @@ def _layout_picks(deck: DeckProfile, spec: MasterSpec, config: RunConfig):
     """
     if not config.use_ai or config.ai_dry_run:
         return []
-    images = _render(deck, config)
+    with stage("rendering %s for the layout pass", deck.name):
+        images = _render(deck, config)
     if not images:
         log.info("no layout pass: %s", images.reason)
         return []
@@ -449,16 +494,43 @@ def _review_batches(
             yield index, part
     else:
         done: dict[int, AIResult] = {}
-        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ai") as pool:
+        # NOT a `with` block, and that is the point of it. The context manager
+        # shuts the pool down waiting, so a single request that never returns
+        # holds the run open for ever -- which is what happened on a real deck:
+        # six batches of seven came back, the seventh did not, and the run
+        # stopped dead with no error and no report. The request timeout in
+        # `ai.gemini` is the real fix; this is what keeps the run from waiting
+        # on even that, and it lets the report be written from the batches
+        # that did come back.
+        pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ai")
+        try:
             futures = {
                 pool.submit(_review_one, validator, deck, payload, images, spent):
                     index
                 for index, payload in enumerate(payloads)
             }
-            for future in as_completed(futures):
-                part = future.result()
-                if part is not None:
-                    done[futures[future]] = part
+            try:
+                for future in as_completed(futures, timeout=_AI_LAYER_DEADLINE_S):
+                    part = future.result()
+                    if part is not None:
+                        done[futures[future]] = part
+            except FuturesTimeout:
+                missing = sorted(
+                    index + 1 for future, index in futures.items()
+                    if future not in done and not future.done()
+                )
+                log.error(
+                    "the AI review gave up waiting after %.0fs: batch(es) %s "
+                    "never came back. The report is written from the %d that "
+                    "did, and the deterministic findings are unaffected.",
+                    _AI_LAYER_DEADLINE_S,
+                    ", ".join(str(n) for n in missing) or "?",
+                    len(done),
+                )
+        finally:
+            # Not waited on: a thread blocked in a request cannot be
+            # interrupted, and the request timeout is what ends it.
+            pool.shutdown(wait=False, cancel_futures=True)
         reviewed = len(done)
         for index in sorted(done):
             yield index, done[index]

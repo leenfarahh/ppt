@@ -34,6 +34,7 @@ from ..models import Issue, RuleTuning, Tolerances
 from .fixers import (
     COHORT,
     GEOMETRIC,
+    _emu,
     is_geometric,
     RELATIVE,
     LeaveAlone,
@@ -893,6 +894,15 @@ def _apply_one_uninstrumented(
                     False,
                     f"left alone: moving it would break its alignment with {names}",
                 )
+            outside = _cohort_outside_the_frame(move, context)
+            if outside:
+                move.revert()
+                return FixOutcome(
+                    issue,
+                    False,
+                    "left alone: moving the set it belongs to would take "
+                    f"{outside} of them outside the page's margins",
+                )
             worse = _cohort_worsened(move, neighbours)
             if worse:
                 move.revert()
@@ -1437,7 +1447,6 @@ class CohortMove:
         return max(0, len(self.shapes) - 1)
 
 
-<<<<<<< HEAD
 _A_NS = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
 
 
@@ -1544,8 +1553,6 @@ def _cohort_outside_the_frame(move: "CohortMove", context: FixContext) -> int:
     return outside
 
 
-=======
->>>>>>> parent of 28354ad (bug)
 def _cohort_move(
     shape: Any,
     partners: list[Any],

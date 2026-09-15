@@ -469,6 +469,137 @@ def _mirrored_pairs(
 # Finding the series
 # --------------------------------------------------------------------------- #
 
+class SeriesFormattingRule(Rule):
+    """Members of one repeated set that disagree about how their text looks.
+
+    `RepeatedElementRule` and the rules beside it ask where the members of a
+    series sit. This asks what they look like, on the same grouping and the
+    same principle: a set of identical boxes is one thing repeated, so the
+    members that depart from the rest are the finding.
+
+    It exists because no palette rule can see this defect. Four card headings
+    on one real deck were three #007DBA and one #004F71; both are entries in
+    the master's own theme, so every colour rule passed all four, and the set
+    reading as three-plus-one was invisible to a tool that only ever looked
+    at one shape at a time.
+
+    REPORTED, NOT FIXED, and the majority is named as evidence rather than as
+    a target. On that same slide the majority was #007DBA and the odd one out
+    #004F71, and it was the odd one out that was right: the three were the
+    defect and the one was the correction, already applied. A rule that
+    recoloured the minority to match the majority would have undone it. Which
+    value is correct is a question about the master, which
+    `color.text.unused_by_master` asks, and the two findings arrive together
+    on a slide like that one -- this one saying the set disagrees, that one
+    saying which member is the colour the master never uses.
+
+    Silent on a tie. Four members split two and two carry no intent, and
+    guessing at one is how a rule earns a reputation for noise.
+    """
+
+    id = "consistency.series_formatting"
+    category = Category.COLOR
+    description = "Repeated elements disagree about text colour, size or weight."
+    default_severity = Severity.WARNING
+
+    def check(self, ctx: RuleContext) -> Iterable[Issue]:
+        tuning = ctx.tuning
+        for slide in ctx.deck.slides:
+            if slide.hidden:
+                continue
+            for series in _series(
+                slide, tuning.repeat_min_members, ctx.spec.tolerances.position_in
+            ):
+                yield from self._compare(slide, series)
+
+    def _compare(self, slide, series: list[ShapeProfile]) -> Iterable[Issue]:
+        for attribute, describe in _COMPARED:
+            seen: dict[object, list[ShapeProfile]] = defaultdict(list)
+            for shape in series:
+                value = _text_attribute(shape, attribute)
+                if value is not None:
+                    seen[value].append(shape)
+            if len(seen) < 2 or sum(len(v) for v in seen.values()) < len(series):
+                # Fewer than two answers is agreement; a member that states
+                # nothing inherits, and a set where some inherit and some do
+                # not is a different defect from a set that disagrees.
+                continue
+
+            ranked = sorted(seen.items(), key=lambda kv: -len(kv[1]))
+            (common, majority), (_odd, minority) = ranked[0], ranked[1]
+            if len(majority) == len(minority):
+                continue                      # a tie states no intent
+
+            for shape in (s for _v, members in ranked[1:] for s in members):
+                value = _text_attribute(shape, attribute)
+                yield self.issue(
+                    f"{describe} here is {_shown(attribute, value)}, but "
+                    f"{len(majority)} of the {len(series)} repeated elements "
+                    f"beside it use {_shown(attribute, common)}.",
+                    slide=slide,
+                    shape=shape,
+                    expected=(
+                        f"{describe} consistent across the {len(series)} "
+                        "repeated elements"
+                    ),
+                    found=_shown(attribute, value),
+                    suggestion=(
+                        "Either this one is wrong or the others are. Which is "
+                        "correct is a question for the master, not for the "
+                        "count: the majority is the more common value here, "
+                        "not necessarily the right one."
+                    ),
+                )
+
+
+# What is worth comparing across a series, and how to say it. Colour first
+# because it is the one that reads as wrong from across the room.
+_COMPARED = (
+    ("color", "Text colour"),
+    ("size_pt", "Text size"),
+    ("bold", "Bold"),
+    ("font_name", "Typeface"),
+)
+
+
+def _text_attribute(shape: ShapeProfile, attribute: str):
+    """One formatting value for a whole shape, or None if it is not uniform.
+
+    A shape whose own runs disagree is `MixedFontsInShapeRule`'s finding, not
+    this one, and feeding it in here would convict it of departing from its
+    neighbours when it departs from itself.
+    """
+    values = set()
+    for paragraph in shape.paragraphs:
+        for run in paragraph.runs:
+            if not run.text.strip():
+                continue
+            if attribute == "color":
+                value = (run.color_hex or "").upper() or (
+                    f"theme:{run.color_theme}" if run.color_theme else None
+                )
+            else:
+                value = getattr(run, attribute, None)
+            if value is None:
+                return None               # inherits; nothing stated to compare
+            values.add(value)
+    if len(values) != 1:
+        return None
+    return values.pop()
+
+
+def _shown(attribute: str, value) -> str:
+    if value is None:
+        return "unset"
+    if attribute == "color":
+        return str(value) if str(value).startswith("theme:") else f"#{value}"
+    if attribute == "size_pt":
+        return f"{float(value):g}pt"
+    if attribute == "bold":
+        return "bold" if value else "not bold"
+    return str(value)
+
+
 def _series(
     slide: SlideProfile, minimum: int, tolerance: float
 ) -> Iterable[list[ShapeProfile]]:

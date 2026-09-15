@@ -225,6 +225,108 @@ class OffPaletteTextRule(Rule):
             )
 
 
+def master_text_colors(spec) -> dict[str, str]:
+    """The colours this master actually sets on TEXT, labelled.
+
+    Deliberately not `spec.palette`. That is the theme scheme -- twelve
+    swatches, most of them meant for fills and chrome -- and measuring text
+    against all twelve passes anything a deck has typed into a heading so
+    long as it happens to be an accent.
+
+    On one real deck three of four card headings were #007DBA. That is
+    accent3, so every palette rule here called it correct, while no layout in
+    the master puts text in it anywhere. The fourth heading was #004F71,
+    which the master does use for text, and nothing reported the other three
+    as different. The set a text colour belongs to is the set the master
+    writes words in, and that is narrower than its theme.
+
+    Chrome is left out for the reason `_CHROME` gives. A page number's colour
+    is the master's business and nobody's finding, and letting it widen the
+    set would admit colours no heading should be.
+    """
+    found: dict[str, str] = {}
+    for layout in getattr(spec, "layouts", ()) or ():
+        for placeholder in getattr(layout, "placeholders", ()) or ():
+            token = getattr(placeholder, "placeholder_token", None)
+            value = getattr(placeholder, "text_color_hex", None)
+            if not value or (token and token in _CHROME):
+                continue
+            value = value.strip().lstrip("#").upper()
+            if len(value) == 6:
+                found.setdefault(_palette_label(value, spec), value)
+    return found
+
+
+def _palette_label(value: str, spec) -> str:
+    """The master's own name for a colour, or the bare hex if it has none."""
+    for label, entry in (spec.palette or {}).items():
+        if str(entry).strip().lstrip("#").upper() == value:
+            return label
+    return f"#{value}"
+
+
+class TextColorUnusedByMasterRule(Rule):
+    """A text colour the theme offers but the master never writes text in.
+
+    Sits between `OffPaletteTextRule`, which asks only whether a colour is in
+    the palette at all, and `InconsistentColorUseRule`, which looks for
+    near-duplicates. The gap between them is a colour that is genuinely on
+    palette and genuinely wrong for text, and it is where a deck built from
+    another file puts its headings.
+
+    A WARNING rather than an ERROR. The colour IS the brand's; it is being
+    used somewhere the master never uses it, which is a judgement the
+    designer should make rather than one to assert.
+
+    No fixer is registered for this id on purpose. The right replacement is
+    not the nearest one -- on the deck this was written for, #007DBA is 9.1
+    delta-E from accent2 and 17.0 from dk2, and dk2 was the correct answer,
+    because the shapes were headings and dk2 is what the master titles are.
+    Nearest-colour would have picked confidently and wrongly.
+    """
+
+    id = "color.text.unused_by_master"
+    category = Category.COLOR
+    description = "Text uses a palette colour the master never sets text in."
+    default_severity = Severity.WARNING
+
+    def check(self, ctx: RuleContext) -> Iterable[Issue]:
+        allowed = master_text_colors(ctx.spec)
+        if not allowed:
+            return                  # the master states none; nothing to measure
+        tolerance = ctx.spec.tolerances.color_delta_e
+
+        for slide, shape, _paragraph, run in ctx.runs():
+            value, slot = _resolved(run.color_hex, run.color_theme, ctx.deck)
+            if not value or slot:
+                # Theme-bound text belongs to ThemeMismatchRule, which reports
+                # the slot once for the deck rather than once per run.
+                continue
+            label, distance = nearest_palette_entry(value, allowed)
+            if distance is None or distance <= tolerance:
+                continue
+            yield self.issue(
+                f"Text colour #{value} is in the theme, but no layout in the "
+                f"master sets text in it (closest colour the master does use "
+                f"for text: {label}, delta-E {distance:.1f}).",
+                slide=slide,
+                shape=shape,
+                expected=f"a colour the master writes text in, such as {label}",
+                found=f"#{value}",
+                suggestion=(
+                    "Pick from the colours the master actually uses for text, "
+                    f"which here are {_listed(allowed)}. Note that the nearest "
+                    "one is not always the right one: a heading above body "
+                    "copy usually takes the colour the master gives its "
+                    "titles, which may not be the closest match."
+                ),
+            )
+
+
+def _listed(allowed: dict[str, str]) -> str:
+    return ", ".join(f"{label} #{value}" for label, value in sorted(allowed.items()))
+
+
 class OffPaletteShapeRule(Rule):
     id = "color.shape.off_palette"
     category = Category.COLOR

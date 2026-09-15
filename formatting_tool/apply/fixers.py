@@ -2555,6 +2555,18 @@ NEEDS_A_PERSON: dict[str, str] = {
         "which of the near-identical colours in play is the intended one is a "
         "design call"
     ),
+    "color.text.unused_by_master": (
+        "the colour is the brand's, so which of the master's text colours "
+        "replaces it is a design call, and the nearest one is not reliably "
+        "the right one: a heading wants the colour the master gives its "
+        "titles, which can be further away than an accent it never uses"
+    ),
+    "consistency.series_formatting": (
+        "the finding is that a repeated set disagrees, not which member is "
+        "right; the majority is the more common value and not necessarily "
+        "the correct one, so matching the odd one to it can propagate the "
+        "defect rather than fix it"
+    ),
     "font.family.unapproved": "which approved face replaces it is a design call",
     "font.family.mixed_in_shape": "which of the faces in play is correct is a design call",
     "size.role.out_of_range": "resizing type changes how much copy fits",

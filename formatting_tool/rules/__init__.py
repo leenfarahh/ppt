@@ -18,6 +18,7 @@ from .colors import (
     OffPaletteShapeRule,
     ThemeMismatchRule,
     OffPaletteTextRule,
+    TextColorUnusedByMasterRule,
 )
 from .direction import (
     RightToLeftRule,
@@ -35,6 +36,7 @@ from .logo import LogoGeometryRule, LogoPresenceRule, UnapprovedLogoAssetRule
 from .repeats import (
     MirroredPairRule,
     RepeatedElementRule,
+    SeriesFormattingRule,
     SatelliteOffsetRule,
     SeriesRowRule,
 )
@@ -136,6 +138,7 @@ def build_default_rules(
         ThemeFontDriftRule(),
         ThemeMismatchRule(),
         OffPaletteTextRule(),
+        TextColorUnusedByMasterRule(),
         OffPaletteShapeRule(),
         RoleFontSizeRule(),
         LogoGeometryRule(),
@@ -145,6 +148,7 @@ def build_default_rules(
         TitlePositionConsistencyRule(),
         AlignmentGridRule(),
         RepeatedElementRule(),
+        SeriesFormattingRule(),
         SatelliteOffsetRule(),
         SeriesRowRule(),
         MirroredPairRule(),

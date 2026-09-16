@@ -370,10 +370,16 @@ class AIValidator:
         client = self._ensure_client()
 
         cached = self._cached_prefix(client)
+        # `attached` is what actually went, which is not always what was
+        # offered: a rendered PNG can be gone by the time its batch's turn
+        # comes round. It decides the evidence label below, so it has to be
+        # the pictures that were sent rather than the ones that were meant to
+        # be -- see `_contents`.
+        contents, attached = self._contents(payload, client, images)
         data, response = generate_json(
             client,
             model=self.config.model,
-            contents=self._contents(payload, client, images),
+            contents=contents,
             # One or the other, never both: a request naming a cache carries
             # its system prefix already, and sending it again is the thing
             # this exists to stop.
@@ -386,14 +392,12 @@ class AIValidator:
             api_key_env=self.config.api_key_env,
         )
 
-        result = self._build_result(
-            data, response, deck_name, rendered={n for n, _ in (images or [])}
-        )
+        result = self._build_result(data, response, deck_name, rendered=attached)
         result.exchanges = [
             {
                 "batch": payload.get("batch", {}),
                 "slides": payload.get("batch", {}).get("slides", []),
-                "images_attached": [n for n, _ in (images or [])],
+                "images_attached": sorted(attached),
                 "rule_findings_sent": len(payload.get("rule_findings", [])),
                 "response": data,
                 "finish_reason": _finish_reason(response),
@@ -407,23 +411,63 @@ class AIValidator:
         payload: dict[str, Any],
         client: Any,
         images: Optional[list[tuple[int, Any]]],
-    ) -> Any:
-        """The payload, then one labelled image per slide in this batch.
+    ) -> tuple[Any, set[int]]:
+        """The payload, then one labelled image per slide, and what went.
 
         Labelled, because a bare run of images leaves the model to infer which
         slide is which from the order, and a misattributed finding names the
         wrong slide in a designer's list.
+
+        A PICTURE THAT IS NO LONGER THERE COSTS THE PICTURE, NOT THE RUN. The
+        PNGs are exported to the system temporary directory and the batches
+        are reviewed over several minutes, and Windows Storage Sense and the
+        managed cleanup tools an IT department installs both delete from there
+        on a schedule with no regard for a process that is using it -- see
+        `render._explain`, where this is already the known hazard. So the file
+        can be listed when the directory is collected and gone by the time its
+        batch's turn comes round.
+
+        It used to raise straight through the worker and out of the run: one
+        missing PNG on slide 20 of 29 lost every deterministic finding and the
+        sixteen batches that had already come back. Now that slide is reviewed
+        on its geometry, which is what a batch with no render has always done,
+        and the numbers returned are the pictures that really went so the
+        evidence label stays honest -- a model saying it looked at a slide it
+        was never shown is demoted in `pipeline._check_evidence`.
         """
         text = payload_to_text(payload)
         if not images:
-            return text
+            return text, set()
 
         parts: list[Any] = [text]
+        attached: set[int] = set()
+        missing: list[int] = []
         for number, path in images:
+            try:
+                part = file_part(client, path, "image/png")
+            except OSError:
+                # OSError and not Exception: a file that is gone is expected
+                # here and is handled by carrying on. Anything else is not
+                # understood, and swallowing it would hide a real fault behind
+                # a slide that quietly lost its picture.
+                missing.append(number)
+                continue
             parts.append(f"Slide {number}, as PowerPoint renders it:")
-            parts.append(file_part(client, path, "image/png"))
-        log.debug("attaching %d rendered slide(s) to the batch", len(images))
-        return parts
+            parts.append(part)
+            attached.add(number)
+        if missing:
+            log.warning(
+                "the rendered picture(s) for slide(s) %s are no longer on "
+                "disk, so they are reviewed on their geometry alone. Files in "
+                "the system temporary directory are removed on a schedule by "
+                "Windows Storage Sense and by managed cleanup tools, whether "
+                "or not something is using them.",
+                ", ".join(str(n) for n in missing),
+            )
+        if not attached:
+            return text, set()
+        log.debug("attaching %d rendered slide(s) to the batch", len(attached))
+        return parts, attached
 
     # -- response handling -------------------------------------------------- #
 

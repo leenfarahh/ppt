@@ -40,6 +40,7 @@ from ..guidelines import GuidelinesError
 from ..pipeline import RunConfig, run
 from ..render import render_deck
 from ..report.reader import _issue as _issue_from_dict
+from ..workdir import WORKDIR_ENV as _WORKDIR_ENV, workroot
 from ..rules import build_default_rules, describe_rules
 
 log = logging.getLogger(__name__)
@@ -724,38 +725,16 @@ class _Handler(BaseHTTPRequestHandler):
 # Helpers
 # --------------------------------------------------------------------------- #
 
-WORKDIR_ENV = "FORMATTING_TOOL_WORKDIR"
-
-
-def _workroot() -> Optional[str]:
-    """Where a session's uploads and renders live, or None for the default.
-
-    The default is the system temporary directory, which is right until
-    something else is managing it. On one machine every session directory
-    vanished mid-run -- an uploaded deck, its renders, and the deck that had
-    been written from it -- and PowerPoint reported it as
-    `0x80070003`, "the system cannot find the path specified", which reads like
-    a fault in the renderer. Windows Storage Sense does this on a schedule, and
-    so do the remote-management agents an IT department installs; neither asks
-    whether a process is using the files.
-
-    So it can be pointed somewhere nobody sweeps. Set FORMATTING_TOOL_WORKDIR
-    to a directory of your own and sessions are made inside it instead. A path
-    that cannot be made is a warning and the default, because a page that runs
-    in the wrong directory is better than one that will not start.
-    """
-    root = os.environ.get(WORKDIR_ENV, "").strip()
-    if not root:
-        return None
-    try:
-        Path(root).mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        log.warning(
-            "%s is set to %r, which cannot be used (%s); sessions will go in "
-            "the system temporary directory", WORKDIR_ENV, root, exc,
-        )
-        return None
-    return root
+# Re-exported under their old names, which `tests.test_workdir_root` imports
+# from here. Not redefined: this was the implementation, and keeping it here
+# is what let the render directory miss it: `render_deck` makes its own
+# directory and had no way to reach this one, so FORMATTING_TOOL_WORKDIR moved
+# the uploads somewhere safe and left the PNGs in the directory that gets
+# swept. That is the directory a real run then lost a slide out of. Both read
+# `formatting_tool.workdir` now, so setting the variable covers everything the
+# run writes.
+_workroot = workroot
+WORKDIR_ENV = _WORKDIR_ENV
 
 
 def _outcome_id(outcome: Any) -> str:

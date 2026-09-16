@@ -47,3 +47,37 @@ def test_a_directory_that_cannot_be_made_falls_back(tmp_path, monkeypatch) -> No
 def test_an_empty_setting_is_the_default(monkeypatch) -> None:
     monkeypatch.setenv(WORKDIR_ENV, "   ")
     assert _workroot() is None
+
+
+def test_the_renders_go_in_the_workdir_too(monkeypatch, tmp_path) -> None:
+    """The gap that cost a run. FORMATTING_TOOL_WORKDIR moved the uploads
+    somewhere nobody sweeps and left the PNGs in the system temporary
+    directory, which is the one that gets swept -- and the PNGs are what
+    vanished: `Slide20.PNG` went mid-review, after sixteen batches were home.
+    An escape hatch that misses the file that disappears is not one."""
+    from formatting_tool.render import render_deck
+
+    wanted = tmp_path / "somewhere-nobody-sweeps"
+    monkeypatch.setenv(WORKDIR_ENV, str(wanted))
+
+    seen: list[str] = []
+
+    class _Renderer:
+        name = "stub"
+        available = True
+
+        def render(self, deck, out, slides=None):
+            seen.append(str(out))
+            png = out / "Slide1.PNG"
+            png.write_bytes(b"png")
+            return {1: png}          # a renderer returns the map itself
+
+    deck = tmp_path / "deck.pptx"
+    deck.write_bytes(b"a deck")
+
+    images = render_deck(deck, renderer=_Renderer())
+    try:
+        assert seen and str(wanted) in seen[0]
+        assert str(wanted) in str(images.directory)
+    finally:
+        images.cleanup()

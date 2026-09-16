@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Optional, Protocol
 
 from . import powerpoint
+from .workdir import workroot
 
 log = logging.getLogger(__name__)
 
@@ -332,7 +333,15 @@ def render_deck(
             ),
         )
 
-    directory = Path(tempfile.mkdtemp(prefix="formatting-tool-render-"))
+    # Inside FORMATTING_TOOL_WORKDIR when it is set. This used to be a bare
+    # `mkdtemp`, so the renders went to the system temporary directory whatever
+    # that variable said -- and the renders are what vanishes: a run lost
+    # `Slide20.PNG` mid-review after sixteen batches were already home. The
+    # escape hatch existed and did not cover the file that went. See
+    # `formatting_tool.workdir`.
+    directory = Path(
+        tempfile.mkdtemp(prefix="formatting-tool-render-", dir=workroot())
+    )
     try:
         images = _rendered(renderer, deck, directory, slides)
     except Exception as exc:

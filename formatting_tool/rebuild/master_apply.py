@@ -52,11 +52,11 @@ import time
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Collection, Optional
 
 from .. import powerpoint
 from ..models import normalize_layout_name
-from . import pictures, rtl
+from . import pictures, quarantine, rtl
 
 log = logging.getLogger(__name__)
 
@@ -126,6 +126,15 @@ class SlideOutcome:
     # master and the deck's own design can be dropped, but not chosen -- which
     # is a different claim and has to be readable as one.
     forced: bool = False
+    # Restyled onto a copy, measured, and the copy thrown away: no layout in
+    # the master fits this slide and the nearest one wrecked it, so the slide
+    # was left exactly as it arrived and a comment says why. `applied` is
+    # False for these -- the master is NOT on this slide, and reporting it as
+    # applied would be the one claim a designer must not have to check.
+    quarantined: bool = False
+    # What the restyle would have cost, kept for the report and the comment.
+    damage_before: float = 0.0
+    damage_after: float = 0.0
 
 
 @dataclass
@@ -158,6 +167,11 @@ class MasterApplyResult:
         """Restyled, but onto a layout that was a fallback rather than a pick."""
         return [o for o in self.outcomes if o.applied and o.forced]
 
+    @property
+    def quarantined(self) -> list[SlideOutcome]:
+        """Slides handed back untouched for a designer to place by hand."""
+        return [o for o in self.outcomes if o.quarantined]
+
 
 def available() -> bool:
     """Whether this host can apply a master at all."""
@@ -170,6 +184,7 @@ def apply_master(
     out: str | Path,
     plans: dict[int, str],
     mirror: bool = False,
+    doubtful: Optional[Collection[int]] = None,
 ) -> MasterApplyResult:
     """Restyle `deck` onto `master`'s layouts and write the result to `out`.
 
@@ -177,6 +192,12 @@ def apply_master(
     Taken as DECIDED rather than re-derived here, so the layouts somebody
     approved are the ones applied; re-planning inside the apply would silently
     discard every pick. `rebuild.matcher` is what makes those picks.
+
+    `doubtful` is the slides the matcher was guessing about. Those and only
+    those are measured before and after the swap, and one the restyle wrecked
+    is handed back untouched with a comment on it -- see `rebuild.quarantine`.
+    Left out, nothing is measured and every slide is restyled, which is what
+    this did before.
 
     Never raises. A host that cannot drive PowerPoint comes back with `fatal`
     set and nothing written, and the caller falls back to the XML rebuild.
@@ -191,7 +212,7 @@ def apply_master(
         )
     try:
         return powerpoint.run(
-            lambda app: _drive(app, deck, master, out, plans, mirror)
+            lambda app: _drive(app, deck, master, out, plans, mirror, doubtful)
         )
     except Exception as exc:
         return MasterApplyResult(fatal=advice(exc))
@@ -260,6 +281,7 @@ def _drive(
     out: Path,
     plans: dict[int, str],
     mirror: bool = False,
+    doubtful: Optional[Collection[int]] = None,
 ):
     """The whole conversation with PowerPoint, on the thread that owns it."""
     result = MasterApplyResult()
@@ -296,7 +318,15 @@ def _drive(
             )
 
         layouts = _layouts_of(designs)
-        result.outcomes = _restyle(presentation, layouts, plans)
+        result.outcomes = _restyle(
+            presentation, layouts, plans, set(doubtful or ()),
+        )
+        # Before the designs are tidied and before the mirror. A quarantined
+        # slide is still on the deck's own design, so it is deliberately one
+        # of the stragglers `_stragglers` reports -- that is the honest
+        # reading of the file, and `_drop_unused_designs` must not take a
+        # design one of these slides is still using.
+        _annotate(presentation, result.outcomes)
         result.stragglers = _stragglers(presentation, designs)
         _drop_unused_designs(presentation)
         result.masters = _design_count(presentation)
@@ -307,7 +337,13 @@ def _drive(
         # Through automation rather than through the file, because this route
         # re-serialises nothing and that is the point of it.
         if mirror:
-            result.mirrored = rtl.mirror_com(presentation)
+            # Never the quarantined slides. They are not on the master, so
+            # there is no English frame on them to turn round -- only the
+            # author's own layout, which already reads the way they meant it
+            # to. See `rtl.mirror_com`.
+            result.mirrored = rtl.mirror_com(
+                presentation, skip={o.number for o in result.quarantined}
+            )
             log.info(
                 "mirrored %d shape(s) so the content reads right to left",
                 result.mirrored,
@@ -503,11 +539,34 @@ def _fallback(layouts: dict[str, Any], plans: dict[int, str]) -> Optional[str]:
     return next(iter(layouts), None)
 
 
-def _restyle(presentation: Any, layouts: dict[str, Any], plans: dict[int, str]):
-    """The copy/apply/delete walk. One slide at a time, count never changes."""
+def _restyle(
+    presentation: Any,
+    layouts: dict[str, Any],
+    plans: dict[int, str],
+    doubtful: Optional[set[int]] = None,
+):
+    """The copy/apply/delete walk. One slide at a time, count never changes.
+
+    WHICH OF THE TWO IS DELETED is where the quarantine lives. The walk always
+    makes a copy, restyles the copy and deletes one of the pair, so at the
+    moment of the decision the slide exists twice: as it arrived at `index`
+    and as the master would have it at `index + 1`. That is the only point in
+    the run where both can be measured, and measuring them is the whole basis
+    for handing one back -- see `rebuild.quarantine`.
+
+    So for a slide the matcher was guessing about, both are measured and the
+    loser is deleted. Normally that is the original, which is what this always
+    did. Where the restyle wrecked the slide it is the restyle, and the
+    original survives untouched on its own design.
+
+    The count is unchanged either way, so the plain 1..n walk stays correct
+    and nothing downstream has to know which slides went which way.
+    """
     outcomes: list[SlideOutcome] = []
     total = int(presentation.Slides.Count)
     fallback = _fallback(layouts, plans)
+    doubtful = doubtful or set()
+    canvas = _canvas_pt(presentation)
 
     for number in range(1, total + 1):
         wanted = plans.get(number)
@@ -529,11 +588,48 @@ def _restyle(presentation: Any, layouts: dict[str, Any], plans: dict[int, str]):
             continue
         try:
             index = number                      # COM is 1-based
+            # Measured before the duplicate, while the slide is the only one
+            # of its kind: `Duplicate` is cheap but the original has to be
+            # read as it arrived, and after the swap it is gone.
+            before = (
+                quarantine.measure(presentation.Slides(index), canvas)
+                if number in doubtful else quarantine.Damage()
+            )
             copy = _retry(lambda: presentation.Slides(index).Duplicate()(1))
             # Read before the swap, put back after. See `_photographs`.
             photographs = _photographs(copy)
             _retry(lambda: setattr(copy, "CustomLayout", target))
             _restore(copy, photographs, _has_picture_slot(target))
+
+            after = (
+                quarantine.measure(copy, canvas)
+                if number in doubtful else quarantine.Damage()
+            )
+            if number in doubtful and quarantine.wrecked(before, after):
+                # Bin the restyle, keep the slide. Deleting index+1 rather
+                # than index is the whole of it: the original never moves and
+                # the count comes back to where it started either way.
+                _retry(lambda: presentation.Slides(index + 1).Delete())
+                log.info(
+                    "slide %d: no layout in the master fits it -- %r would "
+                    "have taken its damage from %s to %s, so it was left as "
+                    "it arrived for a designer",
+                    number, wanted, before, after,
+                )
+                outcomes.append(SlideOutcome(
+                    number, wanted, False,
+                    detail=(
+                        f"no layout in the master fits this slide; {wanted!r} "
+                        f"was the nearest and made it materially worse, so it "
+                        f"was left exactly as it arrived and commented for a "
+                        f"designer"
+                    ),
+                    quarantined=True,
+                    damage_before=before.total,
+                    damage_after=after.total,
+                ))
+                continue
+
             _retry(lambda: presentation.Slides(index).Delete())
             outcomes.append(SlideOutcome(
                 number, wanted, True,
@@ -543,6 +639,8 @@ def _restyle(presentation: Any, layouts: dict[str, Any], plans: dict[int, str]):
                     if forced else ""
                 ),
                 forced=forced,
+                damage_before=before.total,
+                damage_after=after.total,
             ))
         except Exception as exc:
             outcomes.append(
@@ -556,6 +654,45 @@ def _restyle(presentation: Any, layouts: dict[str, Any], plans: dict[int, str]):
             except Exception:
                 log.debug("could not remove a stranded duplicate", exc_info=True)
     return outcomes
+
+
+def _canvas_pt(presentation: Any) -> tuple[float, float]:
+    """The page, in points, which is the unit COM reports geometry in."""
+    try:
+        setup = presentation.PageSetup
+        return (float(setup.SlideWidth), float(setup.SlideHeight))
+    except Exception:
+        log.debug("could not read the slide size", exc_info=True)
+        return (0.0, 0.0)
+
+
+def _annotate(presentation: Any, outcomes: list[SlideOutcome]) -> None:
+    """Leave a comment on every slide handed back. Never fatal.
+
+    In the same session as the walk, so the comments are in the file the one
+    `SaveAs` writes. Doing it afterwards would mean reopening the written deck
+    -- which is what `apply.notes` has to do, for a reason that does not apply
+    here: it runs after python-pptx has re-saved the file, and this does not.
+    """
+    for outcome in outcomes:
+        if not outcome.quarantined:
+            continue
+        body = quarantine.comment_body(
+            outcome.target_layout,
+            quarantine.Damage(overlap=outcome.damage_before),
+            quarantine.Damage(overlap=outcome.damage_after),
+        )
+        try:
+            slide = presentation.Slides(outcome.number)
+        except Exception:
+            log.debug("slide %d could not be reached to comment on",
+                      outcome.number, exc_info=True)
+            continue
+        if not quarantine.annotate(slide, body):
+            log.warning(
+                "slide %d was left as it arrived but could not be commented "
+                "on; the report names it either way", outcome.number,
+            )
 
 
 # --------------------------------------------------------------------------- #

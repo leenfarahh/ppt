@@ -32,6 +32,10 @@ master.pptx + messy.pptx                        [rebuild, when needed]
   rebuild/          open the master as the base file and recreate every slide
         |           on the layout it belongs to
         v
+  rebuild/quarantine  a slide the master has no layout for is measured before
+        |           and after, and where the restyle wrecked it the slide is
+        |           kept exactly as it arrived, with a comment on it
+        v
   messy.rebuilt.pptx  + a list of what needs a designer by hand
         |
         |  ................................................
@@ -42,8 +46,12 @@ master.pptx + messy.pptx + config/brand.yaml   [validate, every run]
   extract/          read both decks into DeckProfile, derive MasterSpec
         |
         v
-  rules/            deterministic layer: layouts, colours, fonts, sizes, logo,
-        |           title/subtitle, orphans/widows, presentation space
+  rules/  pass 1    each slide on its own: layouts, colours, fonts, sizes,
+        |           logo, title/subtitle, presentation space
+        v
+  rules/  pass 2    re-reads the file, then the deck against itself: role
+        |           sizes, title heights, the alignment grid -- and the
+        |           orphan/widow check LAST, after everything else
         |
         |  Issue(source=rule), each tagged with a ref (R1, R2, ...)
         v
@@ -946,6 +954,55 @@ Two measurements it needs to get right, both of which were wrong first:
   place. So the drawing goes too, if it carries no copy, is no bigger than one
   item of the run, and sits in the run's own block. Every shape it takes is
   reported, because this deletes things.
+
+### A slide the master has no layout for is handed back, not wrecked
+
+A deck's framework page was four labelled layers with connector lines between
+them. The master offered nothing of that shape -- its nearest layout is a
+title, a subtitle, a circle drawn as artwork and eight identical body regions
+stacked down one side -- so PowerPoint's placeholder matching poured four
+layers of copy into eight slots that knew nothing about them, and every bullet
+landed on top of the diagram it belonged to. The layout choice was the best
+available and the result was unreadable. That is not a wrong pick; it is a
+master with no right answer in it.
+
+So the slide is left exactly as it arrived, on its own design, and a
+PowerPoint comment on it says why. A slide nobody can lay out automatically is
+a slide for a person, and the original is a working slide where the restyle is
+not.
+
+**Doubt is the gate, not the verdict.** The matcher already says when it is
+guessing, and on a thin master it says so often -- quarantining every slide it
+doubted would hand back half the deck, including the ones it doubted and got
+right. So a doubted slide is *measured*: the walk already copies the slide,
+restyles the copy and deletes one of the pair, which means that at the moment
+of the decision the slide exists twice, as it arrived and as the master would
+have it. Both are measured and the loser is deleted. Normally that is the
+original, which is what the route always did; where the restyle wrecked the
+slide it is the restyle. The slide count never changes either way, so the
+plain 1..n walk stays correct.
+
+**Worse means what a reader sees**, in square inches of the page: copy written
+over other copy, text spilling out of the box holding it, shapes pushed off
+the edge. Not a count of findings -- one bullet overlapping another by a hair
+and a title written across a diagram are both one finding, and only the second
+is a reason to hand a slide back. A slide that arrived broken and came out
+marginally worse is not this feature's business, and neither is a tidy slide
+that picked up a hairline collision: the restyle has to add a square inch of
+new damage *and* leave at least two behind.
+
+**Everything downstream has to leave it alone**, and each of those was a way
+to break the promise quietly. `fill_runs` would claim its boxes and delete
+them. `reset_layouts` would move its placeholders. The RTL mirror would turn
+it round -- which is the exact mistake `rebuild.rtl` opens by warning about,
+since the mirror exists because the *master* is drawn for the other reading
+direction and this slide is not on the master. All three now skip it.
+
+**The XML route cannot do this** and says so rather than differing silently.
+It builds the output from the master, so there is no untouched slide sitting
+in it to keep; the slides it would have considered are named in the report
+with a note explaining that a Windows host with desktop PowerPoint is what
+measures and keeps them.
 
 **The PowerPoint route needs a second pass for it.** Assigning a CustomLayout
 runs PowerPoint's own placeholder matching, which is why that route is

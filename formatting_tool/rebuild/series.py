@@ -80,19 +80,22 @@ class Series:
 
 
 def find_series(
-    shapes: Sequence[Any], shortest: int = _SHORTEST_RUN
+    shapes: Sequence[Any], shortest: int = _SHORTEST_RUN, rtl: bool = False,
 ) -> list[Series]:
     """Every run of like-sized shapes these form, longest first.
 
     Size groups them and regularity confirms them: a run has to fill its own
     grid, so three boxes in a row are a series and three scattered boxes of the
     same size are not. A shape belongs to at most one run.
+
+    `rtl` says which way the deck reads, and it has to be the same answer for
+    both sides of a pairing -- see `_ordered`.
     """
     runs: list[Series] = []
     for group in _by_size(shapes):
         if len(group) < shortest:
             continue
-        ordered = _ordered(group)
+        ordered = _ordered(group, rtl)
         if ordered is not None:
             runs.append(ordered)
     runs.sort(key=len, reverse=True)
@@ -322,8 +325,23 @@ def _by_size(shapes: Sequence[Any]) -> list[list[Any]]:
     return groups
 
 
-def _ordered(group: Sequence[Any]) -> Optional[Series]:
+def _ordered(group: Sequence[Any], rtl: bool = False) -> Optional[Series]:
     """These shapes in reading order, or None if they are not a regular run.
+
+    READING ORDER DEPENDS ON WHICH WAY THE DECK READS, and this sorted on the
+    left edge whatever the answer was. `claim_runs` fills run to run in the
+    order they are read and deletes the boxes it took the copy out of, so on an
+    Arabic deck a row of six chevron labels went in exactly reversed -- every
+    label in the mirror-image cell, and the originals gone. The row that
+    prompted this ran business models, strategy, annual plan, execution,
+    monitoring, review; it came out review-first.
+
+    Both sides of a pairing have to be ordered the same way, which is why this
+    is a parameter rather than something read off the shapes: the layout's
+    regions are usually empty, so there is no copy on them to infer a
+    direction from, and inferring per run would order the slide's Arabic labels
+    right to left and the layout's blank slots left to right -- the same bug
+    with more steps.
 
     REGULAR MEANS IT FILLS ITS OWN GRID. The rows and columns the boxes sit in
     are counted, and the run is only a run when there is one box per cell:
@@ -342,9 +360,15 @@ def _ordered(group: Sequence[Any]) -> Optional[Series]:
     if len(rows) * len(columns) != len(group):
         return None
 
+    last = len(columns) - 1
+
     def cell(shape):
         left, top, _w, _h = _box(shape)
-        return _band_of(top, rows), _band_of(left, columns)
+        column = _band_of(left, columns)
+        # The column INDEX is what reading order is expressed in, so turning
+        # the deck round is turning this number round. Rows are untouched: a
+        # right-to-left deck still reads its rows top to bottom.
+        return _band_of(top, rows), (last - column if rtl else column)
 
     down = len(rows) > len(columns)
     ordered = sorted(

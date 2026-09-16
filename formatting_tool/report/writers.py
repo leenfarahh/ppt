@@ -42,6 +42,8 @@ def write_text(report: ValidationReport, stream: TextIO) -> None:
             stream.write(f"           {path}\n")
     stream.write("\n")
 
+    _write_handed_back_text(report, stream)
+
     if not report.issues:
         # Still print what did not run. "No inconsistencies found" over a set
         # of disabled checks is the most misleading line this can produce.
@@ -75,6 +77,63 @@ def write_text(report: ValidationReport, stream: TextIO) -> None:
     if report.ai_summary:
         stream.write("AI summary\n----------\n")
         stream.write(report.ai_summary + "\n")
+
+
+def handed_back(report: ValidationReport) -> list[tuple[str, dict]]:
+    """Every slide left as it arrived, with the deck it came from.
+
+    Flattened out of `master_applied`, which is keyed per deck: a run over
+    three decks has three of those and a reader wants one list.
+    """
+    return [
+        (applied.get("deck", "the deck"), slide)
+        for applied in report.master_applied
+        for slide in applied.get("quarantined") or ()
+    ]
+
+
+def _quarantine_notes(report: ValidationReport) -> list[tuple[str, str]]:
+    """Why a route could not hand anything back, per deck."""
+    return [
+        (applied.get("deck", "the deck"), applied["quarantine_note"])
+        for applied in report.master_applied
+        if applied.get("quarantine_note")
+    ]
+
+
+def _write_handed_back_text(report: ValidationReport, stream: TextIO) -> None:
+    """Slides the master has no layout for, printed BEFORE the findings.
+
+    Before, because it changes what the rest of the report is about. These
+    slides are not on the master: the restyle was measured, found to wreck
+    them, and thrown away. So every finding below about one of them describes
+    the deck as it was uploaded rather than a restyled slide, and a reader
+    working down the list has no way to tell that from the finding itself.
+    """
+    slides = handed_back(report)
+    notes = _quarantine_notes(report)
+    if not slides and not notes:
+        return
+
+    if slides:
+        heading = f"Left for a designer ({len(slides)} slide(s) not on the master)"
+        stream.write(heading + "\n" + "-" * len(heading) + "\n")
+        stream.write(
+            "  No layout in the master fits these, and the nearest one made\n"
+            "  them materially worse, so each was left exactly as it arrived\n"
+            "  and carries a PowerPoint comment. They are NOT restyled.\n\n"
+        )
+        for deck, slide in slides:
+            stream.write(
+                f"  {deck} slide {slide['slide']}: nearest layout "
+                f"{slide['nearest_layout']!r} would have taken the damage "
+                f"from {slide['damage_before_sqin']} to "
+                f"{slide['damage_after_sqin']} sq in\n"
+            )
+        stream.write("\n")
+
+    for deck, note in notes:
+        stream.write(f"  {deck}: {note}\n\n")
 
 
 def _write_omissions_text(report: ValidationReport, stream: TextIO) -> None:
@@ -113,6 +172,8 @@ def write_markdown(report: ValidationReport, stream: TextIO) -> None:
         )
     stream.write("\n")
 
+    _write_handed_back_markdown(report, stream)
+
     if not report.issues:
         stream.write("No inconsistencies found.\n\n")
         _write_omissions_markdown(report, stream)
@@ -139,6 +200,32 @@ def write_markdown(report: ValidationReport, stream: TextIO) -> None:
                 found=_cell(issue.found),
             )
         )
+
+
+def _write_handed_back_markdown(
+    report: ValidationReport, stream: TextIO
+) -> None:
+    """See `_write_handed_back_text`. Same content, and above the findings for
+    the same reason."""
+    slides = handed_back(report)
+    if slides:
+        stream.write(
+            f"> **{len(slides)} slide(s) were left for a designer and are NOT "
+            f"on the master.** No layout fits them and the nearest one made "
+            f"them materially worse, so each was kept exactly as it arrived "
+            f"and carries a PowerPoint comment. Findings below about these "
+            f"slides describe the deck as uploaded.\n\n"
+        )
+        for deck, slide in slides:
+            stream.write(
+                f"- **{deck} slide {slide['slide']}** - nearest layout "
+                f"`{slide['nearest_layout']}`, damage "
+                f"{slide['damage_before_sqin']} to "
+                f"{slide['damage_after_sqin']} sq in\n"
+            )
+        stream.write("\n")
+    for _deck, note in _quarantine_notes(report):
+        stream.write(f"> {note}\n\n")
 
 
 def _write_omissions_markdown(report: ValidationReport, stream: TextIO) -> None:

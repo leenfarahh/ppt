@@ -42,7 +42,7 @@ import logging
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path, PurePosixPath
-from typing import Any, Optional, Sequence
+from typing import Any, Collection, Optional, Sequence
 
 from ..classify import SlideKind
 from ..extract import read_deck
@@ -92,6 +92,14 @@ class SlideRecord:
     transplanted: list[str] = field(default_factory=list)
     unfilled: list[str] = field(default_factory=list)
     dropped: list[DroppedShape] = field(default_factory=list)
+    # Left exactly as it arrived, because no layout in the master fits it and
+    # the nearest one wrecked it. The master is NOT on this slide; a designer
+    # has been asked to place it by hand, in a comment on the slide itself.
+    # See `rebuild.quarantine`.
+    quarantined: bool = False
+    # What the restyle would have cost, in square inches of visible damage.
+    damage_before: float = 0.0
+    damage_after: float = 0.0
 
 
 @dataclass
@@ -115,11 +123,28 @@ class RebuildResult:
     # Shapes turned round so a right-to-left deck reads that way. Zero on an
     # English deck, where turning it round would be the defect.
     mirrored: int = 0
+    # Why no slide was handed back, when the route could not do it. Set on the
+    # XML route only, and only where there was something it would have
+    # considered: carrying a slide over verbatim means not restyling it, and
+    # that route builds the output from the master rather than editing the
+    # deck, so there is no untouched slide for it to keep. Said out loud
+    # rather than left as a silent difference between two hosts.
+    quarantine_note: Optional[str] = None
 
     @property
     def unmatched(self) -> list[SlideRecord]:
         """Slides placed on a layout that was only the least-bad option."""
         return [record for record in self.slides if not record.confident]
+
+    @property
+    def quarantined(self) -> list[SlideRecord]:
+        """Slides handed back untouched for a designer to place by hand.
+
+        A subset of `unmatched`: the matcher's doubt is the gate and the
+        measured damage is the verdict, so every one of these was doubted and
+        only the wrecked ones are here.
+        """
+        return [record for record in self.slides if record.quarantined]
 
     @property
     def dropped(self) -> list[DroppedShape]:
@@ -195,9 +220,14 @@ def rebuild(
     # class of corruption the XML route kept producing cannot arise.
     if route in ("auto", "powerpoint"):
         if master_apply.available():
+            # The slides the matcher admits it is guessing about. Only these
+            # are measured before and after the swap, and only one the restyle
+            # actually wrecked is handed back -- doubt is the gate, damage is
+            # the verdict. See `rebuild.quarantine`.
+            doubtful = {n for n, match in plans.items() if not match.confident}
             applied = master_apply.apply_master(
                 deck, master, out, {n: m.name for n, m in plans.items()},
-                mirror=mirror,
+                mirror=mirror, doubtful=doubtful,
             )
             if applied.fatal is None:
                 result = _result_from_powerpoint(master, deck, out, plans, applied)
@@ -206,15 +236,22 @@ def rebuild(
                 # is left from the slide's loose runs. Never fatal -- a failure
                 # here leaves the deck exactly as PowerPoint wrote it, which is
                 # what this route produced before.
+                #
+                # NOT on a quarantined slide. That slide was deliberately left
+                # as the designer sent it, and filling its runs would claim
+                # its boxes and delete them -- undoing the one thing the
+                # quarantine promised and doing it to the slide least able to
+                # take it.
+                spared = {record.number for record in result.quarantined}
                 try:
-                    _record_filled(result, *fill_runs(out))
+                    _record_filled(result, *fill_runs(out, skip=spared))
                 except Exception:
                     log.warning(
                         "could not fill the layouts' repeated regions from the "
                         "deck's own runs; the slides keep their loose boxes",
                         exc_info=True,
                     )
-                _reset_at_the_end(out, mirror)
+                _reset_at_the_end(out, mirror, skip=spared)
                 return result
             if route == "powerpoint":
                 raise RebuildError(applied.fatal)
@@ -246,6 +283,23 @@ def rebuild(
     if mirror:
         result.mirrored = rtl.mirror_presentation(base)
 
+    # The XML route rebuilds the output from the master, so there is no
+    # original slide sitting in it to keep -- the quarantine is a property of
+    # editing the deck in place, which only the PowerPoint route does. The
+    # slides it would have considered are still named, so a designer reading
+    # this report is not told less than one reading the other route's.
+    if result.unmatched:
+        result.quarantine_note = (
+            f"{len(result.unmatched)} slide(s) were placed on a layout that "
+            f"was only the least-bad option, and this route cannot hand one "
+            f"back: it builds the output from the master rather than editing "
+            f"the deck, so there is no untouched slide to keep. Re-run on a "
+            f"Windows host with desktop PowerPoint to have those measured and "
+            f"left as they arrived. Slides: "
+            f"{', '.join(str(r.number) for r in result.unmatched)}."
+        )
+        log.warning("%s", result.quarantine_note)
+
     out.parent.mkdir(parents=True, exist_ok=True)
     try:
         base.save(str(out))
@@ -264,7 +318,9 @@ def rebuild(
     return result
 
 
-def _reset_at_the_end(out: Path, mirror: bool) -> None:
+def _reset_at_the_end(
+    out: Path, mirror: bool, skip: Collection[int] = (),
+) -> None:
     """The last thing either route does: hand every placeholder back to its
     layout.
 
@@ -284,7 +340,7 @@ def _reset_at_the_end(out: Path, mirror: bool) -> None:
         )
         return
     try:
-        reset_layouts(out)
+        reset_layouts(out, skip=skip)
     except Exception:
         log.warning(
             "could not reset the slides onto their layouts' geometry; they "
@@ -355,6 +411,9 @@ def _result_from_powerpoint(
                 ),
                 kind=match.kind if match else SlideKind.UNKNOWN,
                 layout_kind=match.layout_kind if match else SlideKind.UNKNOWN,
+                quarantined=outcome.quarantined,
+                damage_before=outcome.damage_before,
+                damage_after=outcome.damage_after,
             )
         )
     log.info(
@@ -369,6 +428,14 @@ def _result_from_powerpoint(
         log.warning(
             "slide %d placed on %r: %s",
             forced.number, forced.target_layout, forced.detail,
+        )
+    if applied.quarantined:
+        log.warning(
+            "%d slide(s) were left exactly as they arrived because no layout "
+            "in %s fits them and the nearest one wrecked them: %s. Each "
+            "carries a PowerPoint comment asking a designer to place it.",
+            len(applied.quarantined), master.name,
+            ", ".join(str(o.number) for o in applied.quarantined),
         )
     return result
 
@@ -446,9 +513,19 @@ def _rebuild_slide(
     for shape in shapes:
         target = claims.get(id(shape))
         if target is not None:
-            _copy_text(shape, target)
-            record.filled.append(_name_of(target))
-            continue
+            # Only counted as filled if the copy actually went. A region that
+            # cannot hold text -- a table, chart or media slot, all of them
+            # "content" in `FAMILIES` -- would otherwise be reported as filled
+            # while the words were neither written into it nor carried over,
+            # because this branch `continue`s past the transplant below.
+            if _copy_text(shape, target):
+                record.filled.append(_name_of(target))
+                continue
+            log.warning(
+                "slide %d: %r was claimed by %r, which cannot hold text; it "
+                "is carried over at its own position instead",
+                profile.number, _name_of(shape), _name_of(target),
+            )
         if id(shape) in spare:
             record.dropped.append(
                 DroppedShape(
@@ -559,8 +636,39 @@ def _claim(
     return pool.pop(best)
 
 
+def _reads_rtl(presentation: Any) -> bool:
+    """Whether this written deck reads right to left.
+
+    The same rule as `DeckProfile.rtl` -- a majority of the text-bearing
+    shapes -- counted here off the open python-pptx tree, because `fill_runs`
+    works on the file PowerPoint has just written and has no DeckProfile for
+    it. Reading the deck again to get one costs seconds on a 30MB file for a
+    single boolean.
+
+    Never raises: a deck that will not answer reads left to right, which is
+    the behaviour this had before the direction was consulted at all.
+    """
+    from ..script import is_rtl        # noqa: PLC0415 - avoids a cycle
+
+    rtl = latin = 0
+    try:
+        for slide in presentation.slides:
+            for shape in slide.shapes:
+                if not _has_copy(shape):
+                    continue
+                if is_rtl(shape.text_frame.text):
+                    rtl += 1
+                else:
+                    latin += 1
+    except Exception:
+        log.debug("could not tell which way the deck reads", exc_info=True)
+        return False
+    return rtl > latin
+
+
 def claim_runs(
-    loose: Sequence[Any], pool: list[Any], everything: Sequence[Any] = ()
+    loose: Sequence[Any], pool: list[Any], everything: Sequence[Any] = (),
+    rtl: bool = False,
 ) -> tuple[dict[int, Any], list[Any], dict[int, tuple]]:
     """Fill the layout's repeated regions from the slide's repeated content.
 
@@ -611,8 +719,11 @@ def claim_runs(
     # -- and deleted the regions the run had just been filled into.
     candidates = [shape for shape in everything if not _is_placeholder(shape)]
 
-    regions = find_series(free, shortest=2)
-    pairs = pair_up(find_series(loose), regions)
+    # The SAME direction for both sides. Ordering the slide's run one way and
+    # the layout's the other is the bug this parameter exists for, not a fix
+    # for it. See `series._ordered`.
+    regions = find_series(free, shortest=2, rtl=rtl)
+    pairs = pair_up(find_series(loose, rtl=rtl), regions)
     claims: dict[int, Any] = {}
     spare: list[Any] = []
     moves: dict[int, tuple[int, int, int, int]] = {}
@@ -817,6 +928,18 @@ _LABEL_SHARE = 0.02
 # Clear air between a lifted graphic and the copy it labels.
 _GAP_IN = 0.15
 
+# How much of a graphic has to be inside a piece of artwork before it counts as
+# sitting ON it. Touching is not enough and was the original test: a master
+# that draws a photograph clipped to the whole page made every shape on the
+# slide read as sitting on artwork, and a row of flag roundels was moved out of
+# the panel holding it on the strength of that.
+_BURIED_SHARE = 0.6
+
+# How far a graphic may travel to reach the copy it labels. A label sits
+# directly above its copy; anything that has to cross an inch and a half of
+# page to find the nearest copy below it has found the footer, not its label.
+_REACH_IN = 1.5
+
 
 def lift_imagery(slide: Any, canvas: tuple[float, float]) -> list[tuple[str, float]]:
     """Move small graphics off the layout's own artwork, onto what they label.
@@ -869,7 +992,15 @@ def lift_imagery(slide: Any, canvas: tuple[float, float]) -> list[tuple[str, flo
     moved: list[tuple[str, float]] = []
     for cluster in _clusters(labels, width, height):
         box = _union([_rect(shape, width, height) for shape in cluster])
-        if box is None or not any(_overlaps(box, art) for art in artwork):
+        if box is None:
+            continue
+        # BURIED IN the artwork, not merely touching it. Touching was the
+        # original test and it is what made this move a row of flag roundels
+        # out of the panel holding them: they sat at the bottom of a page
+        # whose master draws a photograph clipped to the whole of it, so
+        # "overlaps some artwork" was true of every shape on the slide.
+        sitting = [art for art in artwork if _buried(box, art)]
+        if not sitting:
             continue
         target = _copy_below(box, copy, width, height)
         if target is None:
@@ -877,10 +1008,60 @@ def lift_imagery(slide: Any, canvas: tuple[float, float]) -> list[tuple[str, flo
         lift = (target[1] - _GAP_IN) - box[3]
         if lift <= 0:
             continue                  # already clear of the copy it labels
+        if lift > _REACH_IN:
+            # A label sits directly above what it labels. Something that has
+            # to travel further than this to reach the nearest copy beneath it
+            # is not labelling that copy -- it is a graphic with the footer
+            # somewhere below it, which is true of most graphics on most
+            # slides.
+            continue
+        landing = (box[0], box[1] + lift, box[2], box[3] + lift)
+        if any(_buried(landing, art) for art in sitting):
+            # THE MOVE HAS TO ACHIEVE THE THING THE MOVE IS FOR. This exists
+            # to get a graphic off artwork it is invisible against; a
+            # destination still buried in that same artwork has not done that,
+            # it has just moved the graphic down the page and out of whatever
+            # was holding it. That is the whole of the flag-roundel bug: the
+            # flags and the footer line they were dragged onto were inside the
+            # same full-page picture, so the lift cleared nothing at all.
+            continue
         for shape in cluster:
             shape.top = int(shape.top + lift * 914400)
             moved.append((_name_of(shape), lift))
     return moved
+
+
+def _side_by_side(box, other) -> bool:
+    """Two graphics reading as one row: same band, and a gap under their width.
+
+    The gap is measured against the narrower of the two, so a row of equal
+    roundels joins and a small icon does not reach across the page to a
+    distant one merely because they happen to share a band.
+    """
+    if other is None:
+        return False
+    # Sharing a row means overlapping vertically at all: a row of flags is
+    # seldom pixel-aligned and a band test with a fixed tolerance would miss
+    # the ones a designer nudged.
+    if box[3] <= other[1] or other[3] <= box[1]:
+        return False
+    gap = max(box[0], other[0]) - min(box[2], other[2])
+    if gap < 0:
+        return True                       # they already touch horizontally
+    return gap <= min(box[2] - box[0], other[2] - other[0])
+
+
+def _buried(box, art) -> bool:
+    """Whether this box is sitting ON that artwork rather than beside it.
+
+    By area rather than by touching: an icon resting against the edge of a
+    band is not invisible against it, and the case this whole function exists
+    for is dark line art well inside a dark disk.
+    """
+    inside = _area((max(box[0], art[0]), max(box[1], art[1]),
+                    min(box[2], art[2]), min(box[3], art[3])))
+    own = _area(box)
+    return own > 0 and inside / own >= _BURIED_SHARE
 
 
 def _canvas_in(base: Any) -> tuple[float, float]:
@@ -932,11 +1113,21 @@ def _union(boxes):
 
 
 def _clusters(shapes, width: float, height: float) -> list[list[Any]]:
-    """Graphics that overlap each other, grouped -- one icon is often several.
+    """Graphics that belong together, grouped, so none is moved on its own.
 
-    The two icons on the slide this was written for are each a ring and a glyph
-    sitting inside it, two top-level shapes apiece. Lifting one and not the
-    other would take an icon apart.
+    TWO WAYS OF BELONGING, and the second was missing. The two icons on the
+    slide this was written for are each a ring and a glyph sitting inside it,
+    two top-level shapes apiece, so overlapping shapes group -- lifting one and
+    not the other would take an icon apart.
+
+    A ROW OF SEPARATE GRAPHICS IS ALSO ONE THING. Six flag roundels in a line
+    touch nothing, so each was a cluster of its own and each was judged alone:
+    on a real slide three of five moved and two stayed, which is worse than
+    either moving the row or leaving it, because a reader cannot tell a row
+    that was rearranged from one that was always ragged. So neighbours on the
+    same row join, where "neighbour" is a gap narrower than the graphics
+    themselves -- close enough to read as a set, and far short of joining two
+    icons that head two different columns half a page apart.
     """
     groups: list[list[Any]] = []
     for shape in shapes:
@@ -944,8 +1135,11 @@ def _clusters(shapes, width: float, height: float) -> list[list[Any]]:
         if box is None:
             continue
         for group in groups:
-            if any(_overlaps(box, _rect(other, width, height) or box)
-                   for other in group):
+            if any(
+                _overlaps(box, _rect(other, width, height) or box)
+                or _side_by_side(box, _rect(other, width, height))
+                for other in group
+            ):
                 group.append(shape)
                 break
         else:
@@ -973,7 +1167,7 @@ LAYOUT_ECHO = "says only what the layout already writes on the page"
 
 
 def fill_runs(
-    path: Path,
+    path: Path, skip: Collection[int] = (),
 ) -> tuple[dict[int, list[str]], dict[int, list[tuple[str, str]]]]:
     """Fill a written deck's repeated regions from its own loose runs.
 
@@ -1004,7 +1198,16 @@ def fill_runs(
     filled: dict[int, list[str]] = {}
     shed: dict[int, list[tuple[str, str]]] = {}
     touched: set[int] = set()
+    # Decided once for the file, not per slide. Which way a run is read is a
+    # property of the deck, and a slide of mostly numbers in an Arabic deck
+    # would otherwise be filled in the other direction from the one before it.
+    rtl = _reads_rtl(presentation)
+    if rtl:
+        log.info("%s reads right to left; its runs are filled that way", path.name)
     for number, slide in enumerate(presentation.slides, start=1):
+        if number in skip:
+            # Handed back to a designer untouched. See `rebuild.quarantine`.
+            continue
         try:
             # One list, for the reason `_rebuild_slide` gives: a fresh proxy
             # per access makes `id()` meaningless across two walks.
@@ -1014,7 +1217,7 @@ def fill_runs(
                 shape for shape in shapes
                 if not _is_placeholder(shape) and _has_copy(shape)
             ]
-            claims, furniture, moves = claim_runs(loose, pool, shapes)
+            claims, furniture, moves = claim_runs(loose, pool, shapes, rtl=rtl)
             claims.update(claim_drawn_over(
                 [s for s in loose if id(s) not in claims], pool
             ))
@@ -1033,9 +1236,25 @@ def fill_runs(
                 # The box the copy came out of goes with the copy, or the slide
                 # says it twice: once where the layout puts it and once where
                 # it used to be, which is worse than either on its own.
-                _copy_text(shape, target)
-                names.append(_name_of(target))
-                _remove(shape)
+                #
+                # ONLY IF THE COPY ACTUALLY LANDED. `_copy_text` returns
+                # silently when the target has no text frame, and this deleted
+                # the source regardless -- so a run claimed by a table, chart
+                # or media region (all of them "content" in `FAMILIES`, none of
+                # them able to hold a paragraph) had its words copied nowhere
+                # and its boxes removed, and the slide was reported as filled.
+                # Losing copy is the one outcome this whole module is not
+                # allowed to produce.
+                if _copy_text(shape, target):
+                    names.append(_name_of(target))
+                    _remove(shape)
+                else:
+                    log.warning(
+                        "slide %d: %r was claimed by %r, which cannot hold "
+                        "text; the copy was left where it is rather than "
+                        "deleted",
+                        number, _name_of(shape), _name_of(target),
+                    )
             elif id(shape) in drawing:
                 # The run's own drawing goes for the same reason: the new
                 # layout draws its own. See `series.furniture_of`.
@@ -1192,15 +1411,20 @@ def _family_of(shape: Any) -> Optional[str]:
     return FAMILIES.get(token)
 
 
-def _copy_text(source: Any, target: Any) -> None:
+def _copy_text(source: Any, target: Any) -> bool:
     """Move the copy across, keeping emphasis and dropping brand formatting.
 
     Bold, italic and underline are part of what the writer meant, so they
     survive. Typeface, size and colour are the layout's business, and carrying
     them over would reproduce exactly the drift this is meant to remove.
+
+    Returns whether the copy landed. The caller deletes the box it came out
+    of, so "it did not land" and "it landed" must be tellable apart: this used
+    to return None either way and the source was deleted regardless, which
+    turned a region that cannot hold text into lost copy.
     """
     if not _has_text(source) or not _has_text(target):
-        return
+        return False
 
     frame = target.text_frame
     frame.clear()
@@ -1216,6 +1440,7 @@ def _copy_text(source: Any, target: Any) -> None:
                 if value is not None:
                     setattr(run.font, attr, value)
             _copy_hyperlink(src_run, run)
+    return True
 
 
 def _copy_hyperlink(src_run: Any, run: Any) -> None:
@@ -1599,7 +1824,7 @@ def _size_note(base: Any, source: Any) -> Optional[str]:
 # Reset
 # --------------------------------------------------------------------------- #
 
-def reset_layouts(path: Path) -> dict[int, int]:
+def reset_layouts(path: Path, skip: Collection[int] = ()) -> dict[int, int]:
     """Put every placeholder back on the geometry its layout gives it.
 
     THIS IS "RESET SLIDE", DONE TO THE FILE. A layout supplies a placeholder's
@@ -1625,6 +1850,10 @@ def reset_layouts(path: Path) -> dict[int, int]:
     presentation = Presentation(str(path))
     reset: dict[int, int] = {}
     for number, slide in enumerate(presentation.slides, start=1):
+        if number in skip:
+            # Still on its own layout, and still the designer's own geometry.
+            # See `rebuild.quarantine`.
+            continue
         try:
             offered = _layout_slots(slide.slide_layout)
             count = sum(

@@ -40,7 +40,7 @@ rewrites the file, so its mirror is part of that.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Collection
 
 log = logging.getLogger(__name__)
 
@@ -228,13 +228,22 @@ def _flip_alignment(paragraph: Any) -> None:
 # The PowerPoint route
 # --------------------------------------------------------------------------- #
 
-def mirror_com(presentation: Any) -> int:
+def mirror_com(presentation: Any, skip: Collection[int] = ()) -> int:
     """Turn the frame round through automation, writing no file.
 
     Separate from the python-pptx version because `master_apply` is built
     around serialising nothing: handing a PowerPoint-written deck back to
     python-pptx to rewrite is the class of failure that module exists to
     avoid. COM measures in points, which is the only other difference.
+
+    `skip` is the slides that never got the master -- see
+    `rebuild.quarantine`. They MUST be skipped, and for the reason this module
+    opens with: the mirror exists because the MASTER is drawn for the other
+    reading direction, and a quarantined slide is not on the master. It is on
+    the design its author built it in, already reading the way they meant it
+    to. Turning it round is precisely the mistake described above -- moving a
+    deck's own copy off the side the author put it on -- done to the one slide
+    that was promised it would be left exactly as it arrived.
     """
     try:
         width = float(presentation.PageSetup.SlideWidth)
@@ -258,6 +267,8 @@ def mirror_com(presentation: Any) -> int:
     # a designer opening the master view sees an English frame behind Arabic
     # slides. The XML route, which can tell the two apart, turns both.
     for index in range(1, count + 1):
+        if index in skip:
+            continue
         try:
             slide = presentation.Slides(index)
             shapes = int(slide.Shapes.Count)
@@ -279,5 +290,67 @@ def mirror_com(presentation: Any) -> int:
     return moved
 
 
+def _turn_text_com(shape: Any) -> None:
+    """Flush left becomes flush right, and Arabic paragraphs are marked.
+
+    The COM half of `_turn_text`, and it was missing: `mirror_com` called this
+    and nothing defined it, so the first shape of the first slide raised
+    NameError, `apply_master` caught it as fatal, and EVERY right-to-left deck
+    fell back to the XML route without saying so. The fallback is the louder
+    half of the bug -- that route drops what it cannot recreate -- and the
+    silence is the rest of it.
+
+    WHERE IT DIFFERS FROM `_turn_text`, honestly rather than by accident. The
+    python-pptx version leaves an alignment of None alone, because None means
+    the paragraph inherits and what it inherits is already correct; writing a
+    value there would bake in something the layout is entitled to change. COM
+    has no way to say "inherits" -- it reports the effective alignment -- so
+    that distinction cannot be made here and a paragraph that was inheriting
+    comes out with an explicit value. That is the same trade the rest of this
+    route makes, for the same reason: COM reports what is drawn, not where it
+    came from.
+    """
+    from ..script import is_rtl  # noqa: PLC0415 - avoids an import cycle
+
+    try:
+        if not int(shape.HasTextFrame):
+            return
+        paragraphs = shape.TextFrame.TextRange.Paragraphs()
+        count = int(paragraphs.Count)
+    except Exception:
+        return
+
+    for i in range(1, count + 1):
+        try:
+            paragraph = shape.TextFrame.TextRange.Paragraphs(i)
+        except Exception:
+            continue
+        try:
+            current = int(paragraph.ParagraphFormat.Alignment)
+            wanted = _FLIP_COM.get(current)
+            if wanted is not None:
+                paragraph.ParagraphFormat.Alignment = wanted
+        except Exception:
+            log.debug("could not flip a paragraph through COM", exc_info=True)
+        try:
+            if is_rtl(str(paragraph.Text) or ""):
+                # On TextFrame2, which is where PowerPoint keeps it; TextFrame
+                # has no vocabulary for reading direction at all.
+                shape.TextFrame2.TextRange.Paragraphs(i).ParagraphFormat \
+                    .RightToLeft = _MSO_TRUE
+        except Exception:
+            log.debug("could not mark a paragraph right to left", exc_info=True)
+
+
 # msoPlaceholder
 _MSO_PLACEHOLDER = 14
+
+# ppAlignLeft / ppAlignRight, and what each becomes when the page turns round.
+# Centre (2) and justify (4) are absent for the reason `_FLIP` gives: neither
+# has a side. Mixed (-2) is absent because a run of paragraphs aligned several
+# ways cannot be flipped as one.
+_FLIP_COM = {1: 3, 3: 1}
+
+# msoTrue. Spelled out rather than imported, like every other COM constant in
+# this package, so it works without the type library generated.
+_MSO_TRUE = -1

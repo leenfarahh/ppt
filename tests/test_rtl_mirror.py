@@ -227,3 +227,163 @@ def test_an_arabic_deck_is(tmp_path: Path) -> None:
     prs.save(str(path))
 
     assert read_deck(path).rtl
+
+
+# --------------------------------------------------------------------------- #
+# The PowerPoint route's mirror
+# --------------------------------------------------------------------------- #
+#
+# Untested until now, which is how `mirror_com` came to call a helper that was
+# never written. It raised NameError on the first shape of the first slide,
+# `apply_master` caught that as fatal, and every right-to-left deck fell back
+# to the XML route without a word. The fallback drops what it cannot recreate,
+# so the silence was the expensive half.
+
+_PP_LEFT, _PP_CENTER, _PP_RIGHT = 1, 2, 3
+
+
+class _ComParagraph:
+    def __init__(self, text, alignment):
+        self.Text = text
+        self.ParagraphFormat = type("F", (), {"Alignment": alignment})()
+        self.rtl = None
+
+
+class _ComShape:
+    """A placeholder with paragraphs, as COM would report it."""
+
+    Type = 14
+
+    def __init__(self, left, width, paragraphs):
+        self.Left, self.Width = left, width
+        self.Top, self.Height = 72.0, 72.0
+        self._paragraphs = paragraphs
+
+    HasTextFrame = 1
+
+    @property
+    def TextFrame(self):
+        return self
+
+    @property
+    def TextFrame2(self):
+        return self
+
+    @property
+    def TextRange(self):
+        return self
+
+    def Paragraphs(self, index=None):
+        if index is None:
+            return type("C", (), {"Count": len(self._paragraphs)})()
+        paragraph = self._paragraphs[index - 1]
+        holder = paragraph
+
+        class _Fmt:
+            @staticmethod
+            def __setattr__(name, value):
+                pass
+
+            RightToLeft = None
+
+        class _P:
+            Text = paragraph.Text
+            ParagraphFormat = paragraph.ParagraphFormat
+
+            def __setattr__(self, name, value):
+                setattr(holder, name, value)
+
+        return _P()
+
+
+class _ComSlide:
+    def __init__(self, shapes):
+        self._shapes = shapes
+
+    @property
+    def Shapes(self):
+        items = self._shapes
+
+        class _C:
+            Count = len(items)
+
+            def __call__(self, i):
+                return items[i - 1]
+
+        return _C()
+
+
+class _ComPresentation:
+    def __init__(self, slides):
+        self._slides = slides
+        self.PageSetup = type("P", (), {"SlideWidth": WIDTH_IN * 72.0})()
+
+    @property
+    def Slides(self):
+        items = self._slides
+
+        class _C:
+            Count = len(items)
+
+            def __call__(self, i):
+                return items[i - 1]
+
+        return _C()
+
+
+def test_the_com_mirror_runs_at_all() -> None:
+    """The regression that matters: it used to raise NameError here, and the
+    whole PowerPoint route was abandoned for every Arabic deck as a result."""
+    from formatting_tool.rebuild.rtl import mirror_com
+
+    shape = _ComShape(72.0, 144.0, [_ComParagraph(AR, _PP_LEFT)])
+    moved = mirror_com(_ComPresentation([_ComSlide([shape])]))
+
+    assert moved == 1
+
+
+def test_the_com_mirror_brings_a_placeholder_across() -> None:
+    from formatting_tool.rebuild.rtl import mirror_com
+
+    shape = _ComShape(72.0, 144.0, [_ComParagraph(AR, _PP_LEFT)])
+    mirror_com(_ComPresentation([_ComSlide([shape])]))
+
+    # 1in from the left of a 13.333in page, 2in wide, becomes 10.333in.
+    assert round(shape.Left / 72.0, 3) == round(WIDTH_IN - 1.0 - 2.0, 3)
+
+
+def test_the_com_mirror_flips_flush_left_to_flush_right() -> None:
+    from formatting_tool.rebuild.rtl import mirror_com
+
+    paragraph = _ComParagraph(AR, _PP_LEFT)
+    shape = _ComShape(72.0, 144.0, [paragraph])
+    mirror_com(_ComPresentation([_ComSlide([shape])]))
+
+    assert paragraph.ParagraphFormat.Alignment == _PP_RIGHT
+
+
+def test_the_com_mirror_leaves_centred_copy_alone() -> None:
+    """Centred reads the same either way, so it has no side to turn."""
+    from formatting_tool.rebuild.rtl import mirror_com
+
+    paragraph = _ComParagraph(AR, _PP_CENTER)
+    shape = _ComShape(72.0, 144.0, [paragraph])
+    mirror_com(_ComPresentation([_ComSlide([shape])]))
+
+    assert paragraph.ParagraphFormat.Alignment == _PP_CENTER
+
+
+def test_a_shape_that_will_not_answer_does_not_stop_the_mirror() -> None:
+    from formatting_tool.rebuild.rtl import mirror_com
+
+    class Hostile:
+        Type = 14
+
+        @property
+        def Left(self):
+            raise RuntimeError("COM said no")
+
+    good = _ComShape(72.0, 144.0, [_ComParagraph(AR, _PP_LEFT)])
+    moved = mirror_com(_ComPresentation([_ComSlide([Hostile(), good])]))
+
+    assert moved == 1

@@ -124,14 +124,33 @@ def test_one_batch_failing_costs_only_that_batch() -> None:
 
 
 def test_a_single_worker_still_works() -> None:
-    """The sequential path is kept, and has to behave the same."""
+    """The sequential path is kept, and has to behave the same.
+
+    IT NOW ACTUALLY DOES. This used to assert the opposite -- that sequential
+    stopped at the first failure, "the older behaviour and the right one when
+    nothing else is in flight to be wasted". That reasoning is about not
+    discarding work already done, and it does not carry to work not yet
+    attempted: the only failure that predicts the next batch will fail too is
+    a spent account, and that has its own path (see below) which still
+    short-circuits.
+
+    What the old behaviour cost when it did fire: a run where one batch hit a
+    transient fault dropped every batch after it, silently, with the report
+    claiming the AI layer had run. Skipping the batch is what the threaded
+    branch has always done, and the same failure should not produce opposite
+    results depending on a concurrency setting nobody relates to error
+    handling.
+
+    In practice this is inert -- `workers` is `min(ai_concurrency, len(
+    payloads))` and `ai_concurrency` is 8 and not exposed, so the sequential
+    branch only runs for a single batch, where stopping and skipping are the
+    same thing. It is a trap for whoever exposes that knob, not a live bug.
+    """
     validator = _Validator(fail_on={2})
 
     got = list(_review_batches(validator, DECK, _payloads(4), NO_IMAGES, _config(1)))
 
-    # Sequential stops at the first failure, which is the older behaviour and
-    # the right one when nothing else is in flight to be wasted.
-    assert [part.issues[0].slide for _index, part in got] == [1]
+    assert [part.issues[0].slide for _index, part in got] == [1, 3, 4]
     assert validator.peak == 1
 
 

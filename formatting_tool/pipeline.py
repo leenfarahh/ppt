@@ -9,8 +9,14 @@
     apply the master's layouts (optional)       (rebuild/)
         |  which layout each slide belongs on is read off its render
         v
-    deterministic validation layer              (rules/)
-        |  inconsistencies in sizing, fonts, colours, ...
+    deterministic pass 1, slide by slide        (rules/)
+        |  sizing, fonts, colours, space, typography -- everything that can
+        |  be judged from one slide on its own
+        v
+    deterministic pass 2, deck-wide             (rules/)
+        |  re-reads the restyled file, then compares the slides against each
+        |  other: role sizes, title heights, the alignment grid. The orphan
+        |  and widow check runs at the very end of it, after everything else.
         v
     brand guidelines + inconsistencies + slides (ai/payload.py)
         |
@@ -30,6 +36,28 @@ into the master's placeholders resolves a great many findings by itself and
 raises a few of its own, so a report made before it describes a deck nobody
 will send. It also has to be first because findings name shapes by id, and
 PowerPoint's placeholder matching renames and replaces them.
+
+The deterministic layer then runs in two passes, and the split is for the same
+reason the master goes first: a check is only worth what the state of the deck
+was when it ran.
+
+Pass 1 judges each slide on its own. Pass 2 re-opens the written file and asks
+the questions that need the whole deck at once -- is this role set at one size
+or four, do the titles sit at one height, is there a column the deck follows
+and shapes that miss it. Those are answers about the deck rather than about a
+slide, so they are worth having only once every slide has settled.
+
+The orphan and widow check is last inside pass 2, which makes it the last
+thing the deterministic layer does at all. It is the one rule whose subject is
+not in the file: where a line breaks is the renderer's decision, and the
+renderer breaks it differently after anything upstream has moved a box,
+changed a size or swapped a typeface. Asked earlier it answers about wraps
+that the rest of the run then invalidates.
+
+Both passes finish before the AI layer starts, so its batches carry every
+deterministic finding -- including the deck-wide ones and the orphans. That is
+what lets the model restate them, score them, and read a colour scheme as
+deliberate.
 """
 
 from __future__ import annotations
@@ -72,7 +100,9 @@ from .report.merge import merge_issues, summarize_report
 from .rules import (
     RuleContext,
     build_default_rules,
+    build_first_pass_rules,
     build_master_rules,
+    build_second_pass_rules,
     run_rules,
     skipped_rules,
 )
@@ -95,9 +125,14 @@ class RunConfig:
     render: bool = False        # attach rendered slides to the AI layer
     # Read real line breaks out of PowerPoint, which is the only way the
     # orphan and widow checks can run at all: where a line breaks is not in
-    # the file, it is the renderer's decision. Costs one deck open, about
-    # three seconds on a 5-slide file and proportionally more on a long one,
-    # so it can be turned off for a fast pass.
+    # the file, it is the renderer's decision.
+    #
+    # Costs one deck open PER PASS -- so two, since the deterministic layer
+    # was split -- at about three seconds on a 5-slide file and proportionally
+    # more on a long one. Pass 2 opens its own rather than borrowing pass 1's
+    # because its whole job is to measure the file as it finally stands; see
+    # `_run_second_pass`. Turn this off for a fast pass and both become free,
+    # at the cost of every rule that needs a renderer.
     line_metrics: bool = True
     ai_debug: bool = False      # keep the raw AI exchange on the report
     ai: AIConfig = field(default_factory=AIConfig)
@@ -211,11 +246,19 @@ def run(config: RunConfig) -> ValidationReport:
             if applied is not None:
                 report.master_applied.append(applied)
 
-        rule_issues = _run_rule_layer(
-            deck, spec,
-            metrics=None if config.line_metrics else NullLineMetrics(),
-        )
-        log.info("%s: %d rule finding(s)", deck.name, len(rule_issues))
+        metrics = None if config.line_metrics else NullLineMetrics()
+
+        # Pass 1: every slide judged on its own.
+        rule_issues = _run_rule_layer(deck, spec, metrics=metrics)
+        log.info("%s: %d finding(s) from pass 1", deck.name, len(rule_issues))
+
+        # Pass 2: the deck judged as a whole, on the file as it now stands,
+        # with the orphan check last. Extends the same list, so the AI layer
+        # below sees one set of deterministic findings and cannot tell which
+        # pass produced which.
+        second = _run_second_pass(deck, spec, metrics=metrics)
+        log.info("%s: %d finding(s) from pass 2", deck.name, len(second))
+        rule_issues.extend(second)
 
         ai_result = _run_ai_layer(deck, spec, rule_issues, config)
         if ai_result.summary:
@@ -316,12 +359,36 @@ def _apply_master_first(
         "%s: restyled onto %s by %s, now measuring the result",
         deck.name, spec.source, result.applied_by,
     )
+    if result.quarantined:
+        log.warning(
+            "%s: %d slide(s) were left exactly as they arrived -- no layout in "
+            "%s fits them and the nearest one wrecked them. Each carries a "
+            "PowerPoint comment asking a designer to place it by hand: slide "
+            "%s. They are NOT on the master.",
+            deck.name, len(result.quarantined), spec.source,
+            ", ".join(str(r.number) for r in result.quarantined),
+        )
     return read_deck(out), {
         "deck": deck.name,
         "output": str(out),
         "applied_by": result.applied_by,
         "layouts_used": result.layouts_used,
         "unmatched": [record.number for record in result.unmatched],
+        # Handed back rather than restyled, and commented on the slide itself.
+        # Reported apart from `unmatched` because the two ask different things
+        # of a reader: an unmatched slide is on the master and worth checking,
+        # a quarantined one is not on the master at all and is waiting for
+        # somebody to place it.
+        "quarantined": [
+            {
+                "slide": record.number,
+                "nearest_layout": record.target_layout,
+                "damage_before_sqin": round(record.damage_before, 1),
+                "damage_after_sqin": round(record.damage_after, 1),
+            }
+            for record in result.quarantined
+        ],
+        "quarantine_note": result.quarantine_note,
         "dropped": [str(shape) for shape in result.dropped],
         "stragglers": result.stragglers,
         "masters": result.masters,
@@ -361,9 +428,51 @@ def _run_rule_layer(
     spec: MasterSpec,
     metrics: Optional[LineMetricsProvider] = None,
 ) -> list[Issue]:
+    """Pass 1: every rule that reaches its verdict from a single slide."""
     ctx = RuleContext(deck=deck, spec=spec)
-    rules = build_default_rules(metrics=metrics or default_provider(deck.path))
+    rules = build_first_pass_rules(metrics=metrics or default_provider(deck.path))
     return run_rules(ctx, rules)
+
+
+def _run_second_pass(
+    deck: DeckProfile,
+    spec: MasterSpec,
+    metrics: Optional[LineMetricsProvider] = None,
+) -> list[Issue]:
+    """Pass 2: the deck compared against itself, and then the orphans.
+
+    Measures the file on disk rather than the DeckProfile pass 1 was handed.
+    Today those are the same deck and the re-read is cheap insurance; the
+    reason to pay for it is that this pass exists to describe the file as it
+    finally stands, and a pass that quietly reuses an earlier reading stops
+    being true the first time anything is written between the two. The master
+    restyle already writes one such file -- `_apply_master_first` re-reads it
+    for exactly this reason -- and fixes applied mid-run would write another.
+
+    The metrics provider is rebuilt against that same path for the same
+    reason, and because it is the orphan check's only source: it opens the
+    written deck in PowerPoint and reads the lines back, so pointing it at a
+    stale path would report wraps from a file nobody is sending. It loads
+    lazily, so a pass that finds nothing to measure costs nothing.
+
+    Never fatal. A file this cannot re-read costs the deck-wide findings, not
+    the run: pass 1 has already produced a report worth reading, and losing it
+    to a locked file would be the wrong trade.
+    """
+    try:
+        settled = read_deck(deck.path)
+    except Exception:
+        log.warning(
+            "could not re-read %s for the second pass; comparing the slides "
+            "against each other on the first pass's reading instead",
+            deck.name, exc_info=True,
+        )
+        settled = deck
+
+    rules = build_second_pass_rules(
+        metrics=metrics or default_provider(settled.path)
+    )
+    return run_rules(RuleContext(deck=settled, spec=spec), rules)
 
 
 def _run_master_layer(master: DeckProfile, spec: MasterSpec) -> list[Issue]:
@@ -454,7 +563,17 @@ def _review_batches(
         for index, payload in enumerate(payloads):
             part = _review_one(validator, deck, payload, images, spent)
             if part is None:
-                break
+                # STOP only when the account is spent, which is the one
+                # failure that makes asking again pointless. Anything else
+                # costs this batch and this batch alone -- the threaded branch
+                # below has always done that, and this one used to break on
+                # every None, so a single bad batch quietly ended the layer
+                # and dropped every batch after it. Same failure, opposite
+                # behaviour, decided by a concurrency setting nobody relates
+                # to error handling.
+                if spent:
+                    break
+                continue
             reviewed += 1
             yield index, part
     else:
@@ -495,6 +614,17 @@ def _review_one(
     which made sense when the calls ran in order and a broken key would have
     failed the rest anyway; running several at once, the rest are already in
     flight and throwing their answers away would lose work for nothing.
+
+    THAT PROMISE HAS TO COVER EVERY FAILURE, not the two that were foreseen.
+    It caught `Exhausted` and `AIValidationError` and let everything else
+    through the worker, out of `future.result()` and out of the run: on a real
+    deck a single rendered PNG was deleted from the system temporary directory
+    mid-run, `path.stat()` raised FileNotFoundError on slide 20 of 29, and
+    2,846 deterministic findings and sixteen completed batches went with it.
+    The narrower fix is in `ai.client._contents`, which now reviews that slide
+    on its geometry; this is the backstop, because the next unforeseen failure
+    will not be a missing file and the deterministic layer is worth keeping
+    whatever it is.
     """
     if spent:
         return None            # the account is out; do not ask again
@@ -524,6 +654,19 @@ def _review_one(
         )
         if not log.isEnabledFor(logging.DEBUG):
             log.info("run with -vv for the full traceback")
+        return None
+    except Exception:
+        # The backstop the docstring describes. Logged with the traceback
+        # every time and not only under -vv: an AIValidationError carries its
+        # own actionable message, and whatever reaches here by definition does
+        # not, so the frames are the only thing that says what happened.
+        log.error(
+            "AI layer failed unexpectedly on %s slide(s) %s -- reporting rule "
+            "findings for those and carrying on with the rest of the deck",
+            deck.name,
+            payload.get("batch", {}).get("slides"),
+            exc_info=True,
+        )
         return None
 
 

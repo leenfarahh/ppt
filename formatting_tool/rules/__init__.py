@@ -74,7 +74,9 @@ __all__ = [
     "RuleContext",
     "Rule",
     "build_default_rules",
+    "build_first_pass_rules",
     "build_master_rules",
+    "build_second_pass_rules",
     "run_rules",
     "skipped_rules",
 ]
@@ -117,10 +119,18 @@ def build_master_rules() -> list[Rule]:
     ]
 
 
-def build_default_rules(
+def build_first_pass_rules(
     metrics: Optional[LineMetricsProvider] = None,
 ) -> list[Rule]:
-    """Every rule, in report order (structure, then brand, then polish)."""
+    """Pass one: everything that can be judged one slide at a time.
+
+    In report order (structure, then brand, then space, then polish). Every
+    rule here reaches its verdict from the slide in front of it, so the order
+    inside this list is presentation and nothing depends on it.
+
+    What is NOT here is the other half of the answer -- see
+    `build_second_pass_rules`.
+    """
     return [
         # Structure
         LayoutMissingRule(),
@@ -142,11 +152,8 @@ def build_default_rules(
         OffPaletteShapeRule(),
         RoleFontSizeRule(),
         LogoGeometryRule(),
-        # Consistency
-        InconsistentRoleSizeRule(),
-        InconsistentColorUseRule(),
-        TitlePositionConsistencyRule(),
-        AlignmentGridRule(),
+        # Within one slide: a series, a row, a mirrored pair. Deck-wide
+        # consistency is pass two's job.
         RepeatedElementRule(),
         SeriesFormattingRule(),
         SatelliteOffsetRule(),
@@ -162,21 +169,70 @@ def build_default_rules(
         BandWidthRule(),
         UnevenSeriesRule(),
         MatrixGutterRule(),
-        # After the grid rule and before the tables: a shape on the wrong side
-        # of the page is the largest of these moves, and the report reads
+        # After the space rules and before the tables: a shape on the wrong
+        # side of the page is the largest of these moves, and the report reads
         # better with it beside the other edge findings than filed under
         # direction with the paragraph ones.
         RtlLeadingEdgeRule(),
         TableHeaderRowsRule(),
         TableHeaderAlignmentRule(),
         AutofitShrinkRule(),
-        # Typography
-        OrphanWidowRule(metrics=metrics),
+        # Typography, minus the orphan check. That one is deliberately held
+        # back to the very end of pass two; see `build_second_pass_rules`.
         HeadingBalanceRule(metrics=metrics),
         ManualLineBreakRule(metrics=metrics),
         WhitespaceHygieneRule(),
         TitlePunctuationRule(),
     ]
+
+
+def build_second_pass_rules(
+    metrics: Optional[LineMetricsProvider] = None,
+) -> list[Rule]:
+    """Pass two: the checks that need the whole deck, run after pass one.
+
+    Two kinds of thing live here, and the order between them is load-bearing.
+
+    First, slide against slide. These rules do not judge a slide, they judge
+    the deck: the size a role is set at on most slides and the handful that
+    disagree, the column the deck follows and the shapes that miss it, the
+    height titles sit at and the slides that do not. Each one derives a
+    deck-wide norm and then reports the departures from it, which it can only
+    do once every slide has been read and restyled -- a norm taken while the
+    master was still being applied would be a norm over a deck that no longer
+    exists.
+
+    Then, LAST, the orphan and widow check. Last because it is the only rule
+    whose subject is not in the file. Where a line breaks is the renderer's
+    decision, so this rule measures the deck as PowerPoint draws it, and
+    PowerPoint draws it differently after anything upstream has moved a box,
+    changed a size or swapped a typeface. Running it earlier reports wraps
+    that the rest of the pass then invalidates. Keep it at the end of this
+    list.
+    """
+    return [
+        # Slide against slide
+        InconsistentRoleSizeRule(),
+        InconsistentColorUseRule(),
+        TitlePositionConsistencyRule(),
+        AlignmentGridRule(),
+        # Dead last. Nothing goes below this line.
+        OrphanWidowRule(metrics=metrics),
+    ]
+
+
+def build_default_rules(
+    metrics: Optional[LineMetricsProvider] = None,
+) -> list[Rule]:
+    """Every rule, both passes, in the order the pipeline runs them.
+
+    Kept for the callers that want the whole set in one go and have no second
+    pass to speak of -- `formatting-tool rules`, the AI prompt's rule list,
+    and the recheck after fixes are applied. The pipeline itself asks for the
+    two passes separately, because the point of the split is that something
+    happens between them.
+    """
+    return build_first_pass_rules(metrics) + build_second_pass_rules(metrics)
 
 
 def run_rules(ctx: RuleContext, rules: Sequence[Rule]) -> list[Issue]:

@@ -28,17 +28,26 @@ import secrets
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from shutil import rmtree
+from shutil import copyfile, rmtree
 from typing import Any, Optional
 
 from .. import __version__
 from ..ai.client import AIConfig, AIValidationError, DEFAULT_EFFORT, DEFAULT_MODEL
 from ..ai.payload import DEFAULT_BATCH_SIZE
 from ..apply import ApplyError, apply_fixes, fixable
-from ..extract import DeckReadError
+from ..apply.notes import add_comments
+from ..apply.qafix import apply_steps
+from ..designqa import (
+    DesignQaReport,
+    comments_for,
+    outstanding,
+    review_deck,
+    steps_for,
+)
+from ..extract import DeckReadError, read_deck
 from ..guidelines import GuidelinesError
 from ..pipeline import RunConfig, run
-from ..render import render_deck
+from ..render import DESIGN_QA_SIZE, available_renderer, render_deck
 from ..report.reader import _issue as _issue_from_dict
 from ..workdir import WORKDIR_ENV as _WORKDIR_ENV, workroot
 from ..rules import build_default_rules, describe_rules
@@ -147,37 +156,76 @@ class _Session:
 
 
 _SESSIONS: dict[str, _Session] = {}
+
+# The design check keeps its own table. Same shape, same rules, different
+# lifetime: a deck can be checked on one page and QA'd on the other, and one
+# table would have the second check evicting the first one's deck out from
+# under the fixes somebody is halfway through ticking.
+_QA_SESSIONS: dict[str, "_QaSession"] = {}
 _SESSION_LOCK = threading.Lock()
 
 
-def _remember(session: _Session) -> None:
+def _remember(session: Any, table: Optional[dict] = None) -> None:
+    table = _SESSIONS if table is None else table
     with _SESSION_LOCK:
-        _SESSIONS[session.id] = session
+        table[session.id] = session
         stale = [
             key
-            for key, value in _SESSIONS.items()
+            for key, value in table.items()
             if time.time() - value.created > SESSION_TTL_S
         ]
         # Oldest first, so a burst of checks does not fill the disk with decks
         # nobody is going to apply anything to.
-        while len(_SESSIONS) - len(stale) > MAX_SESSIONS:
+        while len(table) - len(stale) > MAX_SESSIONS:
             oldest = min(
-                (k for k in _SESSIONS if k not in stale),
-                key=lambda k: _SESSIONS[k].created,
+                (k for k in table if k not in stale),
+                key=lambda k: table[k].created,
             )
             stale.append(oldest)
         for key in stale:
-            _SESSIONS.pop(key).cleanup()
+            table.pop(key).cleanup()
 
 
-def _session(session_id: str) -> _Session:
+def _session(session_id: str, table: Optional[dict] = None) -> Any:
+    table = _SESSIONS if table is None else table
     with _SESSION_LOCK:
-        found = _SESSIONS.get(session_id)
+        found = table.get(session_id)
     if found is None:
         raise _BadRequest(
             "that check has expired; run it again before applying fixes"
         )
     return found
+
+
+@dataclass
+class _QaSession:
+    """One design check, kept so its steps can be applied to the same deck.
+
+    Smaller than `_Session` because the design check has less to remember:
+    there is no master, no brand file, no undo. What it does have to keep is
+    the report -- the refs the page ticks are the refs that review handed out,
+    and re-deriving them would mean asking the model again and getting a
+    different reading of the same slides.
+    """
+
+    id: str
+    directory: Path
+    deck: Path
+    report: DesignQaReport
+    created: float = field(default_factory=time.time)
+    # How many times a corrected deck has been written. Every round writes a
+    # new file under a new name and renders into a directory carrying the
+    # number, for the reason `_Session.run` gives at length: a picture served
+    # from an unchanged URL is how a page shows the previous deck beside the
+    # new one and says the fix did not happen.
+    run: int = 0
+
+    @property
+    def fixed(self) -> Path:
+        return self.directory / f"checked-{self.run}-{self.deck.name}"
+
+    def cleanup(self) -> None:
+        rmtree(self.directory, ignore_errors=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -294,8 +342,16 @@ class _Handler(BaseHTTPRequestHandler):
         route = self.path.split("?", 1)[0]
         if route in ("/", "/index.html"):
             self._send_file(STATIC / "index.html", "text/html; charset=utf-8")
+        elif route in ("/qa", "/qa.html"):
+            self._send_file(STATIC / "qa.html", "text/html; charset=utf-8")
+        elif route.startswith("/static/"):
+            self._static(route)
         elif route == "/api/context":
             self._send_json(200, _context(self.server.root))
+        elif route.startswith("/api/qa/preview/"):
+            self._qa_preview(route)
+        elif route.startswith("/api/qa/download/"):
+            self._qa_download(route)
         elif route.startswith("/api/preview/"):
             self._preview(route)
         elif route.startswith("/api/download/"):
@@ -313,6 +369,12 @@ class _Handler(BaseHTTPRequestHandler):
             code, payload = self._guarded(self._run_undo)
         elif route == "/api/preview":
             code, payload = self._guarded(self._run_preview)
+        elif route == "/api/qa/check":
+            code, payload = self._guarded(self._run_qa)
+        elif route == "/api/qa/apply":
+            code, payload = self._guarded(self._run_qa_apply)
+        elif route == "/api/qa/render":
+            code, payload = self._guarded(self._run_qa_render)
         else:
             self._send_json(404, {"error": f"no route for {route}"})
             return
@@ -517,7 +579,15 @@ class _Handler(BaseHTTPRequestHandler):
             # The rendered shape of a slide, so the page can reserve the right
             # space before the images arrive. Without it the overlay boxes are
             # positioned against a collapsed <img> and scatter outside it.
-            "aspect": _aspect_of(before, after),
+            # Full paths, because the dicts hold bare filenames: a bare name
+            # is read relative to the working directory, which is not where
+            # the renders are, so this answered None on every run and the page
+            # positioned its overlays against a collapsed <img>.
+            "aspect": _aspect_of(
+                {n: str(session.directory / "before" / name)
+                 for n, name in before.items()},
+                {n: str(_after_dir(session) / name) for n, name in after.items()},
+            ),
             "slides": [
                 {
                     "slide": n,
@@ -533,6 +603,271 @@ class _Handler(BaseHTTPRequestHandler):
                 for n in numbers
             ],
         }
+
+    # -- the design check --------------------------------------------------- #
+
+    def _run_qa(self) -> dict[str, Any]:
+        """Render a deck and ask the model what it looks like.
+
+        One deck, no master, no brand file. The check reads a picture, so the
+        only thing it cannot do without is the renderer -- and a run with no
+        renderer answers with a report that says so rather than an empty page.
+        """
+        content_type = self.headers.get("Content-Type", "")
+        parts = parse_multipart(self._body(), _boundary_of(content_type))
+        options = _options_of(parts)
+
+        decks = [p for p in parts if p.name == "deck" and p.filename]
+        if not decks:
+            raise _BadRequest("no deck to check was sent")
+
+        workdir = Path(tempfile.mkdtemp(prefix="formatting-tool-qa-", dir=_workroot()))
+        keep = False
+        try:
+            deck = _spill(workdir / "deck", decks[0])
+            ai = AIConfig(
+                model=(options.get("model") or SUGGESTED_MODEL).strip(),
+                effort=options.get("effort") or DEFAULT_EFFORT,
+            )
+            slides = [int(n) for n in options.get("slides") or []] or None
+
+            with _RUN_LOCK, _capture() as collected:
+                started = time.perf_counter()
+                profile = read_deck(deck)
+                rendered = _qa_render(deck, workdir / "before", slides)
+                # Narrowed to what was asked for, because asking is not
+                # getting: a renderer free to ignore the request comes back
+                # with the whole deck, and PowerPoint does exactly that for
+                # anything past a fifth of it. Every extra slide here is a
+                # model call somebody did not ask to pay for.
+                if slides:
+                    rendered = {
+                        n: name for n, name in rendered.items() if n in set(slides)
+                    }
+                report = review_deck(
+                    deck,
+                    [(n, workdir / "before" / name) for n, name in rendered.items()],
+                    ai=ai,
+                    profile=profile,
+                )
+                elapsed = time.perf_counter() - started
+
+            session = _QaSession(
+                id=secrets.token_hex(8), directory=workdir, deck=deck, report=report
+            )
+            _remember(session, _QA_SESSIONS)
+            keep = True
+
+            return {
+                "session": session.id,
+                "report": report.to_dict(),
+                "renderer_ok": bool(rendered),
+                "aspect": _aspect_of(
+                    {n: str(workdir / "before" / name) for n, name in rendered.items()}
+                ),
+                "slides": [
+                    {
+                        "slide": n,
+                        "before": f"/api/qa/preview/{session.id}/before/{n}",
+                        "after": None,
+                    }
+                    for n in sorted(rendered)
+                ],
+                "logs": collected.records,
+                "elapsed_s": round(elapsed, 2),
+            }
+        finally:
+            # The deck stays on disk when a session owns it: the page will ask
+            # for the ticked steps to be applied to this exact file.
+            if not keep:
+                rmtree(workdir, ignore_errors=True)
+
+    def _run_qa_apply(self) -> dict[str, Any]:
+        """Step the type on the ticked shapes, and render what it did.
+
+        Every round starts from the ORIGINAL upload and applies the ticks as
+        they now stand. That is what makes un-ticking something work without
+        an undo of its own: the page re-sends the list, and the deck it gets
+        back is the one it would have got had the dropped step never been
+        ticked. One round, no re-check -- see `apply.qafix` for why a loop
+        that steps until the model is happy is the wrong shape.
+        """
+        body = self._json_body()
+        session = _session(str(body.get("session", "")), _QA_SESSIONS)
+        chosen = [str(key) for key in body.get("fix", [])]
+        # On by default, and it is half of what this button does: the
+        # corrections that can be made are made, and everything else is
+        # written into the deck as a comment so it is work somebody can pick
+        # up rather than a list on a page they will close.
+        file_the_rest = body.get("notes", True)
+        if not chosen and not file_the_rest:
+            raise _BadRequest("nothing was ticked")
+
+        steps = steps_for(session.report, chosen)
+        if not steps and not file_the_rest:
+            raise _BadRequest(
+                "none of those are corrections this check can make; they are "
+                "tasks for a designer, and ticking the box beside Apply writes "
+                "them into the deck"
+            )
+
+        session.run += 1
+        with _RUN_LOCK, _capture() as collected:
+            started = time.perf_counter()
+            result = apply_steps(session.deck, session.fixed, steps)
+            if not steps:
+                # Nothing to correct, but the deck still has to exist for the
+                # comments to go into and for the designer to download.
+                result = _qa_copy(session)
+            left = outstanding(session.report, chosen, result.applied)
+            written = 0
+            if file_the_rest and result.output is not None:
+                written = add_comments(result.output, comments_for(session.report, left))
+            elapsed = time.perf_counter() - started
+        _qa_sweep(session)
+
+        touched = sorted({change.slide for change in result.applied})
+        after: dict[int, str] = {}
+        if result.output is not None and result.applied:
+            after = _qa_render(session.fixed, _qa_after_dir(session), touched)
+
+        return {
+            "session": session.id,
+            **result.to_dict(),
+            # What is left to do by hand, and how much of it is now in the
+            # deck. Reported rather than assumed: writing a comment needs
+            # PowerPoint, and a page that says "filed" when nothing was filed
+            # is worse than one that says nothing.
+            "outstanding": [task.to_dict() for task in left],
+            "comments_written": written,
+            "comments_asked": bool(file_the_rest),
+            # Named per round so nothing -- the page, or anything caching for
+            # it -- can answer with the last round's picture.
+            "slides": [
+                {
+                    "slide": n,
+                    "before": f"/api/qa/preview/{session.id}/before/{n}",
+                    "after": (
+                        f"/api/qa/preview/{session.id}/after/{n}?run={session.run}"
+                        if n in after else None
+                    ),
+                }
+                for n in touched
+            ],
+            "download": (
+                f"/api/qa/download/{session.id}"
+                if result.output is not None else None
+            ),
+            "logs": collected.records,
+            "elapsed_s": round(elapsed, 2),
+        }
+
+    def _run_qa_render(self) -> dict[str, Any]:
+        """Render these slides again, both sides of the pair.
+
+        Both, because the two are read together: asking for a slide again is
+        asking whether the comparison on the screen is true, and refreshing
+        half of it answers half the question. The same reasoning as
+        `_forget` on the deck check, and the same failure posture -- a render
+        that will not come back leaves the cached one in place and the button
+        looks like it did nothing, which the designer can answer by pressing
+        it again.
+        """
+        body = self._json_body()
+        session = _session(str(body.get("session", "")), _QA_SESSIONS)
+        numbers = sorted({int(n) for n in body.get("slides", [])})
+        if not numbers:
+            raise _BadRequest("no slide was named")
+        if body.get("force"):
+            _qa_forget(session, numbers)
+
+        with _RUN_LOCK:
+            before = _qa_render(session.deck, session.directory / "before", numbers)
+            after: dict[int, str] = {}
+            if session.fixed.exists():
+                after = _qa_render(session.fixed, _qa_after_dir(session), numbers)
+
+        return {
+            "session": session.id,
+            "slides": [
+                {
+                    "slide": n,
+                    "before": (
+                        f"/api/qa/preview/{session.id}/before/{n}?t={int(time.time())}"
+                        if n in before else None
+                    ),
+                    "after": (
+                        f"/api/qa/preview/{session.id}/after/{n}"
+                        f"?run={session.run}&t={int(time.time())}"
+                        if n in after else None
+                    ),
+                }
+                for n in numbers
+            ],
+        }
+
+    def _qa_preview(self, route: str) -> None:
+        parts = route.strip("/").split("/")   # api qa preview <id> <which> <n>
+        if len(parts) != 6 or parts[4] not in ("before", "after"):
+            self._send_json(404, {"error": "bad preview path"})
+            return
+        try:
+            session = _session(parts[3], _QA_SESSIONS)
+        except _BadRequest as exc:
+            self._send_json(404, {"error": str(exc)})
+            return
+
+        directory = (
+            _qa_after_dir(session) if parts[4] == "after"
+            else session.directory / "before"
+        )
+        image = _image_for(directory, parts[5])
+        if image is None:
+            self._send_json(404, {"error": "no such rendered slide"})
+            return
+        self._send_file(image, "image/png")
+
+    def _qa_download(self, route: str) -> None:
+        session_id = route.rsplit("/", 1)[-1]
+        try:
+            session = _session(session_id, _QA_SESSIONS)
+        except _BadRequest as exc:
+            self._send_json(404, {"error": str(exc)})
+            return
+        if not session.fixed.exists():
+            self._send_json(404, {"error": "nothing has been applied yet"})
+            return
+        body = session.fixed.read_bytes()
+        self.send_response(200)
+        self.send_header(
+            "Content-Type",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        )
+        self.send_header(
+            "Content-Disposition", f'attachment; filename="{session.fixed.name}"'
+        )
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _static(self, route: str) -> None:
+        """One file out of the static directory, by name and nothing else.
+
+        The name arrives from a URL. Joining an arbitrary string onto a path
+        is how a local tool starts serving files it was never asked about, so
+        this takes the last segment, refuses anything that is not a plain
+        name, and refuses any extension the pages do not use.
+        """
+        name = route.rsplit("/", 1)[-1]
+        kind = _STATIC_TYPES.get(Path(name).suffix.lower())
+        if kind is None or name != Path(name).name or name.startswith("."):
+            self._send_json(404, {"error": f"no asset named {name}"})
+            return
+        target = STATIC / name
+        if not target.is_file():
+            self._send_json(404, {"error": f"no asset named {name}"})
+            return
+        self._send_file(target, kind)
 
     def _preview(self, route: str) -> None:
         parts = route.strip("/").split("/")      # api preview <id> <which> <n>
@@ -832,6 +1167,90 @@ def _layout_picks(session: _Session) -> list:
     return session.layout_picks
 
 
+# What the static route will serve. A whitelist rather than a guess from the
+# file: this directory is the page, and a page is HTML, CSS and pictures.
+_STATIC_TYPES = {
+    ".css": "text/css; charset=utf-8",
+    ".html": "text/html; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".png": "image/png",
+    ".svg": "image/svg+xml",
+}
+
+
+def _qa_render(
+    deck: Path, directory: Path, slides: Optional[list[int]] = None
+) -> dict[int, str]:
+    """Render for the design check, which renders bigger than the rest.
+
+    See `render.DESIGN_QA_SIZE`: this is the one call where the picture IS the
+    evidence, so it goes up at the largest size the model will look at without
+    downsizing it first.
+    """
+    return _render_into(
+        deck, directory, slides, renderer=available_renderer(DESIGN_QA_SIZE)
+    )
+
+
+def _qa_copy(session: "_QaSession") -> Any:
+    """The deck copied, unchanged, so comments have somewhere to go.
+
+    A round that corrects nothing still produces a file: the tasks are the
+    point of that round, and they are written into a copy rather than into the
+    designer's upload -- this tool does not edit what it was given.
+    """
+    from ..apply.qafix import QaFixResult  # noqa: PLC0415 - COM-side module
+
+    try:
+        session.fixed.parent.mkdir(parents=True, exist_ok=True)
+        copyfile(session.deck, session.fixed)
+    except OSError as exc:
+        return QaFixResult(reason=f"could not copy the deck: {exc}")
+    return QaFixResult(output=session.fixed)
+
+
+def _qa_forget(session: "_QaSession", slides: list[int]) -> None:
+    """Drop the cached renders of these slides, both sides.
+
+    May fail quietly: this is a designer asking for a picture to be made
+    again, so the worst case is a button that appears not to work and can be
+    pressed again. Nothing here presents an old image as a new one -- the
+    per-round directories are what guarantee that.
+    """
+    for number in slides:
+        for directory in (session.directory / "before", _qa_after_dir(session)):
+            try:
+                (directory / f"{number}.png").unlink()
+            except OSError:
+                pass
+
+
+def _qa_after_dir(session: "_QaSession") -> Path:
+    return session.directory / "after" / str(session.run)
+
+
+def _qa_sweep(session: "_QaSession") -> None:
+    """Drop the renders and the deck of rounds that are over. Best effort.
+
+    Safe to fail: the current round reads its own directory and writes its own
+    filename, so a file Windows will not let go of costs disk space rather
+    than correctness. That is exactly what could not be said when deleting was
+    what made the pictures on the page true -- see `_Session.run`.
+    """
+    for old_deck in session.directory.glob(f"checked-*-{session.deck.name}"):
+        if old_deck != session.fixed:
+            try:
+                old_deck.unlink()
+            except OSError:
+                pass
+    root = session.directory / "after"
+    if not root.is_dir():
+        return
+    for directory in root.iterdir():
+        if directory.is_dir() and directory.name != str(session.run):
+            rmtree(directory, ignore_errors=True)
+
+
 def _after_dir(session: _Session) -> Path:
     """Where this run's renders of the corrected deck live.
 
@@ -893,7 +1312,10 @@ def _spill(directory: Path, part: _Part) -> Path:
 
 
 def _render_into(
-    deck: Path, directory: Path, wanted: Optional[list[int]] = None
+    deck: Path,
+    directory: Path,
+    wanted: Optional[list[int]] = None,
+    renderer: Optional[Any] = None,
 ) -> dict[int, str]:
     """Render a deck into `directory`, reusing what is already there.
 
@@ -911,7 +1333,13 @@ def _render_into(
     if existing and (wanted is None or not missing):
         return existing
 
-    images = render_deck(deck, slides=missing or None)
+    # Named only when one was asked for. `render_deck` picks the host's own
+    # renderer when it is not told, so passing None would mean the same thing
+    # -- but it would mean it in a call that has grown an argument, and the
+    # tests that stand in for the renderer bind the call this module has
+    # always made.
+    extra = {"renderer": renderer} if renderer is not None else {}
+    images = render_deck(deck, slides=missing or None, **extra)
     if not images:
         log.info("no preview for %s: %s", deck.name, images.reason)
         return existing
@@ -1019,6 +1447,11 @@ def _context(root: Path) -> dict[str, Any]:
             "batch_size": DEFAULT_BATCH_SIZE,
         },
         "api_key": bool(os.environ.get("GEMINI_API_KEY")),
+        # Whether this host can render at all. The deck check degrades without
+        # a renderer; the design check cannot run at all, and saying so before
+        # a designer uploads 25MB is the difference between a warning and a
+        # wasted minute.
+        "renderer": available_renderer().available,
     }
 
 

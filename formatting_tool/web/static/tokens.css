@@ -1,0 +1,47 @@
+/* The palette both pages share.
+ *
+ * In a file rather than in each page because there are two pages now -- the
+ * deck check and the design check -- and a colour defined twice is a colour
+ * that ends up being two colours. Everything else about a page stays in that
+ * page: they are different pages, and only the ink is meant to match.
+ */
+:root {
+  --bg: #FAFAF9;
+  --surface: #FFFFFF;
+  --ink: #17191C;
+  --muted: #6E7278;
+  --faint: #9A9EA4;
+  --line: #E5E5E1;
+  --line-strong: #D3D3CE;
+  --accent: #1F2A44;
+  --accent-ink: #FFFFFF;
+  --tint: #F0F1F4;
+  --blocker: #A11B2B;
+  --error: #B4531A;
+  --warning: #8A6A12;
+  --info: #5A6472;
+  /* The change highlight. Deliberately not a brand or a severity colour: it
+     is drawn on top of a client's slide and has to read as the tool's mark
+     rather than as part of the design. */
+  --hl: #00A3B4;
+  --mono: ui-monospace, "Cascadia Mono", "SF Mono", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0F1114;
+    --surface: #16191D;
+    --ink: #E9EAEC;
+    --muted: #979DA5;
+    --faint: #6C737C;
+    --line: #24282E;
+    --line-strong: #333941;
+    --accent: #E9EAEC;
+    --accent-ink: #0F1114;
+    --tint: #1D2127;
+    --blocker: #F1707C;
+    --error: #F0975A;
+    --warning: #DCB53F;
+    --info: #93A0B1;
+    --hl: #22C7D8;
+  }
+}

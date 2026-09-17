@@ -69,6 +69,94 @@ def emu_to_points(value: Optional[int]) -> float:
     return float(value or 0) / _EMU_PER_POINT
 
 
+@dataclass(frozen=True)
+class Comment:
+    """One thing to say on one slide, and where on it to say it."""
+
+    slide: int                          # 1-based
+    body: str
+    left_pt: float = 0.0
+    top_pt: float = 0.0
+
+
+# The design check files its comments under a name of their own, so a designer
+# reading the pane can tell which came from the rule layer, which came from the
+# design check, and which they wrote themselves.
+QA_AUTHOR = "Design check"
+QA_INITIALS = "DQ"
+
+
+def add_comments(
+    deck: Path,
+    comments: Sequence[Comment],
+    author: str = QA_AUTHOR,
+    initials: str = QA_INITIALS,
+) -> int:
+    """Write these comments into the deck. Returns how many landed.
+
+    WHY THE DECK AND NOT THE PAGE. A finding this tool cannot correct is work
+    for a person, and the person does that work in PowerPoint, with the slide
+    in front of them -- not in a browser tab beside it that they have to keep
+    in sync by eye. A comment is anchored to the slide it is about, survives
+    the file being mailed on, and is where a designer already looks for
+    somebody else's instructions.
+
+    Never raises, and never loses the text: the tasks are on the report and on
+    the page whatever happens here, so a host without PowerPoint costs the
+    convenience rather than the finding. It returns a count instead of a
+    result per comment because the caller reports one line either way.
+    """
+    if not comments:
+        return 0
+
+    from .. import powerpoint      # noqa: PLC0415 - Windows only, lazy
+
+    if not powerpoint.available():
+        log.info("no comments written: desktop PowerPoint is needed for that")
+        return 0
+    try:
+        return powerpoint.run(
+            lambda app: _write_comments(app, deck, comments, author, initials)
+        )
+    except Exception:
+        log.warning(
+            "could not write %d comment(s) into %s", len(comments), deck.name,
+            exc_info=True,
+        )
+        return 0
+
+
+def _write_comments(
+    app: Any, deck: Path, comments: Sequence[Comment], author: str, initials: str
+) -> int:
+    """One session, one save, a comment per task."""
+    from ..rebuild.master_apply import _retry   # noqa: PLC0415 - shared COM retry
+    from .. import powerpoint                   # noqa: PLC0415
+
+    written = 0
+    presentation = _retry(
+        lambda: app.Presentations.Open(str(Path(deck).resolve()), False, False, False)
+    )
+    try:
+        count = int(presentation.Slides.Count)
+        for comment in comments:
+            if not 1 <= comment.slide <= count:
+                continue
+            slide = presentation.Slides(comment.slide)
+            try:
+                _retry(lambda s=slide, c=comment: s.Comments.Add(
+                    c.left_pt, c.top_pt, author, initials, c.body
+                ))
+                written += 1
+            except Exception:
+                log.debug("a comment would not go on slide %d", comment.slide,
+                          exc_info=True)
+        _retry(presentation.Save)
+    finally:
+        powerpoint.quietly(presentation.Close)
+    return written
+
+
 def copy_notes_to_comments(deck: Path, notes: Sequence[NoteCopy]) -> list[CopyResult]:
     """Write one PowerPoint comment per deleted note. Never raises.
 

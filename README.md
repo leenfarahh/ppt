@@ -1216,6 +1216,202 @@ skips opening a window, `--root` points the guidelines dropdown at another
 project. Stdlib only, no server dependency. Loopback, single user, no auth: it
 is a local tool, not something to expose.
 
+### The design check
+
+The second page, at `/qa`, and a different question. The deck check measures a
+deck against a master and a brand file and reports what is provably wrong with
+it. The design check takes a deck on its own, renders every slide through
+PowerPoint, and asks the model the thing no rule reaches: does this look right.
+
+```powershell
+python -m formatting_tool ui --reload
+# then http://127.0.0.1:8000/qa
+```
+
+**What the model is shown is the real slide.** Each slide is exported through
+PowerPoint COM at 1536x864 -- the largest 16:9 frame under the 1568px long edge
+past which a picture is downsized before it is looked at -- and that PNG, the
+render a client would open, is what goes up. The validation layer stays at
+1280x720; see `render.DESIGN_QA_SIZE` for why the two differ.
+
+**With it goes a shape map**: every shape on the slide, named, given a role,
+and placed in percentages of the page -- `s3. 'Caption 4' (caption): left 8.2%,
+top 79.6%, width 22.1%, height 10.0%, 9pt, 'Source: ...'`. The percentages are
+the only frame of reference the picture and the file share, and they are what
+lets a verdict be anchored to something nameable. Footers, slide numbers and
+dates are left out: they are the master's furniture, and a verdict on one is a
+verdict on the template.
+
+**The map is a tree, and it goes inside the groups.** A shape in a group is
+listed under it, indented, carrying its parent's ref: `s5` is the circle,
+`s5.2` is the icon inside it. That is where the defect usually is -- a row of
+components each holding an icon, and one icon sitting low inside its circle is
+the commonest fault in a deck built from repeated parts. A list that named the
+group and stopped had nowhere to put that verdict, so the model said nothing.
+`deck_reader` composes a group's children into slide coordinates, so a child's
+percentages mean the same thing as a top-level shape's and the two can be
+compared directly; a child's own numbers are in a private coordinate system the
+group declares, and listing those would put every icon somewhere it is not.
+Percentages carry one decimal for the same reason: an icon 1.5% of the slide
+out of place is an obvious wobble on the render and rounds to the same whole
+number as a centred one.
+
+It stops at two levels and twelve children to a group. An org chart of forty
+boxes is an arrangement rather than forty decisions, and listing it would spend
+the whole map on one drawing; the group is still named, so the model can still
+say the drawing as a whole sits wrong.
+
+**A ref comes back, not a name.** Shape names are not unique on a real slide --
+sixteen shapes called `Pentagon 7` is a thing that happens -- so each listed
+shape carries a ref, and the response schema will accept nothing else in
+`shape`. The model cannot name a shape that was not on the list, because the
+schema has no word for one.
+
+**Two buckets come back, and both are kept.**
+
+- **A verdict per shape**, as `{shape, status, issue, action, note, task}`.
+  `action` is `shrink`, `grow`, `center`, `widen` or `none`; `issue` is
+  `overlap`, `cut_off`, `off_center`, `too_small`, `too_big`, `crowded` or
+  `unfilled`. Both are whitelisted in Python on the way in, so a word nobody
+  defined reads as unlabelled rather than as a new behaviour. `task` is
+  required whenever `status` is `issue`, whatever the action.
+
+  Three of those are worth spelling out. **`cut_off`** covers a word broken
+  across lines because its box is too narrow -- "Proportionalit / y" -- as well
+  as text clipped by its box: both mean the box cannot show the words it was
+  given, and the first is the one a designer sees and no rule measures.
+  **`off_center`** is the icon-in-a-circle case above, and is given on the
+  child rather than on the group. **`unfilled`** is a placeholder the deck
+  never filled, and it is the one verdict the picture cannot support: PowerPoint
+  does not export the "Click to add text" prompt, so an unfilled region renders
+  as blank space rather than as a mistake. The map marks those `EMPTY` and the
+  model is told to trust the mark over the picture for that one.
+- **`slide_issues`**, for everything that vocabulary cannot express: a timeline
+  with a stop nothing uses, a column left empty, a layout weighted to one side.
+  Each is a `{note, task}` pair for the same reason -- the note is what is
+  wrong, the task is what to do about it. Dropping these quietly is how a bad
+  slide reaches a client.
+
+**Every finding is a task.** Not a note, not an observation: a line that says
+what to do, with the slide and the shape it is about. The model is required to
+write one for every issue it reports, including the ones nothing here can
+correct, because for those the instruction is the entire value of having
+reported it. "The right half is empty" is an observation; "run the cards across
+the full width, or move the callout into the empty half" is work.
+
+A task is **fixable** when the applier has arithmetic for it. That is a
+statement about the tool rather than about the finding, and the page says so
+plainly: fixable tasks carry a tick box, the rest carry the instruction and go
+into the deck.
+
+**Four corrections, each bounded and checked afterwards.**
+
+| | what it does | what stops it |
+| --- | --- | --- |
+| `shrink` / `grow` | steps the type one notch, x0.85 or x1.15 | the 9pt floor and the 40pt cap; put back if the copy stops fitting |
+| `center` | moves a shape to the middle of the thing holding it | refuses when it is not inside anything, or is already centred to within half a point |
+| `widen` | widens a box until its words stop breaking in half | a neighbour, the slide edge, or 1.6x; put back if the break survives |
+| `align` | moves a shape to where the rest of the deck puts it | fewer than three slides to measure, or a move over 2in |
+
+A step that would pass a bound is not taken at all rather than clipped to it,
+since a clipped grow is a shrink and nobody asked for one.
+
+**`widen` re-reads the renderer rather than computing a width.** How wide a
+word draws depends on the typeface, the size, the kerning and the language, and
+every attempt to derive it from the characters is a guess that is wrong for
+Arabic. So the box is widened a little and PowerPoint is asked again where it
+broke the lines -- `breaks_mid_word` walks the copy alongside the lines the
+renderer produced, and a line that ends where the original has no space is a
+word broken in half.
+
+**`align` is the one correction the model does not ask for.** It says which
+slides disagree; arithmetic says where the shape belongs -- the median position
+of the title across the deck, median rather than mean so the slide being
+reported cannot drag the target towards itself. Titles only: a title is the one
+shape a deck has on nearly every slide in a role this tool can identify, so
+"where the rest of the deck puts it" means something. For a logo that drifts
+there is no such set, and the finding stays a task.
+
+**Everything else is written into the deck as a comment.** Ticking Apply does
+two things: it makes the corrections, and it files every remaining task as a
+PowerPoint comment anchored on the shape it is about. The designer opens the
+Comments pane and works the list with the slide in front of them, which is
+where the work happens -- not in a browser tab they have to keep in sync by
+eye. Three kinds of task end up there, and they are the same thing to whoever
+picks the deck up next: what nothing can correct, what was not ticked, and what
+was ticked and refused. The third is the one a page loses.
+
+**Shapes are addressed by their position in the tree, not by their id.** A
+shape id is unique within a slide in a well-formed file, and this tool reads
+the file with python-pptx and edits it through PowerPoint -- two readings that
+agree only while the file is well formed. A deck carrying the same id on two
+shapes, which is what pasting between decks produces, is renumbered silently by
+PowerPoint when it opens it. Measured on such a deck: a group holding an icon
+and a text box two shapes away both claimed id 910, and a correction addressed
+by id centred the icon on the text box. Document order is the one thing both
+readings agree on, so the path is the key and the shape's name is the check; a
+lookup that finds a different name touches nothing and says why.
+
+**It steps through PowerPoint, not python-pptx**, because a placeholder usually
+states no size of its own: it inherits one from the layout, `run.font.size` is
+`None`, and that is most of the shapes on a tidy deck. PowerPoint answers with
+the size it is drawing and measures, on the same open presentation, whether the
+copy still fits.
+
+**Applying draws the pair.** The corrected slides come back as **Before and
+after**: the original beside the rewritten one, each shape that was stepped
+marked on both pictures with the number of its line in the list underneath.
+"stepped the type down from 11pt to 9.5pt" is a claim; two pictures are the
+evidence, and a designer can reject the result before it reaches a client. It
+is the same reasoning as **Render before / after** on the deck check, and the
+same furniture: a **Re-render** on each slide that ignores what is cached,
+because the cache is right nearly always and "nearly always" is not something
+anyone can check from the outside; a toggle for the marks; and the download
+beside them.
+
+Only slides that actually changed get a pair. A step that was refused -- the
+copy would have spilled its box, the shape holds no text, the type is already
+at the 9pt floor -- would produce two identical pictures, and two identical
+pictures read as a tool that did nothing rather than as a tool that declined to
+do something. The refusal is listed in words, with its reason, where it can say
+which.
+
+**Everything else is a note.** A shape in the wrong place, a colour fighting
+its background, an image at the wrong crop: the model is told to answer `none`
+and say so in `note`, and the page lists it beside the render with no tick box.
+Ticking something that is a note rather than an action is refused with a
+sentence.
+
+**Each verdict is drawn on the slide it is about.** The boxes over the render
+are the same rectangles the model was given, in the same percentages, numbered
+to match the list underneath.
+
+**And the slides are compared with each other, once.** The per-slide pass
+cannot answer this by construction: a title 4% lower than on every other slide
+looks perfectly placed on its own, and a deck of individually faultless slides
+that do not match each other is exactly what reads as assembled rather than
+designed. So the renders are tiled onto contact sheets -- three across at 512px,
+twelve to a sheet, which keeps the sheet under the 1568px long edge -- and sent
+with a table of what each slide measures: where its title sits, where its
+content starts and ends, what type sizes are on it. One call, not the hundred
+and thirty-six a pairwise comparison of seventeen slides would be.
+
+What comes back is `{kind, slides, note, task}` per mismatch, `kind` being `position`,
+`type_scale`, `spacing`, `color`, `size`, `alignment`, `content` or `other`, and
+the page lists them under **Across the deck** with a link to each slide named.
+They are notes, never steps: a mismatch has two sides, and which of them is
+wrong is a designer's call. A mismatch naming a slide that was not in the
+comparison is dropped -- nothing validates these later, so one pointing at
+slide 40 of a deck compared up to 36 would send a designer to a slide the model
+never saw. The model is told what not to report as well: a cover and a section
+divider are not the content slides and are not meant to match them.
+
+**The failure posture is the same as everywhere else here.** No renderer, no
+key, a quota spent halfway down a deck: each comes back as a report that says
+which, with the slides that did get looked at still on it. A slide the model
+declined is called out as declined, because a slide nobody looked at and a
+slide with nothing wrong with it look identical on a page.
+
 ## Tests
 
 ```powershell
@@ -1226,6 +1422,18 @@ pytest
 Nine smoke tests covering the rule layer, the AI payload and schema, the merge
 step, and colour distance. None of them need python-pptx, an API key, or a
 fixture deck.
+
+**The design check's page is tested in a real browser.** `test_qa_page.py` is
+the only test of any of the JavaScript here, and it exists because a typo in a
+page does not fail anything: it blanks the results and leaves something that
+loads, looks calm, and shows nothing. The script is lifted out of `qa.html`,
+given a `fetch` that answers with the payloads `web/server.py` actually sends,
+and driven through a check, an apply and a re-render in headless Edge or
+Chrome; the assertions read the DOM that comes back. The canned payloads are
+written out in the test rather than captured to a file because they ARE the
+contract between the server and the page, and a change on one side that the
+other does not follow should fail there rather than in a designer's browser.
+Skipped where no browser is installed.
 
 ## Layout
 
@@ -1253,7 +1461,11 @@ fixture deck.
 | `formatting_tool/ai/schema.py` | The JSON contract, enforced server-side. |
 | `formatting_tool/ai/client.py` | The Gemini call. |
 | `formatting_tool/report/` | Merge, dedupe, order, write. |
-| `formatting_tool/web/` | The browser UI: a stdlib server and one HTML page. |
+| `formatting_tool/web/` | The browser UI: a stdlib server and two HTML pages. |
+| `formatting_tool/designqa.py` | The design check: render a deck, ask what it looks like. |
+| `formatting_tool/ai/designqa.py` | The per-slide call, the shape map, the cross-slide pass, and the response contract. |
+| `formatting_tool/apply/qafix.py` | The four bounded corrections, applied through PowerPoint. |
+| `formatting_tool/apply/notes.py` | Writes the tasks nothing can fix into the deck as comments. |
 | `formatting_tool/render.py` | Renders slides through PowerPoint, for the AI layer and the previews. |
 | `formatting_tool/colorutil.py` | Perceptual colour distance. |
 | `formatting_tool/linemetrics.py` | Where rendered line breaks would come from. |

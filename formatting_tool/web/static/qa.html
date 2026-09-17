@@ -1,0 +1,1054 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Design check</title>
+<link rel="stylesheet" href="/static/tokens.css">
+<style>
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 400 14px/1.55 ui-sans-serif, -apple-system, "Segoe UI", Inter, system-ui, sans-serif;
+  font-feature-settings: "cv05", "ss01";
+}
+main { max-width: 1000px; margin: 0 auto; padding: 56px 24px 120px; }
+h1, h2, h3 { margin: 0; font-weight: 600; letter-spacing: -0.011em; }
+code { font-family: var(--mono); font-size: 12px; }
+button { font: inherit; color: inherit; cursor: pointer; }
+a { color: inherit; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+
+/* ---------- header ---------- */
+header { margin-bottom: 34px; }
+header h1 { font-size: 19px; }
+header p { margin: 5px 0 0; color: var(--muted); font-size: 13px; }
+header .elsewhere { color: var(--muted); margin-left: 6px; }
+header .elsewhere:hover { color: var(--ink); }
+
+/* ---------- drop zone ---------- */
+.drop {
+  position: relative;
+  background: var(--surface);
+  border: 1px dashed var(--line-strong);
+  border-radius: 10px;
+  padding: 18px;
+  min-height: 116px;
+  display: flex; flex-direction: column; gap: 4px;
+  transition: border-color .12s ease, background .12s ease;
+}
+.drop:hover { border-color: var(--faint); }
+.drop.over { border-color: var(--accent); border-style: solid; background: var(--tint); }
+.drop.filled { border-style: solid; border-color: var(--line-strong); min-height: 0; }
+.drop-label {
+  font-size: 11px; letter-spacing: .07em; text-transform: uppercase;
+  color: var(--faint); font-weight: 600;
+}
+.drop-hint { color: var(--muted); font-size: 13px; }
+.drop-hint u { text-decoration-color: var(--line-strong); text-underline-offset: 2px; cursor: pointer; }
+.files { list-style: none; margin: 6px 0 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.files li { display: flex; align-items: baseline; gap: 8px; font-size: 13px; }
+.files .size { color: var(--faint); font-size: 11px; font-family: var(--mono); margin-left: auto; }
+.files .x { border: 0; background: none; color: var(--faint); padding: 0 2px; font-size: 15px; line-height: 1; }
+.files .x:hover { color: var(--blocker); }
+.drop input[type=file] { display: none; }
+
+/* ---------- controls ---------- */
+.controls { display: flex; align-items: flex-end; gap: 18px; flex-wrap: wrap; margin-top: 18px; }
+.field { display: flex; flex-direction: column; gap: 6px; }
+.field > span {
+  font-size: 11px; letter-spacing: .07em; text-transform: uppercase;
+  color: var(--faint); font-weight: 600;
+}
+select, input[type=text] {
+  font: inherit; color: inherit; background: var(--surface);
+  border: 1px solid var(--line-strong); border-radius: 7px;
+  padding: 7px 10px; min-width: 190px;
+}
+input#slides { min-width: 120px; }
+.run {
+  margin-left: auto; border: 0; border-radius: 7px;
+  background: var(--accent); color: var(--accent-ink);
+  padding: 9px 20px; font-weight: 500;
+}
+.run:disabled { opacity: .45; cursor: default; }
+.note { font-size: 12px; color: var(--faint); margin: 12px 0 0; }
+
+/* ---------- status ---------- */
+.status { margin-top: 22px; font-size: 13px; color: var(--muted); }
+.status.err { color: var(--blocker); }
+.spinner {
+  display: inline-block; width: 11px; height: 11px; margin-right: 8px;
+  border: 1.5px solid var(--line-strong); border-top-color: var(--accent);
+  border-radius: 50%; animation: spin .7s linear infinite; vertical-align: -1px;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.status .elapsed { font-variant-numeric: tabular-nums; }
+
+/* ---------- summary ---------- */
+.summary { margin-top: 34px; padding-top: 18px; border-top: 1px solid var(--line-strong); }
+.summary-line { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.summary-line .count { font-size: 19px; font-weight: 600; letter-spacing: -0.02em; }
+.summary-line .meta { color: var(--muted); font-size: 12.5px; }
+.toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
+.linkish {
+  border: 1px solid var(--line-strong); background: var(--surface);
+  border-radius: 20px; padding: 5px 12px; font-size: 12.5px; color: var(--muted);
+}
+.linkish:hover { color: var(--ink); border-color: var(--faint); }
+.linkish.on { color: var(--ink); border-color: var(--faint); background: var(--tint); }
+
+/* ---------- notices ---------- */
+.notice {
+  margin-top: 16px; padding: 11px 14px; border-radius: 8px;
+  border: 1px solid var(--line-strong); background: var(--surface);
+  font-size: 13px; display: flex; gap: 10px; align-items: flex-start;
+}
+.notice b { font-weight: 600; }
+.notice.warn { border-left: 3px solid var(--warning); }
+.notice.bad  { border-left: 3px solid var(--blocker); }
+.notice p { margin: 3px 0 0; color: var(--muted); font-size: 12.5px; }
+
+/* ---------- apply ---------- */
+.applybar {
+  margin: 22px 0 4px; padding: 14px 16px;
+  border: 1px solid var(--line); border-radius: 8px; background: var(--surface);
+}
+.applybar-line { font-size: 13px; }
+.applybar-actions { display: flex; align-items: center; gap: 14px; margin-top: 10px; flex-wrap: wrap; }
+.applybar .reb { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+.applybar b { font-weight: 600; }
+.applybar-actions .grow { flex: 1; }
+.applybar button#apply {
+  padding: 7px 16px; border-radius: 6px; border: 1px solid transparent;
+  background: var(--accent); color: var(--accent-ink); font-size: 13px;
+}
+.applybar button#apply:disabled { opacity: .4; cursor: default; }
+.applied { margin: 18px 0; padding: 14px 16px; border: 1px solid var(--line); border-radius: 8px; }
+.applied-head { display: flex; align-items: center; gap: 10px; font-size: 13px; flex-wrap: wrap; }
+.applied-head .dim { color: var(--faint); font-size: 12.5px; }
+.applied-head .grow { flex: 1; }
+.applied-list { margin: 10px 0 0; padding-left: 18px; font-size: 12px; line-height: 1.7; }
+.applied-list .dim { color: var(--faint); }
+.applied-list code { color: var(--faint); margin-left: 6px; }
+.left-over { margin-top: 12px; padding-top: 10px; border-top: 1px dashed var(--line); font-size: 12.5px; }
+.left-over summary { cursor: pointer; color: var(--muted); }
+.left-over summary:hover { color: var(--ink); }
+
+/* ---------- one slide ---------- */
+.slide-block { margin-top: 26px; padding-bottom: 20px; border-bottom: 1px solid var(--line); }
+.slide-block:last-child { border-bottom: 0; }
+.slide-bar { display: flex; align-items: baseline; gap: 10px; font-size: 12.5px; margin-bottom: 8px; }
+.slide-bar b { font-size: 13px; }
+.slide-bar .dim { color: var(--faint); }
+.slide-bar .grow { flex: 1; }
+.shots { display: grid; grid-template-columns: 1fr; gap: 14px; }
+.shots.pair { grid-template-columns: 1fr 1fr; }
+@media (max-width: 860px) { .shots.pair { grid-template-columns: 1fr; } }
+.shot span { display: block; font-size: 11px; font-family: var(--mono); color: var(--faint); margin-bottom: 5px; }
+
+/* The overlay is positioned against the image, so the wrapper has to be
+   exactly the image's size: inline-block and a block img, no line-box slack.
+   Every box is in per cent of the picture, which is the frame of reference
+   the model was given, so nothing here has to know the slide's aspect. */
+.frame { position: relative; display: block; overflow: hidden; border: 1px solid var(--line); border-radius: 4px; }
+.frame img { width: 100%; height: auto; display: block; }
+.hl {
+  position: absolute; border: 2px solid var(--hl); border-radius: 2px;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.55); pointer-events: none;
+}
+.hl.step { border-color: var(--warning); }
+.hl b {
+  position: absolute; left: -2px; bottom: 100%;
+  background: var(--hl); color: #fff;
+  font: 600 7.5px/1.35 var(--mono);
+  min-width: 11px; text-align: center; padding: 0 2px;
+  border-radius: 2px 2px 0 0; white-space: nowrap;
+}
+.hl.step b { background: var(--warning); }
+.hl.high b { bottom: auto; top: 0; border-radius: 0 0 2px 0; }
+
+/* ---------- verdicts ---------- */
+.verdicts { margin: 12px 0 0; padding: 0; list-style: none; font-size: 12.5px; }
+.verdict {
+  display: grid; grid-template-columns: 22px 20px 1fr; gap: 10px;
+  padding: 7px 0; border-bottom: 1px solid var(--line); align-items: start;
+}
+.verdict:last-child { border-bottom: 0; }
+.verdict .tick input { width: 15px; height: 15px; cursor: pointer; accent-color: var(--ink); }
+.verdict .num {
+  display: inline-block; min-width: 15px; text-align: center;
+  background: var(--hl); color: #fff;
+  font: 600 9px/1.6 var(--mono); border-radius: 3px; padding: 0 3px;
+}
+.verdict.step .num { background: var(--warning); }
+.verdict .head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.verdict .what { font-weight: 600; }
+.verdict .role, .verdict .tag { color: var(--faint); font-size: 11px; font-family: var(--mono); }
+.verdict .todo { margin-top: 2px; }
+/* What was seen, under what to do about it: supporting evidence, set as
+   supporting evidence. */
+.verdict .say { color: var(--faint); margin-top: 2px; font-size: 12px; }
+.verdict .byhand { color: var(--warning); font-size: 15px; line-height: 1; padding-left: 4px; }
+.verdict.ok .what { font-weight: 400; color: var(--muted); }
+.verdict.ok .num { background: var(--line-strong); color: var(--surface); }
+.chip-issue {
+  display: inline-block; padding: 0 7px; border-radius: 20px;
+  border: 1px solid var(--line-strong); font-size: 10.5px;
+  letter-spacing: .04em; text-transform: uppercase; color: var(--muted);
+}
+.chip-issue.step { border-color: var(--warning); color: var(--warning); }
+
+/* ---------- before and after ---------- */
+/* The whole point of the page after an apply: "stepped the type down from 11pt
+   to 9.5pt" is a claim, two pictures are the evidence, and a designer can
+   reject the result before it reaches a client. */
+.preview { margin: 18px 0 6px; }
+.preview-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding-bottom: 10px; border-bottom: 1px solid var(--line-strong); }
+.preview-head h2 { font-size: 13px; }
+.preview-head .grow { flex: 1; }
+.preview-head .dim { color: var(--faint); font-size: 12.5px; }
+.pair-block { margin-top: 18px; }
+.pair-block .slide-bar { margin-bottom: 6px; }
+.changed { margin: 10px 0 0; padding: 0; list-style: none; font-size: 12px; }
+.changed li { display: flex; gap: 8px; align-items: baseline; padding: 3px 0; line-height: 1.6; }
+.changed .num { flex: none; display: inline-block; min-width: 15px; text-align: center;
+  background: var(--hl); color: #fff; font: 600 9px/1.6 var(--mono);
+  border-radius: 3px; padding: 0 3px; }
+.changed .num.off { background: var(--warning); }
+.changed b { font-weight: 600; white-space: nowrap; }
+.changed .why { color: var(--faint); }
+.hl-legend { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+.hl-legend .swatch { width: 22px; height: 0; border-top: 2px solid var(--hl); display: inline-block; }
+
+/* Across the deck. Given its own block at the top rather than a line per
+   slide, because a mismatch is about the pair and reading it twice, once
+   under each slide, is how it reads as two separate small problems. */
+.across { margin: 22px 0 4px; padding: 14px 16px 16px;
+  border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface); }
+.across h2 { font-size: 11px; letter-spacing: .07em; text-transform: uppercase; color: var(--faint); }
+.across ul { margin: 10px 0 0; padding: 0; list-style: none; font-size: 12.5px; }
+.across li { display: grid; grid-template-columns: 86px 1fr; gap: 10px; padding: 6px 0;
+  border-bottom: 1px solid var(--line); align-items: start; }
+.across li:last-child { border-bottom: 0; }
+.across .kind { font-family: var(--mono); font-size: 10.5px; color: var(--muted);
+  text-transform: uppercase; letter-spacing: .04em; padding-top: 2px; }
+.across .where { color: var(--faint); }
+.across .head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.across .say { color: var(--faint); font-size: 11.5px; margin-top: 2px; }
+.across .tickline { display: inline-flex; align-items: center; gap: 6px; }
+.across .tickline input { width: 14px; height: 14px; accent-color: var(--ink); cursor: pointer; }
+.across .where a { color: var(--muted); text-decoration: none; border-bottom: 1px solid var(--line-strong); }
+.across .where a:hover { color: var(--ink); }
+
+/* The notes nothing can act on. Deliberately not quiet: dropping these
+   silently is how a slide with an empty column goes to a client. */
+.manual { margin-top: 12px; padding: 10px 14px; border-left: 3px solid var(--warning); background: var(--surface); border-radius: 0 8px 8px 0; }
+.manual h3 { font-size: 11px; letter-spacing: .07em; text-transform: uppercase; color: var(--warning); }
+.manual ul { margin: 6px 0 0; padding-left: 18px; font-size: 12.5px; line-height: 1.65; }
+.manual li { margin-bottom: 4px; }
+.manual .say { display: block; color: var(--faint); font-size: 11.5px; }
+.dead { color: var(--faint); font-size: 12px; margin-top: 10px; }
+
+.empty { margin-top: 34px; padding-top: 18px; border-top: 1px solid var(--line-strong); color: var(--muted); }
+.hidden { display: none !important; }
+.runlog { margin-top: 26px; font-size: 12px; }
+.runlog summary { cursor: pointer; color: var(--faint); list-style: none; width: fit-content; }
+.runlog summary::-webkit-details-marker { display: none; }
+.runlog pre {
+  font-family: var(--mono); font-size: 11.5px; line-height: 1.6;
+  background: var(--surface); border: 1px solid var(--line);
+  border-radius: 8px; padding: 12px 14px; margin: 10px 0 0;
+  overflow-x: auto; white-space: pre-wrap; color: var(--muted);
+}
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Design check</h1>
+    <p>Render every slide, and ask the model what it looks like.
+       <a class="elsewhere" href="/">&larr; Deck check</a></p>
+  </header>
+
+  <section class="inputs">
+    <div class="drop" id="drop-deck" data-kind="deck">
+      <span class="drop-label">Deck</span>
+      <span class="drop-hint">Drop the deck to look at, or <u>browse</u></span>
+      <ul class="files"></ul>
+      <input type="file" accept=".pptx">
+    </div>
+  </section>
+
+  <div class="controls">
+    <label class="field">
+      <span>Model</span>
+      <input type="text" id="model" spellcheck="false">
+    </label>
+    <label class="field">
+      <span>Effort</span>
+      <select id="effort">
+        <option>low</option><option>medium</option><option>high</option>
+        <option>xhigh</option><option>max</option>
+      </select>
+    </label>
+    <label class="field">
+      <span>Slides</span>
+      <input type="text" id="slides" spellcheck="false" placeholder="all">
+    </label>
+    <button class="run" id="run" disabled>Run design check</button>
+  </div>
+  <p class="note" id="setup-note"></p>
+
+  <div class="status" id="status"></div>
+  <div id="results"></div>
+</main>
+
+<script>
+"use strict";
+
+const state = {
+  ctx: null,
+  deck: null,
+  result: null,      // the check
+  session: null,
+  ticked: new Set(), // "<slide>:<ref>" of the font steps the designer wants
+  applied: null,     // the last apply
+  showOk: false,     // list the shapes the model had nothing to say about
+  marks: true,       // draw the boxes over the pair of renders
+  // Write everything this tool cannot correct into the deck as comments. On
+  // by default: a task nobody can act on where the work happens is a task
+  // that does not get done.
+  fileRest: true,
+  busy: false,
+  // Renders the page has been given since the last apply, by slide number.
+  // A re-render answers with new URLs for one slide, and they have to survive
+  // the next paint of the page or the picture reverts to the cached one the
+  // designer had just asked to replace.
+  shots: {},
+};
+
+const $ = (sel) => document.querySelector(sel);
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const kb = (n) => n < 1e6 ? `${Math.round(n / 1024)} KB` : `${(n / 1e6).toFixed(1)} MB`;
+const keyOf = (v) => `${v.slide}:${v.ref}`;
+
+/* ---------------- boot ---------------- */
+
+async function boot() {
+  try {
+    state.ctx = await (await fetch("/api/context")).json();
+  } catch (err) {
+    return setStatus(`Could not reach the server: ${esc(err.message)}`, "err");
+  }
+  $("#model").value = state.ctx.defaults.model;
+  $("#effort").value = state.ctx.defaults.effort;
+
+  // Said before the upload rather than after the run. Both of these make the
+  // check impossible rather than weaker, and a designer who learns that after
+  // sending a 25MB deck has waited for nothing.
+  const notes = [];
+  if (!state.ctx.renderer) {
+    notes.push("No renderer on this machine, so there is nothing to look at: " +
+               "the design check needs PowerPoint and <code>pywin32</code> on Windows.");
+  }
+  if (!state.ctx.api_key) {
+    notes.push("No <code>GEMINI_API_KEY</code> in the environment, so the model cannot be asked.");
+  }
+  $("#setup-note").innerHTML = notes.join(" ");
+}
+
+/* ---------------- the file ---------------- */
+
+function wireDrop(el) {
+  const input = el.querySelector("input[type=file]");
+  el.addEventListener("click", (e) => {
+    if (e.target === input || e.target.closest(".x")) return;
+    input.click();
+  });
+  input.addEventListener("change", () => { accept(input.files); input.value = ""; });
+  el.addEventListener("dragover", (e) => { e.preventDefault(); el.classList.add("over"); });
+  el.addEventListener("dragleave", (e) => {
+    if (!el.contains(e.relatedTarget)) el.classList.remove("over");
+  });
+  el.addEventListener("drop", (e) => {
+    e.preventDefault();
+    el.classList.remove("over");
+    accept(e.dataTransfer.files);
+  });
+}
+
+function accept(fileList) {
+  const files = [...fileList].filter((f) => f.name.toLowerCase().endsWith(".pptx"));
+  if (files.length !== fileList.length) {
+    setStatus("Ignored what is not a .pptx: only PowerPoint decks can be rendered.", "err");
+  }
+  if (!files.length) return;
+  state.deck = files[0];
+  renderFiles();
+}
+
+function renderFiles() {
+  const el = $("#drop-deck");
+  const files = state.deck ? [state.deck] : [];
+  el.classList.toggle("filled", files.length > 0);
+  el.querySelector(".drop-hint").classList.toggle("hidden", files.length > 0);
+  el.querySelector(".files").innerHTML = files.map((f) => `
+    <li>
+      <span>${esc(f.name)}</span>
+      <span class="size">${kb(f.size)}</span>
+      <button class="x" title="Remove">&times;</button>
+    </li>`).join("");
+  $("#run").disabled = !state.deck;
+}
+
+document.addEventListener("click", (e) => {
+  if (!e.target.closest(".x")) return;
+  e.stopPropagation();
+  state.deck = null;
+  renderFiles();
+});
+
+/* ---------------- run ---------------- */
+
+function setStatus(html, cls = "") {
+  const el = $("#status");
+  el.className = `status ${cls}`;
+  el.innerHTML = html;
+}
+
+/* A status line that counts up without restarting its own spinner. The whole
+ * line is written once and only the seconds are rewritten -- assigning
+ * innerHTML on every tick throws the spinner element away and a new element
+ * starts its animation at zero, which reads as an animation that is stuck. */
+function startTicking(label) {
+  const started = Date.now();
+  setStatus(`<span class="spinner"></span>${label}&hellip; <span class="elapsed">0s</span>`);
+  const tick = setInterval(() => {
+    const elapsed = $("#status .elapsed");
+    if (!elapsed) return;
+    elapsed.textContent = `${((Date.now() - started) / 1000).toFixed(0)}s`;
+  }, 200);
+  return () => clearInterval(tick);
+}
+
+/* "3, 7, 11-14" as [3, 7, 11, 12, 13, 14]. A design check is one model call a
+ * slide, so looking at six slides of a ninety-slide deck is the ordinary way
+ * to use this, not an optimisation. */
+function slideNumbers(text) {
+  const out = new Set();
+  for (const part of String(text || "").split(",")) {
+    const range = part.trim().match(/^(\d+)\s*-\s*(\d+)$/);
+    const one = part.trim().match(/^\d+$/);
+    if (range) {
+      const [from, to] = [Number(range[1]), Number(range[2])].sort((a, b) => a - b);
+      for (let n = from; n <= to; n++) out.add(n);
+    } else if (one) {
+      out.add(Number(part.trim()));
+    }
+  }
+  return [...out].sort((a, b) => a - b);
+}
+
+async function runCheck() {
+  if (!state.deck || state.busy) return;
+
+  const form = new FormData();
+  form.append("deck", state.deck, state.deck.name);
+  form.append("options", JSON.stringify({
+    model: $("#model").value,
+    effort: $("#effort").value,
+    slides: slideNumbers($("#slides").value),
+  }));
+
+  state.busy = true;
+  $("#run").disabled = true;
+  $("#results").innerHTML = "";
+  state.ticked.clear();
+  state.applied = null;
+  const stopTicking = startTicking("Rendering the deck and asking the model");
+
+  try {
+    const response = await fetch("/api/qa/check", { method: "POST", body: form });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || data.error || `HTTP ${response.status}`);
+    state.result = data;
+    state.session = data.session;
+    // Every correction starts ticked. The list is the model's answer to a
+    // question that was asked on purpose, and a designer reads it by taking
+    // things off rather than by putting them on.
+    for (const task of fixable()) state.ticked.add(task.id);
+    setStatus("");
+    render();
+  } catch (err) {
+    setStatus(`<b>The check failed.</b> ${esc(err.message)}`, "err");
+  } finally {
+    stopTicking();
+    state.busy = false;
+    $("#run").disabled = false;
+  }
+}
+
+/* ---------------- reading the result ---------------- */
+
+const report = () => state.result?.report || null;
+const slides = () => report()?.slides || [];
+const verdicts = () => slides().flatMap((s) => s.shapes || []);
+// Every finding, as a piece of work. The server builds this list so the page
+// and the deck agree on what is outstanding.
+const tasks = () => report()?.tasks || [];
+const taskFor = (id) => tasks().find((t) => t.id === id) || null;
+const fixable = () => tasks().filter((t) => t.fixable);
+function render() {
+  const data = report();
+  if (!data) return;
+  $("#results").innerHTML = [
+    summaryHTML(data),
+    noticesHTML(),
+    acrossHTML(),
+    applyBarHTML(),
+    appliedHTML(),
+    previewHTML(),
+    slides().map(slideHTML).join("") || emptyHTML(),
+    logHTML(state.result.logs),
+  ].join("");
+  wire();
+}
+
+function summaryHTML(data) {
+  const s = data.stats;
+  const meta = [
+    esc(data.deck),
+    `${s.reviewed} of ${s.slides} slide(s) looked at`,
+    `<code>${esc(data.model)}</code>`,
+    `${state.result.elapsed_s}s`,
+  ];
+  return `
+  <section class="summary">
+    <div class="summary-line">
+      <span class="count">${s.tasks ?? s.issues}</span>
+      <span>task(s) &mdash; ${s.actions} this tool can do${
+        s.mismatches ? `, ${s.mismatches} of them across slides` : ""}</span>
+      <span class="meta">${meta.join(" &middot; ")}</span>
+    </div>
+    <div class="toolbar">
+      <button class="linkish ${state.showOk ? "on" : ""}" id="show-ok">
+        ${state.showOk ? "Hide" : "Show"} the ${s.shapes - s.issues} shape(s) it passed
+      </button>
+    </div>
+  </section>`;
+}
+
+function noticesHTML() {
+  const out = [];
+  const why = report().reason;
+  if (why) {
+    out.push(`<div class="notice bad"><div><b>The check did not run.</b>
+      <p>${esc(why)}</p></div></div>`);
+  }
+  // A slide the model declined is not a slide with nothing wrong with it, and
+  // the page has to be able to tell the designer which it is looking at.
+  const declined = slides().filter((s) => !s.reviewed);
+  if (declined.length && !why) {
+    out.push(`<div class="notice warn"><div>
+      <b>${declined.length} slide(s) were not looked at.</b>
+      <p>${esc(declined.map((s) => `slide ${s.slide}: ${s.reason}`).slice(0, 3).join("; "))}</p>
+    </div></div>`);
+  }
+  const errors = (state.result.logs || []).filter((r) => r.level === "error");
+  if (errors.length) {
+    out.push(`<div class="notice bad"><div><b>Something failed during the run.</b>
+      <p>${esc(errors[0].message)}</p></div></div>`);
+  }
+  return out.join("");
+}
+
+/* What the per-slide pass cannot see by construction: a title 4% lower than on
+   every other slide looks perfectly placed on its own. */
+function acrossHTML() {
+  const issues = report().deck_issues || [];
+  const why = report().consistency_reason;
+  if (!issues.length && !why) return "";
+  return `
+  <section class="across">
+    <h2>Across the deck</h2>
+    ${issues.length ? `<ul>${issues.map((d, i) => {
+      const task = taskFor(`deck:${i}`);
+      const tickable = Boolean(task && task.fixable);
+      return `
+      <li>
+        <span class="kind">${esc(d.kind.replace("_", " "))}</span>
+        <div>
+          <div class="head">
+            ${tickable
+              ? `<label class="tickline"><input type="checkbox"
+                   data-key="deck:${i}" ${state.ticked.has(`deck:${i}`) ? "checked" : ""}>
+                 <span class="chip-issue step">align it to the deck</span></label>`
+              : ""}
+            <span>${esc((task && task.what) || d.note)}</span>
+          </div>
+          ${d.task && d.note && d.note !== d.task
+            ? `<div class="say">${esc(d.note)}</div>` : ""}
+          <div class="where">${d.slides.map((n) =>
+            `<a href="#slide-${n}">slide ${n}</a>`).join(", ")}</div>
+        </div>
+      </li>`; }).join("")}</ul>`
+      : `<p class="dead">Nothing here: the slides agree with each other.</p>`}
+    ${why ? `<p class="dead">${esc(why)}</p>` : ""}
+  </section>`;
+}
+
+/* ---------------- applying ---------------- */
+
+function applyBarHTML() {
+  const all = tasks();
+  if (!all.length) return "";
+  const canFix = fixable().length;
+  const byHand = all.length - canFix;
+  const n = state.ticked.size;
+  return `
+  <section class="applybar">
+    <div class="applybar-line">
+      <b>${all.length} task(s)</b> &mdash; ${canFix} this tool can do
+      ${byHand ? `and ${byHand} for a designer` : ""}.
+      ${canFix ? `Corrections are bounded: type moves one notch, a box widens
+        only into free space, and anything that stops fitting is put back.` : ""}
+    </div>
+    <div class="applybar-actions">
+      ${canFix ? `<button class="linkish" id="tick-all">Tick all</button>
+      <button class="linkish" id="tick-none">Clear</button>` : ""}
+      <label class="reb">
+        <input type="checkbox" id="file-rest" ${state.fileRest ? "checked" : ""}>
+        write the rest into the deck as comments
+      </label>
+      <span class="grow"></span>
+      <button id="apply" ${n || state.fileRest ? "" : "disabled"}>${
+        n ? `Apply ${n}` : "Write the tasks in"}</button>
+    </div>
+  </section>`;
+}
+
+function appliedHTML() {
+  const done = state.applied;
+  if (!done) return "";
+  const applied = done.applied || [];
+  const skipped = done.skipped || [];
+  const head = applied.length
+    ? `${applied.length} correction(s) made`
+    : "No correction was made";
+  // Said in the same breath as the corrections, because it is the other half
+  // of the same round: what was done, and what is now waiting in the deck for
+  // somebody to do.
+  const filed = done.comments_asked
+    ? (done.comments_written
+        ? `${done.comments_written} task(s) written into the deck as comments`
+        : `the remaining tasks could not be written in (PowerPoint is needed
+           for comments); they are listed below`)
+    : "";
+  return `
+  <section class="applied">
+    <div class="applied-head">
+      <b>${head}</b>
+      ${filed ? `<span class="dim">&middot; ${filed}</span>` : ""}
+      <span class="grow"></span>
+      ${done.download
+        ? `<a class="linkish" href="${esc(done.download)}">Download the deck</a>`
+        : ""}
+    </div>
+    ${applied.length ? `<ul class="applied-list">${applied.map((a) => `
+      <li>slide ${a.slide} &middot; ${esc(a.shape)} &mdash; ${esc(a.detail)}</li>`).join("")}
+    </ul>` : ""}
+    ${skipped.length ? `<ul class="applied-list dim">${skipped.map((sk) => `
+      <li class="dim">slide ${sk.slide} &middot; ${esc(sk.shape)} &mdash; not taken:
+        ${esc(sk.reason)}</li>`).join("")}
+    </ul>` : ""}
+    ${done.reason ? `<p class="dead">${esc(done.reason)}</p>` : ""}
+    ${outstandingHTML(done)}
+  </section>`;
+}
+
+/* What a round leaves behind. Three things end up here and they are the same
+   thing to whoever picks the deck up next: what nothing can correct, what was
+   not ticked, and what was ticked and refused. The third is the one a page
+   loses -- off the tick list, absent from the changes, nowhere. */
+function outstandingHTML(done) {
+  const left = done.outstanding || [];
+  if (!left.length) {
+    return `<p class="dead">Nothing is outstanding: every task on this deck
+      has been done.</p>`;
+  }
+  return `
+  <details class="left-over" ${left.length <= 6 ? "open" : ""}>
+    <summary>${left.length} task(s) still to do${
+      done.comments_written ? ", each one a comment in the deck" : ""}</summary>
+    <ul class="applied-list">
+      ${left.map((task) => `
+        <li>${task.slide ? `slide ${task.slide} &middot; ` : ""}
+          ${task.shape ? `<b>${esc(task.shape)}</b> &mdash; ` : ""}
+          ${esc(task.what)}</li>`).join("")}
+    </ul>
+  </details>`;
+}
+
+async function applyTicked() {
+  if (!state.session || state.busy) return;
+  const stopTicking = startTicking(
+    state.ticked.size
+      ? "Correcting the deck and rendering what changed"
+      : "Writing the tasks into the deck"
+  );
+  state.busy = true;
+  try {
+    const response = await fetch("/api/qa/apply", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session: state.session,
+        fix: [...state.ticked],
+        notes: state.fileRest,
+      }),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || data.error || `HTTP ${response.status}`);
+    state.applied = data;
+    // Every picture the page was holding is of a deck that no longer exists:
+    // the corrected file has just been written again from the original.
+    state.shots = {};
+    setStatus("");
+    render();
+  } catch (err) {
+    setStatus(`<b>Applying failed.</b> ${esc(err.message)}`, "err");
+  } finally {
+    stopTicking();
+    state.busy = false;
+  }
+}
+
+/* ---------------- before and after ---------------- */
+
+/* One block per slide something was actually done to.
+ *
+ * ONLY SLIDES THAT CHANGED. A slide whose every step was refused would show
+ * two identical pictures, and two identical pictures read as a tool that did
+ * nothing rather than as a tool that declined to do something -- the refusal
+ * is in the list above, in words, where it can say why.
+ */
+function previewHTML() {
+  const done = state.applied;
+  if (!done || !(done.applied || []).length) return "";
+  const pairs = (done.slides || []).filter((row) => row.after);
+  if (!pairs.length) {
+    return `<p class="dead">The deck was written, but its slides could not be
+      rendered again, so there is nothing to compare. The download above is
+      still the corrected deck.</p>`;
+  }
+  return `
+  <section class="preview">
+    <div class="preview-head">
+      <h2>Before and after</h2>
+      <span class="dim">${pairs.length} slide(s) &middot; ${done.applied.length} step(s)</span>
+      <span class="grow"></span>
+      <label class="hl-legend">
+        <input type="checkbox" id="mark-toggle" ${state.marks ? "checked" : ""}>
+        <span class="swatch"></span> mark what changed
+      </label>
+    </div>
+    ${pairs.map(pairHTML).join("")}
+  </section>`;
+}
+
+function pairHTML(row) {
+  const changes = (state.applied.applied || [])
+    .filter((c) => c.slide === row.slide)
+    .map((c, i) => ({ ...c, n: i + 1 }));
+  const refused = (state.applied.skipped || []).filter((sk) => sk.slide === row.slide);
+  // The boxes come from the verdicts the steps were taken from, so the mark on
+  // the picture and the line under it are the same claim. A step whose verdict
+  // carried no box is listed without one rather than drawn somewhere plausible.
+  const marks = state.marks
+    ? changes.map((c) => ({ ...c, box: boxFor(row.slide, c.shape_id) }))
+              .filter((c) => c.box)
+    : [];
+  const shown = state.shots[row.slide] || row;
+
+  return `
+  <div class="pair-block" id="pair-${row.slide}">
+    <div class="slide-bar">
+      <b>Slide ${row.slide}</b>
+      <span class="dim">${changes.length} step(s) taken${
+        refused.length ? `, ${refused.length} refused` : ""}</span>
+      <span class="grow"></span>
+      <button class="linkish rerender" data-slide="${row.slide}">Re-render</button>
+    </div>
+    <div class="shots pair">
+      ${shotHTML(shown.before, marks, "before")}
+      ${shotHTML(shown.after, marks, "after")}
+    </div>
+    <ul class="changed">
+      ${changes.map((c) => `
+        <li><span class="num">${c.n}</span>
+          <b>${esc(c.shape)}</b>
+          <span>${esc(c.detail)}</span></li>`).join("")}
+      ${refused.map((sk) => `
+        <li><span class="num off">&times;</span>
+          <b>${esc(sk.shape)}</b>
+          <span class="why">not taken: ${esc(sk.reason)}</span></li>`).join("")}
+    </ul>
+  </div>`;
+}
+
+/* Where a stepped shape sits, taken off the verdict that named it. Font steps
+   do not move a box, so the same rectangle is right on both pictures. */
+function boxFor(slide, shapeId) {
+  const row = slides().find((s) => s.slide === slide);
+  const verdict = (row?.shapes || []).find((v) => v.shape_id === shapeId);
+  return verdict?.box || null;
+}
+
+async function rerender(slide, button) {
+  if (state.busy) return;
+  const label = button.textContent;
+  button.disabled = true;
+  button.textContent = "Rendering\u2026";
+  try {
+    const response = await fetch("/api/qa/render", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session: state.session, slides: [slide], force: true }),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || data.error || `HTTP ${response.status}`);
+    for (const row of data.slides || []) state.shots[row.slide] = row;
+    render();
+  } catch (err) {
+    button.disabled = false;
+    button.textContent = label;
+    setStatus(`<b>Could not render slide ${slide} again.</b> ${esc(err.message)}`, "err");
+  }
+}
+
+/* ---------------- one slide ---------------- */
+
+function slideHTML(slide) {
+  const shown = (slide.shapes || []).filter(
+    (v) => state.showOk || v.status === "issue");
+  if (!shown.length && !(slide.slide_issues || []).length && !slide.reason) return "";
+
+  const shot = state.shots[slide.slide] || {};
+  const before = shot.before
+    || (state.result.slides || []).find((s) => s.slide === slide.slide)?.before;
+  // Numbered in the order they are listed, so a box on the picture and a line
+  // in the list below it carry the same number. The number is the only thing
+  // tying a verdict to a place on the slide.
+  const marks = shown.map((v, i) => ({ ...v, n: i + 1 }));
+  // The corrected render lives in "Before and after" above, next to the
+  // change it is evidence for. Repeating it here would put the same picture
+  // on the page twice, once beside what the model said and once beside what
+  // was done, and leave a designer to work out that they are the same slide.
+  const changed = (state.applied?.applied || []).some((c) => c.slide === slide.slide);
+
+  return `
+  <section class="slide-block" id="slide-${slide.slide}">
+    <div class="slide-bar">
+      <b>Slide ${slide.slide}</b>
+      <span class="dim">${marks.filter((m) => m.status === "issue").length} to look at</span>
+      <span class="grow"></span>
+      ${changed
+        ? `<a class="linkish" href="#pair-${slide.slide}">See before and after</a>`
+        : ""}
+    </div>
+    <div class="shots">
+      ${shotHTML(before, marks.filter((m) => m.status === "issue"), "")}
+    </div>
+    ${marks.length ? `<ul class="verdicts">${marks.map(verdictHTML).join("")}</ul>` : ""}
+    ${manualHTML(slide)}
+    ${slide.reason ? `<p class="dead">Not looked at: ${esc(slide.reason)}</p>` : ""}
+  </section>`;
+}
+
+function shotHTML(src, marks, label) {
+  if (!src) return `<div class="shot"><span>${esc(label || "")}</span>
+    <p class="dead">No render for this slide.</p></div>`;
+  return `
+  <div class="shot">
+    ${label ? `<span>${esc(label)}</span>` : ""}
+    <div class="frame">
+      <img src="${esc(src)}" alt="slide render" loading="lazy">
+      ${marks.filter((m) => m.box).map(markHTML).join("")}
+    </div>
+  </div>`;
+}
+
+function markHTML(mark) {
+  const [left, top, width, height] = mark.box;
+  const high = top < 0.06;   // no room above for the label
+  // Clipped to the picture, because a shape half off the slide is a real
+  // thing to mark and the half that is on it is the half worth drawing.
+  const clamp = (v) => Math.max(0, Math.min(1, v));
+  // Three decimals: percentages of an image that is itself a percentage of the
+  // page, so the difference between 5.4% and 5.399999999999999% is nothing a
+  // browser can draw, and the second is what a raw float prints as.
+  const pc = (v) => `${(v * 100).toFixed(3)}%`;
+  const style = [
+    `left:${pc(clamp(left))}`,
+    `top:${pc(clamp(top))}`,
+    `width:${pc(clamp(left + width) - clamp(left))}`,
+    `height:${pc(clamp(top + height) - clamp(top))}`,
+  ].join(";");
+  const kind = [mark.executable ? "step" : "", high ? "high" : ""]
+    .filter(Boolean).join(" ");
+  return `<span class="hl ${kind}" style="${style}"><b>${mark.n}</b></span>`;
+}
+
+/* One finding, as work.
+ *
+ * THE INSTRUCTION LEADS. The first version of this row put what the model saw
+ * first and what to do about it nowhere, which reads as a complaint rather
+ * than as a task -- and a designer with forty complaints does the four that
+ * have tick boxes and closes the tab. What it saw is still here, under the
+ * instruction, because a designer who disagrees with the finding needs to see
+ * what it rests on.
+ *
+ * A TICK ONLY WHERE TICKING IT DOES THE WORK. Everything else carries the way
+ * it will be handed over instead: filed into the deck as a comment.
+ */
+function verdictHTML(v) {
+  const key = keyOf(v);
+  const task = taskFor(key);
+  const tickable = Boolean(task && task.fixable);
+  return `
+  <li class="verdict ${v.status} ${tickable ? "step" : ""}">
+    <span class="tick">${tickable
+      ? `<input type="checkbox" data-key="${esc(key)}"
+          ${state.ticked.has(key) ? "checked" : ""}>`
+      : `<span class="byhand" title="a designer does this one">&bull;</span>`}</span>
+    <span class="num">${v.n}</span>
+    <div>
+      <div class="head">
+        <span class="what">${esc(v.shape)}</span>
+        <span class="role">${esc(v.role)}</span>
+        ${v.issue ? `<span class="chip-issue ${tickable ? "step" : ""}">${esc(v.issue)}</span>` : ""}
+        ${tickable ? `<span class="chip-issue step">${esc(opWords(task.op))}</span>` : ""}
+      </div>
+      ${task && task.what ? `<div class="todo">${esc(task.what)}</div>` : ""}
+      ${v.note ? `<div class="say">${esc(v.note)}</div>` : ""}
+    </div>
+  </li>`;
+}
+
+/* What the correction will do, in words rather than in the schema's verb. */
+function opWords(op) {
+  return {
+    grow: "step the type up",
+    shrink: "step the type down",
+    center: "centre it in its holder",
+    widen: "widen the box",
+    align: "align it to the deck",
+  }[op] || op;
+}
+
+/* The bucket nothing can act on. It is shown at full weight on purpose: an
+   unused timeline stop and an empty column are exactly the defects a font
+   step cannot touch, and dropping them quietly is how one reaches a client. */
+function manualHTML(slide) {
+  const lines = slide.slide_issues || [];
+  if (!lines.length) return "";
+  return `
+  <div class="manual">
+    <h3>For a designer, on this slide</h3>
+    <ul>${lines.map((line) => `
+      <li>${esc(line.task || line.note)}
+        ${line.task && line.note && line.note !== line.task
+          ? `<span class="say">${esc(line.note)}</span>` : ""}
+      </li>`).join("")}</ul>
+  </div>`;
+}
+
+/* A clean deck and a deck nobody looked at produce the same empty list, so
+   the empty state has to say which of the two this is. */
+function emptyHTML() {
+  const s = report().stats;
+  if (!s.reviewed) {
+    return `<p class="empty">No slide was looked at, so there is nothing to
+      show. The reason is above.</p>`;
+  }
+  if ((report().deck_issues || []).length) {
+    return `<p class="empty">No slide has a problem of its own. What is above
+      is where they disagree with each other.</p>`;
+  }
+  return `<p class="empty">Nothing to change: the model passed every shape on
+    ${s.reviewed} slide(s) and had no note about any of them. Press
+    <b>Show the ${s.shapes - s.issues} shape(s) it passed</b> to read what it
+    looked at.</p>`;
+}
+
+function logHTML(logs) {
+  if (!logs || !logs.length) return "";
+  const text = logs.map((r) => `${r.level.padEnd(7)} ${r.logger}: ${r.message}`).join("\n");
+  return `<details class="runlog"><summary>Run log (${logs.length} lines)</summary>
+    <pre>${esc(text)}</pre></details>`;
+}
+
+/* ---------------- wiring ---------------- */
+
+function wire() {
+  const showOk = $("#show-ok");
+  if (showOk) showOk.addEventListener("click", () => { state.showOk = !state.showOk; render(); });
+
+  const all = $("#tick-all");
+  if (all) all.addEventListener("click", () => {
+    for (const task of fixable()) state.ticked.add(task.id);
+    render();
+  });
+  const rest = $("#file-rest");
+  if (rest) rest.addEventListener("change", () => {
+    state.fileRest = rest.checked;
+    render();
+  });
+  const none = $("#tick-none");
+  if (none) none.addEventListener("click", () => { state.ticked.clear(); render(); });
+
+  const apply = $("#apply");
+  if (apply) apply.addEventListener("click", applyTicked);
+
+  const marks = $("#mark-toggle");
+  if (marks) marks.addEventListener("change", () => {
+    state.marks = marks.checked;
+    render();
+  });
+  for (const button of document.querySelectorAll(".rerender")) {
+    button.addEventListener("click", () =>
+      rerender(Number(button.dataset.slide), button));
+  }
+
+  // Every tick box that names a task, wherever it sits: beside a shape on a
+  // slide, or beside a mismatch under Across the deck. The selector used to
+  // name one of the two, so the deck-level corrections could be seen and not
+  // chosen.
+  for (const box of document.querySelectorAll("input[type=checkbox][data-key]")) {
+    box.addEventListener("change", () => {
+      const key = box.dataset.key;
+      if (box.checked) state.ticked.add(key); else state.ticked.delete(key);
+      // Only the button changes; re-rendering the whole result would scroll a
+      // designer away from the slide they are reading.
+      const button = $("#apply");
+      if (button) {
+        const n = state.ticked.size;
+        button.textContent = n ? `Apply ${n}` : "Write the tasks in";
+        button.disabled = !n && !state.fileRest;
+      }
+    });
+  }
+}
+
+wireDrop($("#drop-deck"));
+$("#run").addEventListener("click", runCheck);
+boot();
+</script>
+</body>
+</html>

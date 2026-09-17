@@ -45,6 +45,14 @@ log = logging.getLogger(__name__)
 DEFAULT_WIDTH = 1280
 DEFAULT_HEIGHT = 720
 
+# What the design check renders at, which is bigger on purpose. That review is
+# one slide per call and the whole question is what the slide LOOKS like, so
+# the model wants every pixel it can be given: 1568 is the long edge past
+# which a picture is downsized before it is looked at, and 1536x864 is the
+# largest 16:9 frame under it. The validation layer stays at 1280 -- see above
+# for the measurement that keeps it there.
+DESIGN_QA_SIZE = (1536, 864)
+
 
 @dataclass
 class SlideImages:
@@ -117,6 +125,16 @@ class PowerPointRenderer:
 
     name = "powerpoint"
 
+    def __init__(self, size: Optional[tuple[int, int]] = None) -> None:
+        """`size` is the pixel frame to export into, long edge first.
+
+        A renderer rather than a caller decides this because PowerPoint is
+        told the size at export time and nothing downstream can change it
+        afterwards. The default is what the validation layer has always sent;
+        the design check asks for `DESIGN_QA_SIZE`.
+        """
+        self.width, self.height = size or (DEFAULT_WIDTH, DEFAULT_HEIGHT)
+
     @property
     def available(self) -> bool:
         return powerpoint.available()
@@ -133,20 +151,28 @@ class PowerPointRenderer:
     ) -> dict[int, Path]:
         out.mkdir(parents=True, exist_ok=True)
         powerpoint.run(
-            lambda app: _export(app, deck, out, slides), timeout=self.TIMEOUT_S
+            lambda app: _export(app, deck, out, slides, (self.width, self.height)),
+            timeout=self.TIMEOUT_S,
         )
         return _collect(out)
 
 
-def _export(app, deck: Path, out: Path, slides: Optional[list[int]] = None) -> None:
+def _export(
+    app,
+    deck: Path,
+    out: Path,
+    slides: Optional[list[int]] = None,
+    size: Optional[tuple[int, int]] = None,
+) -> None:
     # A backslash path: PowerPoint reads a forward-slash path containing spaces
     # as a URL and cannot find it. `resolve` gives the native form.
     presentation = app.Presentations.Open(
         str(deck.resolve()), ReadOnly=True, WithWindow=False
     )
+    width, height = size or (DEFAULT_WIDTH, DEFAULT_HEIGHT)
     try:
-        if not _export_some(presentation, out, slides):
-            presentation.Export(str(out), "PNG", DEFAULT_WIDTH, DEFAULT_HEIGHT)
+        if not _export_some(presentation, out, slides, (width, height)):
+            presentation.Export(str(out), "PNG", width, height)
     except Exception:
         powerpoint.quietly(presentation.Close)  # the export failure is the interesting one
         raise
@@ -156,7 +182,12 @@ def _export(app, deck: Path, out: Path, slides: Optional[list[int]] = None) -> N
     presentation.Close()
 
 
-def _export_some(presentation, out: Path, slides: Optional[list[int]]) -> bool:
+def _export_some(
+    presentation,
+    out: Path,
+    slides: Optional[list[int]],
+    size: Optional[tuple[int, int]] = None,
+) -> bool:
     """Export just these slides, or say it did not.
 
     False rather than an exception, because the caller's answer to both "not
@@ -179,7 +210,7 @@ def _export_some(presentation, out: Path, slides: Optional[list[int]]) -> bool:
         for number in wanted:
             target = out / f"Slide{number}.PNG"
             presentation.Slides(number).Export(
-                str(target), "PNG", DEFAULT_WIDTH, DEFAULT_HEIGHT
+                str(target), "PNG", *(size or (DEFAULT_WIDTH, DEFAULT_HEIGHT))
             )
             written.append(target)
     except Exception:
@@ -281,8 +312,9 @@ def _explain(exc: Exception, deck: Path, directory: Path) -> str:
     return f"rendering failed: {exc}"
 
 
-def available_renderer() -> Renderer:
-    for renderer in (PowerPointRenderer(),):
+def available_renderer(size: Optional[tuple[int, int]] = None) -> Renderer:
+    """The renderer this host has, exporting at `size` where it can honour it."""
+    for renderer in (PowerPointRenderer(size),):
         if renderer.available:
             return renderer
     return NullRenderer()

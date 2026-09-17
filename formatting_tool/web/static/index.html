@@ -4,48 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Deck check</title>
+<link rel="stylesheet" href="/static/tokens.css">
 <style>
-:root {
-  --bg: #FAFAF9;
-  --surface: #FFFFFF;
-  --ink: #17191C;
-  --muted: #6E7278;
-  --faint: #9A9EA4;
-  --line: #E5E5E1;
-  --line-strong: #D3D3CE;
-  --accent: #1F2A44;
-  --accent-ink: #FFFFFF;
-  --tint: #F0F1F4;
-  --blocker: #A11B2B;
-  --error: #B4531A;
-  --warning: #8A6A12;
-  --info: #5A6472;
-  /* The change highlight. Deliberately not a brand or a severity colour: it
-     is drawn on top of a client's slide and has to read as the tool's mark
-     rather than as part of the design. */
-  --hl: #00A3B4;
-  --mono: ui-monospace, "Cascadia Mono", "SF Mono", Menlo, Consolas, monospace;
-}
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #0F1114;
-    --surface: #16191D;
-    --ink: #E9EAEC;
-    --muted: #979DA5;
-    --faint: #6C737C;
-    --line: #24282E;
-    --line-strong: #333941;
-    --accent: #E9EAEC;
-    --accent-ink: #0F1114;
-    --tint: #1D2127;
-    --blocker: #F1707C;
-    --error: #F0975A;
-    --warning: #DCB53F;
-    --info: #93A0B1;
-    --hl: #22C7D8;
-  }
-}
-
 * { box-sizing: border-box; }
 html { -webkit-text-size-adjust: 100%; }
 body {
@@ -65,6 +25,10 @@ button { font: inherit; color: inherit; cursor: pointer; }
 header { margin-bottom: 34px; }
 header h1 { font-size: 19px; }
 header p { margin: 5px 0 0; color: var(--muted); font-size: 13px; }
+/* The way to the other page. Quiet: it is a second tool, not a second half
+   of this one, and a designer who wants it knows it is there. */
+header .elsewhere { color: var(--muted); margin-left: 6px; }
+header .elsewhere:hover { color: var(--ink); }
 
 /* ---------- drop zones ---------- */
 .inputs { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
@@ -451,7 +415,8 @@ details.advanced[open] summary::before { content: "\2212  "; }
 <main>
   <header>
     <h1>Deck check</h1>
-    <p>Validate a deck against its master and brand guidelines.</p>
+    <p>Validate a deck against its master and brand guidelines.
+       <a class="elsewhere" href="/qa">Design check &rarr;</a></p>
   </header>
 
   <section class="inputs">

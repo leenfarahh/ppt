@@ -241,39 +241,65 @@ def _token(shape: Any) -> str:
         return "BODY"
 
 
-def _compose(
-    out: Path, tiles: Sequence[tuple[str, Path]]
-) -> Optional[LayoutSheet]:
-    """Tile the renders into one image, a number and a name under each."""
+def tile_images(
+    out: Path,
+    tiles: Sequence[tuple[str, Path]],
+    columns: int = _COLUMNS,
+    tile_w: int = _TILE_W,
+) -> Optional[list[str]]:
+    """Tile renders into one image with a caption under each. Never raises.
+
+    Returns the captions actually placed, in order, or None when nothing could
+    be. Shared with `ai.designqa`, which puts slides on a sheet rather than
+    layouts and for a different question -- one picture of the whole deck is
+    what a mismatch between two slides is visible in, and twenty separate
+    uploads of the same slides would be twenty times the bytes for an answer
+    that needs them side by side.
+
+    `columns` and `tile_w` are the caller's because the two uses want different
+    shapes, and the ceiling on both is the same: the long edge of the finished
+    sheet past 1568px is downsized before anything looks at it, so a wider
+    sheet is a smaller tile, not a clearer one.
+    """
     from PIL import Image, ImageDraw  # noqa: PLC0415 - lazy
 
     if not tiles:
         return None
-    columns = min(_COLUMNS, len(tiles))
+    columns = max(1, min(columns, len(tiles)))
+    tile_h = int(tile_w * DEFAULT_HEIGHT / DEFAULT_WIDTH)
     rows = (len(tiles) + columns - 1) // columns
-    cell_w = _TILE_W + 2 * _PAD
-    cell_h = _TILE_H + _CAPTION_H + 2 * _PAD
+    cell_w = tile_w + 2 * _PAD
+    cell_h = tile_h + _CAPTION_H + 2 * _PAD
     sheet = Image.new("RGB", (columns * cell_w, rows * cell_h), (255, 255, 255))
     draw = ImageDraw.Draw(sheet)
 
-    numbers: dict[str, int] = {}
+    placed: list[str] = []
     for i, (name, path) in enumerate(tiles):
-        number = i + 1
-        numbers[name] = number
         x = (i % columns) * cell_w + _PAD
         y = (i // columns) * cell_h + _PAD
         try:
             with Image.open(path) as image:
-                sheet.paste(image.convert("RGB").resize((_TILE_W, _TILE_H)), (x, y))
+                sheet.paste(image.convert("RGB").resize((tile_w, tile_h)), (x, y))
         except Exception:
             log.debug("could not place the render of %r", name, exc_info=True)
             continue
-        # A border, because several of these layouts are white to the edge and
-        # a tile without one runs into its neighbour.
-        draw.rectangle([x, y, x + _TILE_W - 1, y + _TILE_H - 1], outline=(0, 0, 0))
-        draw.text((x + 2, y + _TILE_H + 6), f"{number}. {name}", fill=(0, 0, 0))
+        # A border, because a tile that is white to its edge runs into its
+        # neighbour without one.
+        draw.rectangle([x, y, x + tile_w - 1, y + tile_h - 1], outline=(0, 0, 0))
+        draw.text((x + 2, y + tile_h + 6), f"{len(placed) + 1}. {name}", fill=(0, 0, 0))
+        placed.append(name)
 
-    if not numbers:
+    if not placed:
         return None
     sheet.save(out, "PNG")
-    return LayoutSheet(path=out, numbers=numbers)
+    return placed
+
+
+def _compose(
+    out: Path, tiles: Sequence[tuple[str, Path]]
+) -> Optional[LayoutSheet]:
+    """Tile the renders into one image, a number and a name under each."""
+    placed = tile_images(out, tiles)
+    if not placed:
+        return None
+    return LayoutSheet(path=out, numbers={name: i + 1 for i, name in enumerate(placed)})

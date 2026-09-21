@@ -34,35 +34,46 @@ PAGE = Path("formatting_tool/web/static/qa.html")
 TOKENS = Path("formatting_tool/web/static/tokens.css")
 
 _BROWSERS = (
-    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
     r"C:\Program Files\Google\Chrome\Application\chrome.exe",
     r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
     "/usr/bin/google-chrome",
     "/usr/bin/chromium",
 )
 
 
-def _browser() -> str:
-    for path in _BROWSERS:
-        if Path(path).is_file():
-            return path
-    pytest.skip("no Chrome or Edge on this host to run the page in")
+def _browsers() -> list[str]:
+    """Every browser on this host, in the order worth trying.
+
+    ALL OF THEM, NOT THE FIRST ONE, and that is not caution for its own sake:
+    Edge stopped answering `--dump-dom` at some point between one run of this
+    file and the next, exiting 0 with an empty stdout and nothing on stderr.
+    Read as "no browser", that turns a test of the page into a skip, and a
+    skip is indistinguishable from a pass in a summary line. So each is tried
+    until one actually produces a document.
+    """
+    found = [path for path in _BROWSERS if Path(path).is_file()]
+    if not found:
+        pytest.skip("no Chrome or Edge on this host to run the page in")
+    return found
 
 
 # --------------------------------------------------------------------------- #
 # What the server sends
 # --------------------------------------------------------------------------- #
 
-def _verdict(ref, shape_id, shape, status, issue, action, box, parent_id=None):
+def _verdict(ref, shape_id, shape, status, issue, action, box, parent_id=None,
+             proposal=None):
+    verb = action != "none" and (action != "center" or bool(parent_id))
     return {
         "slide": 1, "ref": ref, "shape": shape, "shape_id": shape_id,
         "role": "body", "status": status, "issue": issue, "action": action,
         "note": f"{shape}: something to say",
         "task": f"do something about {shape}",
         "parent": "Circle 3" if parent_id else "", "parent_id": parent_id,
-        "box": box,
-        "executable": action != "none" and (action != "center" or bool(parent_id)),
+        "box": box, "fix": proposal,
+        "executable": bool(verb or proposal),
     }
 
 
@@ -76,6 +87,9 @@ def _check() -> dict:
                  [0.06, 0.59, 0.02, 0.04], parent_id=8),
         _verdict("s9", 12, "Chart 4", "issue", "crowded", "none",
                  [0.55, 0.3, 0.4, 0.4]),
+        _verdict("s11", 14, "Caption 9", "issue", "too_small", "none",
+                 [0.1, 0.8, 0.3, 0.06], proposal={"op": "set_font_size",
+                                                  "size_pt": 11}),
     ]
     return {
         "session": "page-test",
@@ -96,6 +110,20 @@ def _check() -> dict:
                 "slide_issues": [{
                     "note": "the right half of the slide is empty",
                     "task": "run the cards across the full width",
+                    "arrangement": "", "members": [],
+                }, {
+                    # The other kind of slide-level finding: a relation the
+                    # file can measure, which is work this tool does rather
+                    # than work it hands over.
+                    "note": "the top row of circles does not line up",
+                    "task": "level the top row on its top edge",
+                    "arrangement": "align_top",
+                    "members": [
+                        {"ref": "s2", "shape": "Oval 2", "shape_id": 20,
+                         "path": [2]},
+                        {"ref": "s3", "shape": "Oval 3", "shape_id": 21,
+                         "path": [3]},
+                    ],
                 }],
                 "reviewed": True, "reason": "",
             }],
@@ -126,11 +154,26 @@ def _check() -> dict:
                  "why": "Chart 4: something to say", "slide": 1, "slides": [],
                  "shape": "Chart 4", "shape_id": 12, "issue": "crowded",
                  "fixable": False, "op": "", "box": [0.55, 0.3, 0.4, 0.4]},
+                # A proposal rather than a measured verb: applied by the
+                # shared applier, and the page must not care which half of the
+                # tool carries a correction out.
+                {"id": "1:s11", "kind": "shape",
+                 "what": "set this to 11pt, which is what the rest of the deck uses",
+                 "why": "Caption 9: smaller than the rest", "slide": 1,
+                 "slides": [], "shape": "Caption 9", "shape_id": 14,
+                 "issue": "too_small", "fixable": True, "op": "set_font_size",
+                 "box": [0.1, 0.8, 0.3, 0.06]},
                 {"id": "slide:1:0", "kind": "slide",
                  "what": "run the cards across the full width",
                  "why": "the right half of the slide is empty",
                  "slide": 1, "slides": [], "shape": "", "shape_id": None,
                  "issue": "", "fixable": False, "op": "", "box": None},
+                {"id": "slide:1:1", "kind": "slide",
+                 "what": "level the top row on its top edge",
+                 "why": "the top row of circles does not line up",
+                 "slide": 1, "slides": [], "shape": "", "shape_id": None,
+                 "issue": "align_top", "fixable": True, "op": "align",
+                 "box": None},
             ],
             "deck_issues": [
                 {"kind": "position", "slides": [1],
@@ -139,8 +182,8 @@ def _check() -> dict:
             ],
             "consistency_reason": "",
             "notes": ["slide 1: run the cards across the full width"],
-            "stats": {"slides": 1, "reviewed": 1, "shapes": 4, "issues": 3,
-                      "actions": 3, "notes": 2, "tasks": 5, "mismatches": 1},
+            "stats": {"slides": 1, "reviewed": 1, "shapes": 5, "issues": 4,
+                      "actions": 5, "notes": 2, "tasks": 7, "mismatches": 1},
             "reason": "",
         },
     }
@@ -282,31 +325,34 @@ window.fetch = async (url) => {{
 @pytest.fixture(scope="module")
 def dom(tmp_path_factory) -> str:
     """The page's DOM after a check, an apply and a re-render."""
-    browser = _browser()
     if not PAGE.is_file():
         pytest.skip("run from the project root")
     harness = _harness(tmp_path_factory.mktemp("page"))
-    profile = tmp_path_factory.mktemp("profile")
-    finished = subprocess.run(
-        [
-            browser, "--headless=new", "--disable-gpu", "--no-sandbox",
-            f"--user-data-dir={profile}",
-            # Long enough for the awaited stubs to settle; they resolve
-            # immediately, so this is a ceiling rather than a wait.
-            "--virtual-time-budget=8000",
-            "--dump-dom", harness.resolve().as_uri(),
-        ],
-        # Bytes, decoded here rather than by subprocess: the DOM is UTF-8 and
-        # Python would otherwise decode it with the console's code page, which
-        # on Windows is cp1252 and raises on the first byte it does not know.
-        capture_output=True, timeout=180,
-    )
-    if not finished.stdout:
-        pytest.skip(
-            "the browser produced no DOM: "
-            + finished.stderr.decode("utf-8", "replace")[:400]
+
+    complaints = []
+    for index, browser in enumerate(_browsers()):
+        profile = tmp_path_factory.mktemp(f"profile{index}")
+        finished = subprocess.run(
+            [
+                browser, "--headless=new", "--disable-gpu", "--no-sandbox",
+                f"--user-data-dir={profile}",
+                # Long enough for the awaited stubs to settle; they resolve
+                # immediately, so this is a ceiling rather than a wait.
+                "--virtual-time-budget=8000",
+                "--dump-dom", harness.resolve().as_uri(),
+            ],
+            # Bytes, decoded here rather than by subprocess: the DOM is UTF-8
+            # and Python would otherwise decode it with the console's code
+            # page, which on Windows is cp1252 and raises on the first byte it
+            # does not know.
+            capture_output=True, timeout=180,
         )
-    return finished.stdout.decode("utf-8", "replace")
+        if finished.stdout:
+            return finished.stdout.decode("utf-8", "replace")
+        complaints.append(
+            f"{Path(browser).name}: {finished.stderr.decode('utf-8', 'replace')[:200]}"
+        )
+    pytest.skip("no browser produced a DOM -- " + "; ".join(complaints))
 
 
 def _results(dom: str) -> str:
@@ -367,9 +413,10 @@ def test_every_finding_is_offered_as_something_to_do(dom: str) -> None:
     # The instruction, on the row, for a finding nothing can correct.
     assert "do something about Chart 4" in results
     assert "run the cards across the full width" in results
-    # And the corrections named in words rather than in the schema's verbs.
+    # And the corrections named in words rather than in the schema's verbs,
+    # whichever half of the tool carries them out.
     assert "widen the box" in results and "centre it in its holder" in results
-    assert "align it to the deck" in results
+    assert "align it to the deck" in results and "set the type size" in results
 
 
 def test_what_is_left_after_a_round_is_listed_and_filed(dom: str) -> None:
@@ -387,6 +434,33 @@ def test_a_slide_can_be_drawn_again(dom: str) -> None:
 
     assert 'class="linkish rerender"' in results
     assert "t=99" in results           # the URLs the re-render answered with
+
+
+def test_a_slide_finding_sits_in_the_panel_that_matches_what_it_is(dom: str) -> None:
+    """Both kinds arrive in the same bucket and no longer belong in the same
+    panel. A row that does not line up is measured off the file and carries a
+    tick; an empty half of a slide has no arithmetic and carries an
+    instruction. Reading the task's `fixable` rather than the finding's shape
+    is what keeps that honest as the arithmetic grows again."""
+    results = _results(dom)
+
+    ticked, handed = results.split("For a designer, on this slide", 1)
+    assert "On this slide, and ticking it does it" in ticked
+    assert 'data-key="slide:1:1"' in ticked
+    assert "level the top row on its top edge" in ticked
+    # And the one nothing can measure stayed where it was, with no tick.
+    assert "run the cards across the full width" in handed
+    assert 'data-key="slide:1:0"' not in results
+
+
+def test_a_finished_round_offers_to_check_what_it_produced(dom: str) -> None:
+    """The button sits with the round it is about, beside the download and
+    after the pictures, because it is the thing to press once they have been
+    looked at -- pressing it replaces them."""
+    applied = _results(dom).split('<section class="applied">', 1)[1]
+
+    assert 'id="recheck"' in applied
+    assert "Check the corrected deck" in applied
 
 
 def test_the_findings_still_read_as_findings(dom: str) -> None:

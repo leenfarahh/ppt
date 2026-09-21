@@ -16,11 +16,16 @@ comments rather than dropped.
     widen           widen a text box until PowerPoint stops breaking its words
                     in half, in steps, stopping at a neighbour, at the slide
                     edge, or at a cap, and rolled back if the break survives.
-    align           move a shape to a position measured off the rest of the
-                    deck -- the title that sits 4% lower than on every other
-                    slide. The target is computed here, not asked for: the
-                    model says which slides disagree, arithmetic says where the
-                    majority put it.
+    align           move a shape to a position measured off other shapes. Two
+                    findings arrive as this one op. A title that sits 4% lower
+                    than on every other slide is measured off the deck; a
+                    circle that breaks the top edge of its row, or a row whose
+                    gaps are uneven, is measured off the rest of the set on its
+                    own slide. Either way the target is computed before this
+                    module runs (`designqa._align_steps` and `_arrange_steps`)
+                    and never asked for: the model says which shapes disagree,
+                    arithmetic says where they belong. `measured_off` carries
+                    which of the two it was, for the sentence shown afterwards.
 
 ONE ROUND, NO RE-CHECK. A loop that keeps correcting until the model is happy
 converges on a deck nobody chose, so every step is taken once and the result is
@@ -112,8 +117,8 @@ class Step:
     """One correction to make, named the only way that is unambiguous.
 
     `op` is from `ai.designqa.ACTIONS` plus `align`, which no model asks for --
-    it is derived from a deck-level mismatch and a measurement (see
-    `designqa.steps_for`).
+    it is derived from a mismatch the model named and a measurement taken off
+    the file (see `designqa.steps_for`).
     """
 
     op: str                       # shrink | grow | center | widen | align
@@ -126,11 +131,27 @@ class Step:
     parent_path: tuple[int, ...] = ()
     # `center` needs the shape that holds this one; `align` needs where to put
     # it, in inches from the top left of the slide. Both are refused without.
+    #
+    # AN ALIGN MAY NAME ONE AXIS AND LEAVE THE OTHER None, and that is how a
+    # within-slide arrangement says what it is about: levelling a row sets
+    # tops and must not touch where along the row anything sits. An axis left
+    # None is not written, which is different from writing back the value it
+    # already had -- by the time a later step in the same round is applied,
+    # that value may be the thing an earlier step just corrected.
     parent_id: Optional[int] = None
     parent: str = ""
     left_in: Optional[float] = None
     top_in: Optional[float] = None
     note: str = ""                # what the model said, carried for the page
+    # What `align` measured its target off, in the words the page will show.
+    # The default is the cross-slide case the op was written for; a within-
+    # slide arrangement sets its own, because "where the rest of the deck puts
+    # it" is not true of a circle lined up with the four beside it.
+    measured_off: str = "where the rest of the deck puts it"
+    # Which row on the page this answers, for a finding that names no single
+    # shape and so cannot be matched back by one. Set for an arrangement,
+    # empty for everything else, which the page matches by shape and op.
+    task_id: str = ""
 
     @property
     def direction(self) -> str:
@@ -139,18 +160,25 @@ class Step:
 
 @dataclass(frozen=True)
 class Change:
-    """One correction that was made, in the words the page will show."""
+    """One correction that was made, in the words the page will show.
+
+    `task_id` says which row on the page it answers. Set for a correction that
+    came from a proposal, since those are applied by `apply.apply_fixes` and
+    reported by the finding they were made on; empty for a measured verb,
+    which the page matches by shape and op.
+    """
 
     op: str
     slide: int
     shape_id: int
     shape: str
     detail: str
+    task_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "op": self.op, "slide": self.slide, "shape_id": self.shape_id,
-            "shape": self.shape, "detail": self.detail,
+            "shape": self.shape, "detail": self.detail, "task_id": self.task_id,
         }
 
 
@@ -161,11 +189,12 @@ class SkippedStep:
     shape_id: int
     shape: str
     reason: str
+    task_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "op": self.op, "slide": self.slide, "shape_id": self.shape_id,
-            "shape": self.shape, "reason": self.reason,
+            "shape": self.shape, "reason": self.reason, "task_id": self.task_id,
         }
 
 
@@ -294,6 +323,14 @@ def steps_from(reviews: Iterable[Any]) -> list[Step]:
         for verdict in getattr(review, "verdicts", []):
             if not verdict.executable:
                 continue
+            # A verdict is executable when it carries EITHER a measured verb
+            # or a proposal, and the two are applied by different halves of
+            # the tool. Only the verbs belong here; a proposal that reached
+            # this loop became a Step whose op is "none", which the applier
+            # then refused -- a refusal on the page for a correction the other
+            # half had already made.
+            if verdict.action not in ("shrink", "grow", "center", "widen"):
+                continue
             steps.append(
                 Step(
                     op=verdict.action,
@@ -333,10 +370,14 @@ def apply_steps(deck: Path, out: Path, steps: Sequence[Step]) -> QaFixResult:
         )
 
     out.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        shutil.copy2(deck, out)
-    except OSError as exc:
-        return QaFixResult(reason=f"could not copy the deck: {exc}")
+    # The same file means the corrections that go through `apply.apply_fixes`
+    # have already written it, and this round edits what they produced rather
+    # than the upload. Copying over it would undo them.
+    if deck.resolve() != out.resolve():
+        try:
+            shutil.copy2(deck, out)
+        except OSError as exc:
+            return QaFixResult(reason=f"could not copy the deck: {exc}")
 
     result = QaFixResult(output=out)
     try:
@@ -373,6 +414,12 @@ def _apply_all(
     )
     try:
         count = int(presentation.Slides.Count)
+        # Which (shape, axis) pairs a correction has already settled this
+        # round. Two findings that both want to decide where one shape sits
+        # horizontally -- space this row evenly, and line these columns up --
+        # cannot both be honoured, and the second silently winning is how a
+        # round produces a slide nobody chose. See `_align`.
+        settled: set[tuple[int, str]] = set()
         for step in steps:
             if not 1 <= step.slide <= count:
                 result.skipped.append(_refused(step, "that slide is not in the deck"))
@@ -386,7 +433,7 @@ def _apply_all(
                     "nothing was touched",
                 ))
                 continue
-            _apply_one(presentation, slide, shape, step, result)
+            _apply_one(presentation, slide, shape, step, result, settled)
         presentation.Save()
         presentation.Close()
     except Exception:
@@ -394,7 +441,10 @@ def _apply_all(
         raise
 
 
-def _apply_one(presentation, slide, shape, step: Step, result: QaFixResult) -> None:
+def _apply_one(
+    presentation, slide, shape, step: Step, result: QaFixResult,
+    settled: Optional[set] = None,
+) -> None:
     if step.op in ("grow", "shrink"):
         _step_type(shape, step, result)
     elif step.op == "center":
@@ -402,7 +452,7 @@ def _apply_one(presentation, slide, shape, step: Step, result: QaFixResult) -> N
     elif step.op == "widen":
         _widen(presentation, slide, shape, step, result)
     elif step.op == "align":
-        _align(shape, step, result)
+        _align(shape, step, result, settled if settled is not None else set())
     else:
         result.skipped.append(_refused(step, f"there is no {step.op!r} correction"))
 
@@ -695,16 +745,36 @@ def _room_to_the_right(presentation: Any, slide: Any, shape: Any) -> float:
 
 # -- aligning --------------------------------------------------------------- #
 
-def _align(shape: Any, step: Step, result: QaFixResult) -> None:
-    """Move a shape to where the rest of the deck puts it.
+def _align(
+    shape: Any, step: Step, result: QaFixResult, settled: set,
+) -> None:
+    """Move a shape to where the shapes it belongs with put it.
 
     The target is arithmetic done before this ran -- the position most of the
-    slides agree on -- so all that is left here is the move and the guard on
-    it. The guard matters: a large move means the shape being aligned is not
-    the shape the measurement describes, and putting a cover's title where a
-    content slide's title goes is worse than leaving it alone.
+    deck agrees on, or the line the rest of a row sits on -- so all that is
+    left here is the move and the guards on it.
+
+    ONE AXIS OR BOTH. A cross-slide align names both; a within-slide
+    arrangement names the one it is about and leaves the other None, and an
+    axis that is None is not written at all. Writing back the value an axis
+    already had is not a no-op in a round with more than one correction in it:
+    the value may be what the previous step just fixed.
+
+    TWO CORRECTIONS DO NOT GET TO DISAGREE ABOUT ONE AXIS. A row spaced evenly
+    and a column lined up both decide where a shape sits horizontally, and
+    they will not agree. Applied in the order they happen to arrive, the
+    second wins and the first is reported as done anyway -- a page claiming
+    two corrections and a slide carrying one. So the first to settle an axis
+    keeps it and the second is refused with a reason, which is the honest
+    outcome: arithmetic can compute either answer and cannot choose between
+    them.
+
+    The distance guard matters for the same reason it always did: a large move
+    means the shape is not doing the same job as the ones it was measured
+    against, and putting a cover's title where a content slide's title goes is
+    worse than leaving it alone.
     """
-    if step.left_in is None or step.top_in is None:
+    if step.left_in is None and step.top_in is None:
         result.skipped.append(_refused(step, "there is nowhere named to move it to"))
         return
     try:
@@ -715,8 +785,18 @@ def _align(shape: Any, step: Step, result: QaFixResult) -> None:
         )
         return
 
-    left = step.left_in * _POINTS_PER_INCH
-    top = step.top_in * _POINTS_PER_INCH
+    for axis, wanted in (("across", step.left_in), ("down", step.top_in)):
+        if wanted is None or (step.shape_id, axis) not in settled:
+            continue
+        result.skipped.append(_refused(
+            step,
+            f"another correction in this round has already settled where this "
+            f"shape sits {axis}, and the two do not agree",
+        ))
+        return
+
+    left = was_left if step.left_in is None else step.left_in * _POINTS_PER_INCH
+    top = was_top if step.top_in is None else step.top_in * _POINTS_PER_INCH
     moved_in = max(
         abs(left - was_left), abs(top - was_top)
     ) / _POINTS_PER_INCH
@@ -729,7 +809,9 @@ def _align(shape: Any, step: Step, result: QaFixResult) -> None:
         ))
         return
     if moved_in < 0.01:
-        result.skipped.append(_refused(step, "it is already where the rest of the deck puts it"))
+        result.skipped.append(
+            _refused(step, f"it is already {step.measured_off}")
+        )
         return
 
     try:
@@ -738,12 +820,21 @@ def _align(shape: Any, step: Step, result: QaFixResult) -> None:
         result.skipped.append(_refused(step, f"PowerPoint refused the move: {exc}"))
         return
 
+    if step.left_in is not None:
+        settled.add((step.shape_id, "across"))
+    if step.top_in is not None:
+        settled.add((step.shape_id, "down"))
+
+    # Only the axis that actually moved is described. A row being levelled
+    # reports how far down it came and says nothing about across, because it
+    # did nothing across.
+    moves = []
+    if step.left_in is not None:
+        moves.append(f"{(left - was_left) / _POINTS_PER_INCH:+.2f}in across")
+    if step.top_in is not None:
+        moves.append(f"{(top - was_top) / _POINTS_PER_INCH:+.2f}in down")
     result.applied.append(_made(
-        step,
-        f"moved it to where the rest of the deck puts it "
-        f"({(left - was_left) / _POINTS_PER_INCH:+.2f}in across, "
-        f"{(top - was_top) / _POINTS_PER_INCH:+.2f}in down)",
-    ))
+        step, f"moved it to {step.measured_off} ({', '.join(moves)})"))
 
 
 # -- shared ----------------------------------------------------------------- #
@@ -785,14 +876,14 @@ def _spilled(shape: Any) -> str:
 def _made(step: Step, detail: str) -> Change:
     return Change(
         op=step.op, slide=step.slide, shape_id=step.shape_id,
-        shape=step.shape, detail=detail,
+        shape=step.shape, detail=detail, task_id=step.task_id,
     )
 
 
 def _refused(step: Step, reason: str) -> SkippedStep:
     return SkippedStep(
         op=step.op, slide=step.slide, shape_id=step.shape_id,
-        shape=step.shape, reason=reason,
+        shape=step.shape, reason=reason, task_id=step.task_id,
     )
 
 

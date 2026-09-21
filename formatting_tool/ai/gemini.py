@@ -23,6 +23,24 @@ class RateLimited(AIValidationError):
     that is worth simply waiting out."""
 
 
+class Truncated(AIValidationError):
+    """The answer ran past `max_output_tokens` and stopped mid-token.
+
+    Separate from the other failures because the text it carries is not
+    worthless. A refusal or an API error leaves nothing to read; this leaves a
+    complete answer with its tail cut off, and for a caller whose answer is a
+    LIST -- a verdict per shape -- the entries before the cut are as good as
+    they were ever going to be. `salvage_list` reads them.
+
+    Callers that cannot use half an answer do not have to: this is an
+    `AIValidationError` and an `except AIValidationError` still catches it.
+    """
+
+    def __init__(self, message: str, text: str = "") -> None:
+        super().__init__(message)
+        self.text = text
+
+
 class Exhausted(AIValidationError):
     """The account is out: a spend cap reached, or a daily quota spent.
 
@@ -210,15 +228,69 @@ def parse_json(response: Any) -> dict[str, Any]:
     try:
         data = json.loads(text)
     except json.JSONDecodeError as exc:
-        # response_schema makes this near-impossible; if it happens, the
-        # response was truncated by max_output_tokens, most likely because
-        # thinking ate the budget. Lower the effort or raise max_tokens.
-        raise AIValidationError(
-            f"response was not valid JSON (finish_reason={reason}): {exc}"
+        # response_schema makes this near-impossible for any reason other than
+        # the answer being cut off at max_output_tokens, usually because
+        # thinking ate the budget. The text comes along so a caller that can
+        # use a partial answer has something to use.
+        raise Truncated(
+            f"response was not valid JSON (finish_reason={reason}): {exc}",
+            text=text,
         ) from exc
     if not isinstance(data, dict):
         raise AIValidationError(f"response JSON was {type(data).__name__}, not an object")
     return data
+
+
+# Whitespace and the commas between entries: what to step over on the way
+# from one decoded entry of an array to the next.
+_JSON_GAP = " \t\r\n,"
+
+
+def salvage_list(text: str, key: str) -> list[Any]:
+    """The complete entries of one top-level array in a truncated answer.
+
+    A cut-off response is not an empty one. `{"shapes": [...]}` holding forty
+    verdicts and stopping in the middle of the forty-first still holds forty
+    verdicts, and throwing them away loses the whole slide -- which, because
+    the answer is long in proportion to how much is wrong, is reliably the
+    slide most worth reading.
+
+    Entries are decoded one at a time from the start of the array and the
+    first one that will not decode ends it. Nothing is repaired: a half-written
+    object is dropped, not guessed at, so what comes back is a prefix of what
+    the model actually said and never an invention.
+
+    An empty list for anything unrecognisable, which is the same answer the
+    caller had before it asked.
+    """
+    marker = f'"{key}"'
+    at = text.find(marker)
+    if at < 0:
+        return []
+    # The bracket has to be THIS key's, so only a colon and whitespace may sit
+    # between them. Scanning ahead for the next "[" anywhere would, for a key
+    # whose value is not an array, quietly return the contents of whichever
+    # array came next in the object.
+    at += len(marker)
+    while at < len(text) and text[at] in _JSON_GAP + ":":
+        at += 1
+    if at >= len(text) or text[at] != "[":
+        return []
+
+    decoder = json.JSONDecoder()
+    out: list[Any] = []
+    at += 1
+    while at < len(text):
+        while at < len(text) and text[at] in _JSON_GAP:
+            at += 1
+        if at >= len(text) or text[at] == "]":
+            break
+        try:
+            entry, at = decoder.raw_decode(text, at)
+        except ValueError:
+            break
+        out.append(entry)
+    return out
 
 
 def count(usage: Any, name: str) -> int:

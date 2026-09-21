@@ -27,9 +27,14 @@ TWO BUCKETS COME BACK, AND BOTH ARE KEPT.
    That vocabulary is deliberately tiny: it is everything `apply.qafix` can do
    on its own, bounded, to a copy of the deck. Anything outside it is not an
    instruction.
-2. `slide_issues`: whatever the vocabulary cannot express -- a timeline with an
-   unused stop, an empty column, a layout lopsided on the page. These are notes
-   for a designer, never actions.
+2. `slide_issues`: whatever the per-shape vocabulary cannot express -- a
+   timeline with an unused stop, an empty column, a layout lopsided on the
+   page. Mostly notes for a designer. The exception is an ARRANGEMENT: a
+   finding about how several shapes sit RELATIVE TO EACH OTHER, which the
+   model names by kind and by the refs it is about, and which arithmetic then
+   turns into moves. See `ARRANGEMENTS` here and `designqa._arrange_steps` for
+   the half that does the measuring. The model never gives a coordinate: it
+   says which shapes should line up, and the file says where.
 
 Dropping the second bucket is how a bad slide gets through. A model that has
 just said the slide is lopsided and been ignored has still said it, and the
@@ -51,8 +56,21 @@ from pathlib import Path
 from shutil import rmtree
 from typing import Any, Optional, Sequence
 
-from ..models import MARGIN_CHROME, DeckProfile, ShapeProfile, SlideProfile
-from .gemini import Exhausted, build_client, file_part, generate_json
+from ..models import (
+    MARGIN_CHROME,
+    DeckProfile,
+    FixAction,
+    ShapeProfile,
+    SlideProfile,
+)
+from .gemini import (
+    Exhausted,
+    Truncated,
+    build_client,
+    file_part,
+    generate_json,
+    salvage_list,
+)
 
 log = logging.getLogger(__name__)
 
@@ -82,13 +100,101 @@ ISSUES = (
     "unfilled",
 )
 
-# Room for a verdict per shape, on top of whatever thinking was asked for.
-# Gemini counts thinking against `max_output_tokens`, so the two budgets share
-# one allowance and a flat number here would be the answer being squeezed out
-# by the reasoning -- which arrives as a truncated string and no verdicts at
-# all, for the slide that had the most to say. See `ai.layout` for the same
-# trap with a smaller answer.
-_ANSWER_TOKENS = 4096
+# The relational defects a SLIDE-level finding may name, and the second thing
+# on this page that turns into a correction rather than into prose.
+#
+# WHY THEY CANNOT BE PER-SHAPE ACTIONS. Every verb in ACTIONS is about one
+# shape and the thing that holds it -- `center` puts a child in the middle of
+# its parent. A row of circles that does not line up is not any one circle
+# being wrong, it is the SET being wrong, and there is no single shape to hang
+# the verdict on. So these came back as sentences in `slide_issues` and reached
+# a designer as work, which was the honest answer while nothing here could
+# measure a set. It is not the honest answer any more: given the shapes, the
+# target is a median or an equal division, and neither of those is a judgement.
+#
+# THE MODEL NAMES THE SET AND THE RELATION, NEVER THE NUMBERS. It is looking at
+# a picture, and "0.31in too far left" is precisely the guess the rest of this
+# prompt exists to prevent. It says these five should share a top edge; the
+# file says where that top edge is. Same split as the cross-slide `align`.
+ARRANGEMENTS = (
+    "align_top", "align_bottom", "align_left", "align_right",
+    "distribute_h", "distribute_v",
+)
+
+# How many shapes each arrangement needs before it means anything. Aligning
+# needs two, because one shape has nothing to line up with. Distributing needs
+# three: two shapes are already evenly spaced whatever the gap, so asking for
+# that is asking for no change at all.
+_ARRANGE_MIN = {
+    "align_top": 2, "align_bottom": 2, "align_left": 2, "align_right": 2,
+    "distribute_h": 3, "distribute_v": 3,
+}
+
+# The parameterised corrections this check may propose, on top of the verbs
+# above. They are `models.FIX_OPS` -- the vocabulary the rule layer's AI pass
+# has always used -- so a proposal made here is validated by `ai.schema` and
+# carried out by `apply.fixers`, with the brand guards those already have.
+#
+# WHY A SUBSET. Two of FIX_OPS are left out on purpose. `set_font` swaps a
+# typeface, which is a brand decision rather than a design defect, and the
+# only typefaces this check could offer are the ones already in the deck.
+# `remove_note` deletes a shape, needs a confidence this check does not
+# produce, and belongs to the layer that can tell a production note from a
+# caption.
+#
+# WHAT CHECKS THEM. `fix_ai_action` refuses every proposal when there is no
+# brand reference, which is the honest answer when a deck arrives without a
+# master. The design check has no master and derives one from the deck itself
+# instead -- its own palette, its own typefaces, the size range its own slides
+# use for each role. That is the right authority for this question: the check
+# is about whether a deck agrees with itself.
+PROPOSABLE_OPS = (
+    "set_font_size",
+    "recolor_text",
+    "recolor_fill",
+    "move",
+    "resize",
+    "disable_autofit",
+    "delete_empty_paragraphs",
+)
+
+# Room for the answer, on top of whatever thinking was asked for. Gemini counts
+# thinking against `max_output_tokens`, so the two share one allowance and the
+# reasoning can squeeze the answer out -- which arrives as a truncated string
+# and NO VERDICTS AT ALL for the slide that had the most to say. See
+# `ai.layout` for the same trap with a smaller answer.
+#
+# IT SCALES WITH THE SHAPES BECAUSE THE SCHEMA MAKES IT. One verdict per listed
+# shape is required, and a verdict carrying an issue and a proposal is about
+# 350 characters of JSON: a ref, a status, an issue, an action, a note, a task
+# and a `fix` object with eight keys of its own. At `_MAX_SHAPES` with two
+# thirds of them flagged that is near 5,000 tokens of answer, and the flat
+# 4,096 this used to be could not fit what the schema is entitled to ask for.
+# The slides it failed on were exactly the crowded ones -- the slides worth
+# checking -- and each one came back as "response was not valid JSON".
+#
+# AND ARABIC COSTS MORE PER SENTENCE. A note that runs 60 tokens in English
+# runs well over 100 in Arabic, so a budget tuned on an English deck truncates
+# a bilingual one. The allowance is per listed shape rather than per character
+# for that reason: it does not need to know which language the answer is in.
+#
+# The floor keeps a sparse slide's budget away from the thinking it also pays
+# for. The cap is a stop on a runaway, not a target.
+_ANSWER_TOKENS_FLOOR = 4096
+_ANSWER_TOKENS_PER_SHAPE = 150
+_ANSWER_TOKENS_CAP = 32768
+# Room for `slide_issues` and the JSON around everything, which do not scale
+# with the shape count the way the verdicts do.
+_ANSWER_TOKENS_SLACK = 1024
+
+
+def _answer_tokens(shapes: int) -> int:
+    """How much room this slide's answer needs, from how much it was asked."""
+    return min(
+        _ANSWER_TOKENS_CAP,
+        max(_ANSWER_TOKENS_FLOOR,
+            shapes * _ANSWER_TOKENS_PER_SHAPE + _ANSWER_TOKENS_SLACK),
+    )
 
 # Shapes listed on one slide, groups and their contents together. A slide with
 # more than this on it is a slide whose problem is not which of its boxes is
@@ -187,17 +293,83 @@ it, and say whether it is right.
            Write one for every `issue`, whatever the action is -- including
            `none`, where it is the only thing anyone can act on. Leave it empty
            only for an `ok` shape.
+  fix      an exact correction, with the numbers, where you can name one. This
+           is the second way to be useful and it is open where `action` is
+           closed: name an op and the values it needs.
+
+             set_font_size            needs `size_pt`
+             recolor_text             needs `hex`, six digits, no hash
+             recolor_fill             needs `hex`
+             move                     needs `left_in` and `top_in`
+             resize                   needs `width_in` and `height_in`
+             disable_autofit          needs nothing else
+             delete_empty_paragraphs  needs nothing else
+
+           Always give `shape_id`, copied from the list. Leave `fix` null when
+           you cannot name the numbers; a wrong number is worse than none.
+
+           EVERY VALUE IS CHECKED BEFORE IT IS WRITTEN, against the deck's own
+           palette, its own typefaces and the size range its own slides use for
+           that role. So propose a colour this deck already uses and a size
+           this deck already sets for that kind of text. A value the deck
+           cannot vouch for is refused and the finding stays on the list as
+           work for a designer, which costs the proposal rather than the deck.
+
+           Prefer `action` where both would do. A heading one notch too big is
+           `shrink`; a caption that should match the 11pt the rest of the deck
+           uses is `set_font_size` with `size_pt: 11`.
 
 STEP 2 -- WHAT IS WRONG WITH THE SLIDE. Anything the per-shape vocabulary
-cannot express goes in `slide_issues`: a timeline with a stop nothing uses, a
+cannot express goes in `slide_issues`: shapes that do not line up with each
+other, a row whose gaps are uneven, a timeline with a stop nothing uses, a
 column left empty, a layout weighted to one side, a hierarchy that reads in the
 wrong order, a slide carrying more than it can hold.
 
-Each one is a pair. `note` says what is wrong, in a sentence. `task` says what
-to do about it, as an instruction somebody can pick up and act on -- these are
-the findings nothing here can correct, so the instruction is the entire value
-of reporting them. "The right half is empty" is an observation; "run the cards
-across the full width, or move the callout into the empty half" is a task.
+The first two are not like the rest. A set of shapes out of line is measured
+and corrected, so it is worth being exact about; the others are handed to a
+designer. Do not let the shape of this list suggest otherwise.
+
+ONE RELATION PER FINDING. A row that is both unevenly spaced and out of line
+with the row below it is TWO findings, one for each, each naming its own
+shapes. Describing both in one note leaves half of it uncorrected.
+
+Each one carries a `note` saying what is wrong, in a sentence, and a `task`
+saying what to do about it as an instruction somebody can pick up and act on.
+"The right half is empty" is an observation; "run the cards across the full
+width, or move the callout into the empty half" is a task.
+
+WHEN THE PROBLEM IS THAT SHAPES DO NOT LINE UP, SAY SO IN `arrangement` AND
+`shapes`. This is the one slide-level finding that gets corrected rather than
+handed over, so it is worth naming precisely.
+
+  arrangement  align_top      these should share a top edge
+               align_bottom   these should share a bottom edge
+               align_left     these should share a left edge
+               align_right    these should share a right edge
+               distribute_h   these should have equal gaps left to right
+               distribute_v   these should have equal gaps top to bottom
+               none           this finding is not about shapes lining up
+  shapes       every ref the arrangement is about, from the list. Two or more
+               to align, three or more to distribute -- two shapes are already
+               evenly spaced whatever the gap between them.
+
+NAME EVERY SHAPE THE RELATION IS ABOUT, including the ones already in the
+right place. The correction is measured off the shapes named: with five circles
+named, the four that agree are what says where the fifth belongs, and naming
+only the odd one out leaves nothing to measure against.
+
+Do not worry about splitting a grid into rows. Ten circles in two rows of five
+can be named as one `align_top` set; the rows are worked out from the file and
+each is levelled against itself, so a row that is already square does not move.
+Name what the relation is about and let the measuring sort out the rest.
+
+DO NOT GIVE COORDINATES FOR THESE, here or in `fix`. You are reading a picture.
+Saying which shapes belong in line is a judgement you can make from one, and
+saying where the line is is not. The file is measured for that.
+
+Still write `note` and `task` for every arrangement, in plain words. The
+correction can be refused -- a shape that would have to travel too far to join
+the set is left where it is -- and the sentence is then what a designer reads.
 
 WHAT NOT TO DO.
 
@@ -205,7 +377,10 @@ WHAT NOT TO DO.
   something anyone can see and is not your question. Rules already do that.
 - Do not report a defect you cannot see in this render. Two boxes whose
   rectangles overlap is not a collision; type touching type is.
-- Do not invent a shape. Every verdict names a ref from the list.
+- Do not invent a shape. Every verdict, and every ref in an arrangement's
+  `shapes`, names a ref from the list.
+- Do not put an arrangement in `shapes` as well. A row that does not line up is
+  one finding about a set, not one `issue` on each member of it.
 - Do not ask for a font step to fix a spacing problem. Making the type smaller
   so it stops colliding is how a deck ends up at nine sizes; say `none` and
   describe the collision.
@@ -306,6 +481,10 @@ class ShapeVerdict:
     # deck whose ids PowerPoint has renumbered.
     path: tuple[int, ...] = ()
     parent_path: tuple[int, ...] = ()
+    # The exact correction the model proposed, where it named one. Checked
+    # against the deck's own values by `apply.fixers.fix_ai_action` before
+    # anything is written -- see PROPOSABLE_OPS.
+    fix: Optional[FixAction] = None
     # Where the shape sits, as fractions of the slide: left, top, width,
     # height. Carried so the page can draw the verdict on the render rather
     # than beside it. It is the same rectangle the model was given, which is
@@ -324,9 +503,14 @@ class ShapeVerdict:
         parent is not an instruction at all -- centred on what? -- so it
         becomes a task rather than a step.
         """
-        if self.shape_id is None or self.action not in ACTIONS or self.action == "none":
+        if self.shape_id is None:
             return False
-        return self.parent_id is not None if self.action == "center" else True
+        if self.action in ACTIONS and self.action != "none":
+            return self.parent_id is not None if self.action == "center" else True
+        # A proposal is executable in its own right: it names an op and the
+        # numbers for it, and what makes it safe is the check it goes through
+        # rather than the smallness of the vocabulary.
+        return self.fix is not None and self.fix.valid
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -345,6 +529,7 @@ class ShapeVerdict:
             "executable": self.executable,
             "box": list(self.box) if self.box else None,
             "path": list(self.path),
+            "fix": self.fix.__dict__.copy() if self.fix is not None else None,
         }
 
 
@@ -404,14 +589,63 @@ class Listed:
 
 
 @dataclass(frozen=True)
+class Member:
+    """One shape a relational finding names, addressed the way a step needs it.
+
+    The ref is how the model said it; the rest is what the map said it was.
+    A member whose ref was never sent does not become one of these -- see
+    `review_from_response` -- so everything here is a shape that exists.
+    """
+
+    ref: str
+    shape: str = ""
+    shape_id: Optional[int] = None
+    path: tuple[int, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ref": self.ref, "shape": self.shape,
+            "shape_id": self.shape_id, "path": list(self.path),
+        }
+
+
+@dataclass(frozen=True)
 class SlideIssue:
-    """Something wrong with the slide as a whole, and what to do about it."""
+    """Something wrong with the slide as a whole, and what to do about it.
+
+    `arrangement` and `members` are set only when the finding is about how
+    several shapes sit relative to each other, which is the one kind of
+    slide-level finding arithmetic can answer. Everything else carries the
+    empty string and no members, and reads exactly as it always did: a note
+    and a task for a designer.
+    """
 
     note: str
     task: str = ""
+    arrangement: str = ""          # one of ARRANGEMENTS, or "" for a plain note
+    members: tuple[Member, ...] = ()
+
+    @property
+    def addressable(self) -> bool:
+        """Whether arithmetic has enough to work with.
+
+        NOT a promise that anything will move. Where the shapes belong is
+        counted in `designqa._arrange_steps` and a set already in line
+        produces no steps, so the task is only offered as fixable once that
+        count has been done. This is the cheaper question asked first: is this
+        a relation at all, and does it name enough shapes to be one.
+        """
+        needed = _ARRANGE_MIN.get(self.arrangement)
+        if needed is None:
+            return False
+        return sum(1 for m in self.members if m.shape_id is not None) >= needed
 
     def to_dict(self) -> dict[str, Any]:
-        return {"note": self.note, "task": self.task}
+        return {
+            "note": self.note, "task": self.task,
+            "arrangement": self.arrangement,
+            "members": [m.to_dict() for m in self.members],
+        }
 
 
 @dataclass(frozen=True)
@@ -612,6 +846,43 @@ def _excerpt(shape: ShapeProfile) -> str:
 # The call
 # --------------------------------------------------------------------------- #
 
+# The proposal block, in the shape `ai.schema._fix` reads back. Written here
+# rather than imported from AI_ISSUE_SCHEMA because the ops differ: that one
+# offers the whole of FIX_OPS to a layer that has a master to check them
+# against, and this one offers what a picture can support.
+_FIX_SCHEMA: dict[str, Any] = {
+    "type": ["object", "null"],
+    "description": (
+        "The exact correction, with its numbers, or null when you cannot name "
+        "one. Null is the ordinary answer."
+    ),
+    "properties": {
+        "op": {"type": "string", "enum": list(PROPOSABLE_OPS)},
+        "shape_id": {
+            "type": ["integer", "null"],
+            "description": (
+                "The id of the shape, copied from the list. Always give it: "
+                "names repeat within a slide and ids do not."
+            ),
+        },
+        "size_pt": {"type": ["number", "null"]},
+        "hex": {
+            "type": ["string", "null"],
+            "description": "Six hex digits, no leading hash.",
+        },
+        "left_in": {"type": ["number", "null"]},
+        "top_in": {"type": ["number", "null"]},
+        "width_in": {"type": ["number", "null"]},
+        "height_in": {"type": ["number", "null"]},
+    },
+    "required": [
+        "op", "shape_id", "size_pt", "hex",
+        "left_in", "top_in", "width_in", "height_in",
+    ],
+    "additionalProperties": False,
+}
+
+
 def _schema(refs: Sequence[str]) -> dict[str, Any]:
     """The response contract, built per slide so `shape` can be an enum.
 
@@ -668,9 +939,11 @@ def _schema(refs: Sequence[str]) -> dict[str, Any]:
                                 "including those whose action is 'none'."
                             ),
                         },
+                        "fix": _FIX_SCHEMA,
                     },
                     "required": [
                         "shape", "status", "issue", "action", "note", "task",
+                        "fix",
                     ],
                     "additionalProperties": False,
                 },
@@ -688,8 +961,32 @@ def _schema(refs: Sequence[str]) -> dict[str, Any]:
                                  "description": "What is wrong, in a sentence."},
                         "task": {"type": "string",
                                  "description": "What to do about it, as an instruction."},
+                        # Closed for the same reason `shape` is: an enum is
+                        # how "it cannot name a relation nothing implements"
+                        # stops being a rule and becomes a fact about the
+                        # answer. "none" carries the absence, because a
+                        # nullable enum comes back as "" -- see the note on
+                        # `issue` above.
+                        "arrangement": {
+                            "type": "string",
+                            "enum": [*ARRANGEMENTS, "none"],
+                            "description": (
+                                "How these shapes should sit relative to each "
+                                "other, or 'none' when the finding is not "
+                                "about shapes lining up."
+                            ),
+                        },
+                        "shapes": {
+                            "type": "array",
+                            "items": {"type": "string", "enum": list(refs)},
+                            "description": (
+                                "Every ref the arrangement is about, including "
+                                "the ones already in the right place. Empty "
+                                "when arrangement is 'none'."
+                            ),
+                        },
                     },
-                    "required": ["note", "task"],
+                    "required": ["note", "task", "arrangement", "shapes"],
                     "additionalProperties": False,
                 },
             },
@@ -809,15 +1106,34 @@ def _ask(
         "Answer with one entry per shape above, using its ref, then the "
         "slide-level issues.",
     ]
-    data, _response = generate_json(
-        client,
-        model=model,
-        contents=contents,
-        system_instruction=INSTRUCTIONS,
-        schema=_schema(list(refs)),
-        thinking_budget=thinking_budget,
-        max_output_tokens=_ANSWER_TOKENS + max(0, thinking_budget),
-    )
+    try:
+        data, _response = generate_json(
+            client,
+            model=model,
+            contents=contents,
+            system_instruction=INSTRUCTIONS,
+            schema=_schema(list(refs)),
+            thinking_budget=thinking_budget,
+            max_output_tokens=_answer_tokens(len(refs)) + max(0, thinking_budget),
+        )
+    except Truncated as exc:
+        # A cut-off answer is not an empty one. The verdicts before the cut are
+        # as good as they were ever going to be, and the alternative is losing
+        # the whole slide -- reliably the crowded slide with the most wrong
+        # with it, because that is what makes an answer long enough to be cut
+        # off. Raised again when there is nothing to keep, so the slide still
+        # reports why rather than reporting that it is clean.
+        data = {
+            "shapes": salvage_list(exc.text, "shapes"),
+            "slide_issues": salvage_list(exc.text, "slide_issues"),
+        }
+        if not data["shapes"] and not data["slide_issues"]:
+            raise
+        log.warning(
+            "slide %d: the answer was cut off at the token limit; keeping the "
+            "%d verdict(s) and %d slide finding(s) that arrived before it",
+            number, len(data["shapes"]), len(data["slide_issues"]),
+        )
     return review_from_response(data, number, refs, size)
 
 
@@ -1162,6 +1478,7 @@ def review_from_response(
                 parent_id=parent.shape_id if parent is not None else None,
                 path=listed.path,
                 parent_path=parent.path if parent is not None else (),
+                fix=_proposal(raw.get("fix"), shape) if status == "issue" else None,
                 box=_box_of(shape, size),
             )
         )
@@ -1173,12 +1490,83 @@ def review_from_response(
         # page then shows as work with nothing said about it.
         if isinstance(entry, str):
             note, task = entry.strip(), ""
+            arrangement, members = "", ()
         else:
             note = str(entry.get("note") or "").strip()
             task = str(entry.get("task") or "").strip()
+            arrangement, members = _arrangement(entry, refs)
         if note or task:
-            review.slide_issues.append(SlideIssue(note=note or task, task=task))
+            review.slide_issues.append(SlideIssue(
+                note=note or task, task=task,
+                arrangement=arrangement, members=members,
+            ))
     return review
+
+
+def _arrangement(
+    raw: dict[str, Any], refs: dict[str, "Listed"]
+) -> tuple[str, tuple[Member, ...]]:
+    """The relation a slide-level finding names, and the shapes it is about.
+
+    DEGRADES TO A NOTE RATHER THAN TO NOTHING. A ref that was never sent is
+    dropped on the same terms as an invented ref on a verdict, and a set that
+    no longer has enough members once the invented ones are gone loses its
+    arrangement -- but the finding itself survives as a sentence, which is
+    where it used to live anyway. The failure mode of the new path is the old
+    path, not a lost finding.
+
+    Duplicates are dropped too. A model that names the same circle twice in a
+    row of five has described a set of four, and counting it twice would drag
+    a median towards it.
+    """
+    kind = str(raw.get("arrangement") or "").strip().lower()
+    if kind not in ARRANGEMENTS:
+        return "", ()
+
+    members: list[Member] = []
+    seen: set[str] = set()
+    for value in raw.get("shapes") or []:
+        ref = str(value or "").strip()
+        listed = refs.get(ref)
+        if listed is None or ref in seen:
+            continue
+        seen.add(ref)
+        members.append(Member(
+            ref=ref, shape=listed.name,
+            shape_id=listed.shape_id, path=listed.path,
+        ))
+
+    if len(members) < _ARRANGE_MIN[kind]:
+        return "", ()
+    return kind, tuple(members)
+
+
+def _proposal(raw: Any, shape: ShapeProfile) -> Optional[FixAction]:
+    """The model's proposed correction, read the way the rule layer reads one.
+
+    `ai.schema._fix` is the parser, so a proposal from this check and one from
+    the validation layer are the same object by the time anything acts on
+    them. Two things are tightened here.
+
+    The op has to be one this check offers. `_fix` accepts the whole of
+    FIX_OPS, which includes deleting a shape; a model answering this prompt has
+    no business proposing that and the schema does not offer it, so a name
+    outside PROPOSABLE_OPS is read as no proposal at all.
+
+    The shape is taken from the map rather than from the answer. The model is
+    asked for `shape_id` and usually gives it, but the verdict is already
+    anchored to a listed shape by its ref -- which the schema guarantees -- and
+    an id that disagrees with it is the model contradicting itself about which
+    shape this is. The ref wins.
+    """
+    from .schema import _fix  # noqa: PLC0415 - one parser, not two
+
+    action = _fix(raw)
+    if action is None or action.op not in PROPOSABLE_OPS:
+        return None
+    action.shape_id = shape.shape_id
+    action.shape = shape.name
+    return action if action.valid else None
 
 
 def _box_of(

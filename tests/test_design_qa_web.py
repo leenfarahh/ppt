@@ -225,3 +225,167 @@ def test_the_page_is_told_whether_this_host_can_render(wired) -> None:
 
     assert code == 200
     assert "renderer" in json.loads(body)
+
+
+# --------------------------------------------------------------------------- #
+# The second round
+#
+# `apply_fixes` corrects what its own first round caused -- a box that stops
+# clearing its neighbour once the type around it changed size -- and reports
+# that separately, because the rule pipeline's page gives it a section of its
+# own. The design page has no such section, read only the first round, and so
+# made those edits and showed them nowhere. What that looks like from the
+# outside is a slide visibly reflowed under a line reading "1 step(s) taken".
+# --------------------------------------------------------------------------- #
+
+def _outcome(applied: bool, slide: int, shape: str, detail: str):
+    from formatting_tool.apply.applier import FixOutcome
+    from formatting_tool.models import (
+        Category, FixAction, Issue, Severity, Source,
+    )
+
+    issue = Issue(
+        category=Category.SPACE, severity=Severity.WARNING, message=detail,
+        source=Source.RULE, slide=slide, shape=shape, shape_id=7,
+        fix=FixAction(op="move", shape=shape, shape_id=7,
+                      left_in=1.0, top_in=1.0),
+    )
+    issue.id = f"{slide}:{shape}"
+    return FixOutcome(issue=issue, applied=applied, detail=detail)
+
+
+def test_what_the_second_round_changed_is_on_the_list(tmp_path, monkeypatch):
+    """Every edit that reaches the deck has to reach the list beside the
+    pictures. A designer comparing a before and an after is asking what
+    accounts for the difference, and which of the applier's rounds made a
+    change is this tool's bookkeeping, not theirs."""
+    from formatting_tool.apply.applier import ApplyResult
+    from formatting_tool.web import server
+
+    deck = tmp_path / "deck.pptx"
+    deck.write_bytes(b"not really a deck")
+    session = server._QaSession(
+        id="s", directory=tmp_path, deck=deck,
+        report=DesignQaReport(deck="deck.pptx", generated_at="now", model="t"),
+    )
+
+    result = ApplyResult(deck="deck.pptx", output=tmp_path / "fixed.pptx")
+    result.applied = [_outcome(True, 5, "TextBox 26", "stepped the type down")]
+    result.second_round = [
+        _outcome(True, 5, "Gateway 1", "moved it clear of its neighbour"),
+        _outcome(False, 5, "Gateway 2", "there was nowhere to move it to"),
+    ]
+    monkeypatch.setattr(server, "apply_fixes", lambda **kw: result)
+
+    out = server._qa_propose(session, [_outcome(True, 5, "TextBox 26", "x").issue])
+
+    details = [c.detail for c in out.applied]
+    assert "stepped the type down" in details
+    # The second-round change is there, and says where it came from rather
+    # than reading as something the designer ticked.
+    assert any("moved it clear of its neighbour" in d
+               and "following on from the first round" in d for d in details)
+    # And one that was attempted and refused is a refusal, not a silence.
+    assert any("nowhere to move it to" in s.reason for s in out.skipped)
+
+
+def test_a_slide_the_second_round_alone_touched_still_gets_an_after(
+    tmp_path, monkeypatch,
+):
+    """The corrected renders are made for the slides that changed, and which
+    slides changed is read off the applied list. A slide the first round never
+    touched used to be absent from it, so the one picture that would have
+    shown the reflow was never drawn."""
+    from formatting_tool.apply.applier import ApplyResult
+    from formatting_tool.web import server
+
+    deck = tmp_path / "deck.pptx"
+    deck.write_bytes(b"not really a deck")
+    session = server._QaSession(
+        id="s", directory=tmp_path, deck=deck,
+        report=DesignQaReport(deck="deck.pptx", generated_at="now", model="t"),
+    )
+
+    result = ApplyResult(deck="deck.pptx", output=tmp_path / "fixed.pptx")
+    result.applied = [_outcome(True, 2, "Title 1", "recoloured it")]
+    result.second_round = [_outcome(True, 9, "Body 3", "moved it down")]
+    monkeypatch.setattr(server, "apply_fixes", lambda **kw: result)
+
+    out = server._qa_propose(session, [_outcome(True, 2, "Title 1", "x").issue])
+
+    assert sorted({c.slide for c in out.applied}) == [2, 9]
+
+
+# --------------------------------------------------------------------------- #
+# Checking the corrected deck
+#
+# A round corrects what the model saw. Whether the deck now reads right is a
+# different question about a different file, and the only way to ask it used to
+# be downloading the result and uploading it again. These are about the button
+# that does it in place, and about the one thing it must never do: answer the
+# new question with the old deck's pictures.
+# --------------------------------------------------------------------------- #
+
+def test_a_recheck_with_nothing_applied_is_refused(wired) -> None:
+    """Re-checking a deck no round has touched is a second model call for the
+    answer already on the screen, and paying for one by accident is exactly
+    what a button next to a finished round could do."""
+    base, session = wired
+    status, body = _post(base, "/api/qa/recheck", {"session": session.id})
+
+    assert status == 400
+    assert "nothing has been applied" in json.dumps(body).lower()
+
+
+def test_the_corrected_deck_becomes_the_deck_the_check_is_about(tmp_path) -> None:
+    """`deck` moves to the round's output, so applying, rendering and
+    downloading go on meaning "this check's deck" without any of them knowing
+    which pass they are in."""
+    from formatting_tool.web.server import _QaSession
+
+    report = DesignQaReport(deck="deck.pptx", generated_at="now", model="t")
+    session = _QaSession(id="s", directory=tmp_path, deck=tmp_path / "deck.pptx",
+                         report=report)
+
+    # Pass 0, round 0: the working filenames are built from the upload's name.
+    assert session.name == "deck.pptx"
+    assert session.fixed.name == "checked-0-0-deck.pptx"
+    first = session.before_dir
+
+    session.run = 1
+    written = session.fixed
+    session.passes += 1
+    session.run = 0
+    session.deck = tmp_path / "pass-1-deck.pptx"
+
+    # The name does not compound into pass-2-pass-1-deck.pptx, the new round
+    # cannot write over the file it is reading, and the pictures of the two
+    # passes are kept apart.
+    assert session.name == "deck.pptx"
+    assert session.fixed != written
+    assert session.fixed.name == "checked-1-0-deck.pptx"
+    assert session.before_dir != first
+
+
+def test_the_two_passes_do_not_share_a_directory_for_their_afters(tmp_path) -> None:
+    """Pass 0 round 1 and pass 1 round 1 are different pictures of different
+    decks, and one directory for the two of them is the page showing the
+    wrong one."""
+    from formatting_tool.web.server import _QaSession, _qa_after_dir
+
+    session = _QaSession(id="s", directory=tmp_path, deck=tmp_path / "deck.pptx",
+                         report=DesignQaReport(deck="d", generated_at="n", model="t"))
+    session.run = 1
+    first = _qa_after_dir(session)
+    session.passes, session.run = 1, 1
+    assert _qa_after_dir(session) != first
+
+
+def test_a_pass_that_never_happened_is_not_claimed(tmp_path) -> None:
+    """The counter starts where the wording does: the first look at the
+    uploaded file is not a re-check of anything."""
+    from formatting_tool.web.server import _QaSession
+
+    session = _QaSession(id="s", directory=tmp_path, deck=tmp_path / "deck.pptx",
+                         report=DesignQaReport(deck="d", generated_at="n", model="t"))
+    assert session.passes == 0

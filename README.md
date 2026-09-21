@@ -1304,7 +1304,61 @@ statement about the tool rather than about the finding, and the page says so
 plainly: fixable tasks carry a tick box, the rest carry the instruction and go
 into the deck.
 
-**Four corrections, each bounded and checked afterwards.**
+**Two kinds of correction, and they are applied by different halves of the
+tool.** A designer ticking a row does not need to know which.
+
+*Measured verbs*, where the target is something this tool works out by asking
+the renderer. They go through PowerPoint, because that is the only thing that
+can say where a line broke or what size a placeholder is actually drawing.
+
+*Proposals*, where the model names an op and the numbers for it. These are
+`models.FIX_OPS`, the same vocabulary the rule layer's AI pass has used all
+along, so they are validated by `ai/schema.py` and carried out by
+`apply/fixers.py` with the guards those already have: a colour must be one the
+deck vouches for, a size must sit in the range the deck uses for that role, a
+move must land inside the safe margins and survive the overlap check. The
+design check adds the eyes; it does not need a second applier.
+
+Two ops are deliberately not offered. `set_font` swaps a typeface, which is a
+brand decision rather than a design defect. `remove_note` deletes a shape, and
+belongs to the layer that can tell a production note from a caption.
+
+**The deck is its own authority.** `fix_ai_action` refuses every proposal when
+there is no brand reference, which is the honest answer when a deck arrives
+without a master, and this page never has one: it takes a single deck and asks
+whether it holds together. So the reference is derived from the deck itself
+with `derive_master_spec`, giving its own palette, its own typefaces and the
+size range its own slides use for each role. A colour the deck uses on two or
+more slides is added to that palette as well, because the theme is what the
+file says and the body copy is what the file does; where the two disagree
+about a colour that is on every slide, the file is doing it on purpose.
+
+This is not a brand system and does not pretend to be one. A deck that is
+wrong throughout will happily vouch for being wrong consistently, and that is
+what the deck check next door is for.
+
+**A cross-slide mismatch is fixable when the deck can be counted.** The model
+says which slides disagree and on what; arithmetic says what the majority
+does. `position` becomes a move to the median, `type_scale` becomes
+`set_font_size` at the most common size for that role, and `color` becomes
+`recolor_text` at the most common colour for it. A tie is not a majority: two
+slides at 11pt and two at 12pt say the deck has not decided, and picking one
+would be this tool deciding for it. `spacing`, `content` and the rest have no
+number to count and stay tasks.
+
+Measured on a three-slide deck whose third slide had 7pt body copy where the
+others had 12pt, and a red title where the others were near-black:
+
+```
+[FIX:recolor_text ] deck:0   Change the title colour on slide 3 to match the others
+[FIX:set_font_size] deck:1   Increase the body copy on slide 3 to 12pt to match
+...
+recolor_text   slide 3 Title 1                recoloured 1 run(s) to deck:17191C
+set_font_size  slide 3 Content Placeholder 2  set 3 run(s) to 12pt
+grow           slide 1 Content Placeholder 2  stepped the type up from 12pt to 14pt
+```
+
+**The measured verbs, each bounded and checked afterwards.**
 
 | | what it does | what stops it |
 | --- | --- | --- |
@@ -1464,7 +1518,7 @@ Skipped where no browser is installed.
 | `formatting_tool/web/` | The browser UI: a stdlib server and two HTML pages. |
 | `formatting_tool/designqa.py` | The design check: render a deck, ask what it looks like. |
 | `formatting_tool/ai/designqa.py` | The per-slide call, the shape map, the cross-slide pass, and the response contract. |
-| `formatting_tool/apply/qafix.py` | The four bounded corrections, applied through PowerPoint. |
+| `formatting_tool/apply/qafix.py` | The measured corrections, applied through PowerPoint. |
 | `formatting_tool/apply/notes.py` | Writes the tasks nothing can fix into the deck as comments. |
 | `formatting_tool/render.py` | Renders slides through PowerPoint, for the AI layer and the previews. |
 | `formatting_tool/colorutil.py` | Perceptual colour distance. |

@@ -245,13 +245,21 @@ input#slides { min-width: 120px; }
 .across .where a { color: var(--muted); text-decoration: none; border-bottom: 1px solid var(--line-strong); }
 .across .where a:hover { color: var(--ink); }
 
-/* The notes nothing can act on. Deliberately not quiet: dropping these
-   silently is how a slide with an empty column goes to a client. */
+/* Findings about the slide rather than about one shape. Two blocks, because
+   some of them are now work this tool does and a tick box in a panel headed
+   "for a designer" is a contradiction. Deliberately not quiet either way:
+   dropping these silently is how a slide with an empty column goes to a
+   client. */
 .manual { margin-top: 12px; padding: 10px 14px; border-left: 3px solid var(--warning); background: var(--surface); border-radius: 0 8px 8px 0; }
 .manual h3 { font-size: 11px; letter-spacing: .07em; text-transform: uppercase; color: var(--warning); }
 .manual ul { margin: 6px 0 0; padding-left: 18px; font-size: 12.5px; line-height: 1.65; }
 .manual li { margin-bottom: 4px; }
 .manual .say { display: block; color: var(--faint); font-size: 11.5px; }
+.manual.step { border-left-color: var(--accent); }
+.manual.step h3 { color: var(--accent); }
+.manual.step ul { list-style: none; padding-left: 0; }
+.manual.step li { display: flex; align-items: baseline; gap: 8px; }
+.manual.step input { width: 14px; height: 14px; accent-color: var(--ink); cursor: pointer; flex: none; position: relative; top: 2px; }
 .dead { color: var(--faint); font-size: 12px; margin-top: 10px; }
 
 .empty { margin-top: 34px; padding-top: 18px; border-top: 1px solid var(--line-strong); color: var(--muted); }
@@ -528,6 +536,11 @@ function summaryHTML(data) {
     `<code>${esc(data.model)}</code>`,
     `${state.result.elapsed_s}s`,
   ];
+  // WHICH DECK THIS IS ABOUT. After a re-check the pictures marked "before"
+  // are of the deck the last round produced, not of the file that was
+  // uploaded, and a page that does not say so is quietly relabelling the
+  // evidence. Counted from one, because "pass 0" is not how anybody says it.
+  const pass = state.result.pass || 0;
   return `
   <section class="summary">
     <div class="summary-line">
@@ -536,6 +549,9 @@ function summaryHTML(data) {
         s.mismatches ? `, ${s.mismatches} of them across slides` : ""}</span>
       <span class="meta">${meta.join(" &middot; ")}</span>
     </div>
+    ${pass ? `<p class="dim">This is pass ${pass + 1}: the deck read here is
+      the one the previous round produced, so "before" below means the deck as
+      that round left it rather than the file you uploaded.</p>` : ""}
     <div class="toolbar">
       <button class="linkish ${state.showOk ? "on" : ""}" id="show-ok">
         ${state.showOk ? "Hide" : "Show"} the ${s.shapes - s.issues} shape(s) it passed
@@ -656,6 +672,9 @@ function appliedHTML() {
       <b>${head}</b>
       ${filed ? `<span class="dim">&middot; ${filed}</span>` : ""}
       <span class="grow"></span>
+      ${applied.length
+        ? `<button class="linkish" id="recheck">Check the corrected deck</button>`
+        : ""}
       ${done.download
         ? `<a class="linkish" href="${esc(done.download)}">Download the deck</a>`
         : ""}
@@ -723,6 +742,59 @@ async function applyTicked() {
     render();
   } catch (err) {
     setStatus(`<b>Applying failed.</b> ${esc(err.message)}`, "err");
+  } finally {
+    stopTicking();
+    state.busy = false;
+  }
+}
+
+/* Ask the model again, about the deck this round produced.
+ *
+ * A SECOND QUESTION, NOT A SECOND TRY. The corrections were measured against
+ * what the model saw; whether the deck now reads right is something only
+ * another look can answer, and the alternative a designer has is downloading
+ * the result and uploading it again, which is the same two model calls with a
+ * round trip through their filesystem in the middle.
+ *
+ * WHAT IT COSTS IS THE COMPARISON. After this, "before" means the deck as the
+ * last round left it, because that is what the new report is about. The pair
+ * of pictures from the round just gone is on screen until this returns and
+ * then it is gone, which is why the button sits beside them rather than above:
+ * it is the thing to press once they have been looked at.
+ */
+async function recheckAll() {
+  if (!state.session || state.busy) return;
+  const stopTicking = startTicking(
+    "Rendering the corrected deck and asking the model again");
+  state.busy = true;
+  try {
+    const response = await fetch("/api/qa/recheck", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session: state.session,
+        options: {
+          model: $("#model").value,
+          effort: $("#effort").value,
+          slides: slideNumbers($("#slides").value),
+        },
+      }),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || data.error || `HTTP ${response.status}`);
+    state.result = data;
+    // Everything the page was holding describes the deck as it was before
+    // this pass: the round that produced it, the pictures of it, and the ticks
+    // against findings that no longer have the same ids.
+    state.applied = null;
+    state.shots = {};
+    state.ticked.clear();
+    for (const task of fixable()) state.ticked.add(task.id);
+    setStatus("");
+    render();
+    document.querySelector(".applybar")?.scrollIntoView({ block: "start" });
+  } catch (err) {
+    setStatus(`<b>The re-check failed.</b> ${esc(err.message)}`, "err");
   } finally {
     stopTicking();
     state.busy = false;
@@ -866,7 +938,7 @@ function slideHTML(slide) {
       ${shotHTML(before, marks.filter((m) => m.status === "issue"), "")}
     </div>
     ${marks.length ? `<ul class="verdicts">${marks.map(verdictHTML).join("")}</ul>` : ""}
-    ${manualHTML(slide)}
+    ${slideIssuesHTML(slide)}
     ${slide.reason ? `<p class="dead">Not looked at: ${esc(slide.reason)}</p>` : ""}
   </section>`;
 }
@@ -941,7 +1013,12 @@ function verdictHTML(v) {
   </li>`;
 }
 
-/* What the correction will do, in words rather than in the schema's verb. */
+/* What the correction will do, in words rather than in the schema's verb.
+ *
+ * Two families read the same here on purpose. The measured verbs are applied
+ * through PowerPoint and the proposals through the shared applier, and which
+ * half of the tool carries a correction out is not something a designer
+ * ticking a box needs to know. */
 function opWords(op) {
   return {
     grow: "step the type up",
@@ -949,22 +1026,54 @@ function opWords(op) {
     center: "centre it in its holder",
     widen: "widen the box",
     align: "align it to the deck",
-  }[op] || op;
+    set_font_size: "set the type size",
+    recolor_text: "recolour the text",
+    recolor_fill: "recolour the fill",
+    move: "move it",
+    resize: "resize it",
+    disable_autofit: "stop it shrinking its own type",
+    delete_empty_paragraphs: "delete the empty lines",
+  }[op] || op.replace(/_/g, " ");
 }
 
-/* The bucket nothing can act on. It is shown at full weight on purpose: an
-   unused timeline stop and an empty column are exactly the defects a font
-   step cannot touch, and dropping them quietly is how one reaches a client. */
-function manualHTML(slide) {
-  const lines = slide.slide_issues || [];
+/* What is wrong with the slide rather than with one shape on it, split by
+   whether this tool can do anything about it.
+ *
+ * THE SPLIT IS THE POINT. These all used to render as one list headed "for a
+ * designer", which was true when nothing here could measure a set of shapes
+ * and is not true now: a row that does not line up is arithmetic, and it sat
+ * in the same panel as an empty column because both arrived in the same
+ * bucket. Reading the task's `fixable` rather than the finding's shape is
+ * what keeps the two panels honest as that changes again.
+ *
+ * The second panel is shown at full weight on purpose. An unused timeline
+ * stop and an empty column are exactly the defects no correction can touch,
+ * and dropping them quietly is how one reaches a client. */
+function slideIssuesHTML(slide) {
+  const lines = (slide.slide_issues || []).map((line, i) => ({
+    ...line, task_id: `slide:${slide.slide}:${i}`,
+  }));
+  const fix = lines.filter((l) => taskFor(l.task_id)?.fixable);
+  const hand = lines.filter((l) => !taskFor(l.task_id)?.fixable);
+  return panelHTML(fix, true) + panelHTML(hand, false);
+}
+
+function panelHTML(lines, tickable) {
   if (!lines.length) return "";
   return `
-  <div class="manual">
-    <h3>For a designer, on this slide</h3>
+  <div class="manual${tickable ? " step" : ""}">
+    <h3>${tickable
+      ? "On this slide, and ticking it does it"
+      : "For a designer, on this slide"}</h3>
     <ul>${lines.map((line) => `
-      <li>${esc(line.task || line.note)}
-        ${line.task && line.note && line.note !== line.task
-          ? `<span class="say">${esc(line.note)}</span>` : ""}
+      <li>${tickable
+          ? `<input type="checkbox" data-key="${esc(line.task_id)}"
+              ${state.ticked.has(line.task_id) ? "checked" : ""}>`
+          : ""}
+        <div>${esc(taskFor(line.task_id)?.what || line.task || line.note)}
+          ${line.task && line.note && line.note !== line.task
+            ? `<span class="say">${esc(line.note)}</span>` : ""}
+        </div>
       </li>`).join("")}</ul>
   </div>`;
 }
@@ -1015,6 +1124,9 @@ function wire() {
 
   const apply = $("#apply");
   if (apply) apply.addEventListener("click", applyTicked);
+
+  const recheck = $("#recheck");
+  if (recheck) recheck.addEventListener("click", recheckAll);
 
   const marks = $("#mark-toggle");
   if (marks) marks.addEventListener("change", () => {

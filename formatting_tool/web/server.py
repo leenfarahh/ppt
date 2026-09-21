@@ -40,6 +40,7 @@ from ..apply.qafix import apply_steps
 from ..designqa import (
     DesignQaReport,
     comments_for,
+    issues_for,
     outstanding,
     review_deck,
     steps_for,
@@ -219,10 +220,35 @@ class _QaSession:
     # from an unchanged URL is how a page shows the previous deck beside the
     # new one and says the fix did not happen.
     run: int = 0
+    # How many times the check has been asked again ON ITS OWN OUTPUT. A round
+    # corrects what the model saw; looking at the corrected deck is a second
+    # question, and the answer to it is a different report about a different
+    # file. `deck` moves to that file, so everything downstream -- applying,
+    # rendering, downloading -- goes on meaning "the deck this check is about"
+    # without knowing how many passes it took to get here.
+    passes: int = 0
+    # The uploaded filename, kept because `deck` stops being the upload after
+    # the first re-check and the working filenames are built from this. Without
+    # it they compound: pass-2-pass-1-deck.pptx.
+    name: str = ""
+
+    def __post_init__(self) -> None:
+        self.name = self.name or self.deck.name
 
     @property
     def fixed(self) -> Path:
-        return self.directory / f"checked-{self.run}-{self.deck.name}"
+        return self.directory / f"checked-{self.passes}-{self.run}-{self.name}"
+
+    @property
+    def before_dir(self) -> Path:
+        """Where this pass's renders of the deck AS IT NOW STANDS live.
+
+        Per pass, because a re-check reads a different file and the pictures
+        of the last one are not evidence about this one. Serving them from a
+        shared directory is how a page shows the deck before the round that
+        already happened.
+        """
+        return self.directory / "before" / str(self.passes)
 
     def cleanup(self) -> None:
         rmtree(self.directory, ignore_errors=True)
@@ -371,6 +397,8 @@ class _Handler(BaseHTTPRequestHandler):
             code, payload = self._guarded(self._run_preview)
         elif route == "/api/qa/check":
             code, payload = self._guarded(self._run_qa)
+        elif route == "/api/qa/recheck":
+            code, payload = self._guarded(self._run_qa_recheck)
         elif route == "/api/qa/apply":
             code, payload = self._guarded(self._run_qa_apply)
         elif route == "/api/qa/render":
@@ -634,7 +662,10 @@ class _Handler(BaseHTTPRequestHandler):
             with _RUN_LOCK, _capture() as collected:
                 started = time.perf_counter()
                 profile = read_deck(deck)
-                rendered = _qa_render(deck, workdir / "before", slides)
+                # Pass 0's renders. `_QaSession.before_dir` is the same path;
+                # it cannot be asked for it yet because the session is made
+                # from the report this is about to produce.
+                rendered = _qa_render(deck, workdir / "before" / "0", slides)
                 # Narrowed to what was asked for, because asking is not
                 # getting: a renderer free to ignore the request comes back
                 # with the whole deck, and PowerPoint does exactly that for
@@ -646,7 +677,8 @@ class _Handler(BaseHTTPRequestHandler):
                     }
                 report = review_deck(
                     deck,
-                    [(n, workdir / "before" / name) for n, name in rendered.items()],
+                    [(n, workdir / "before" / "0" / name)
+                     for n, name in rendered.items()],
                     ai=ai,
                     profile=profile,
                 )
@@ -663,12 +695,19 @@ class _Handler(BaseHTTPRequestHandler):
                 "report": report.to_dict(),
                 "renderer_ok": bool(rendered),
                 "aspect": _aspect_of(
-                    {n: str(workdir / "before" / name) for n, name in rendered.items()}
+                    {n: str(workdir / "before" / "0" / name)
+                     for n, name in rendered.items()}
                 ),
+                "pass": session.passes,
                 "slides": [
                     {
                         "slide": n,
-                        "before": f"/api/qa/preview/{session.id}/before/{n}",
+                        # The pass is in the URL so a re-check's pictures are
+                        # not the last pass's out of the browser's cache.
+                        "before": (
+                            f"/api/qa/preview/{session.id}/before/{n}"
+                            f"?pass={session.passes}"
+                        ),
                         "after": None,
                     }
                     for n in sorted(rendered)
@@ -681,6 +720,98 @@ class _Handler(BaseHTTPRequestHandler):
             # for the ticked steps to be applied to this exact file.
             if not keep:
                 rmtree(workdir, ignore_errors=True)
+
+    def _run_qa_recheck(self) -> dict[str, Any]:
+        """Ask the model again, about the deck the last round produced.
+
+        WHY THIS IS A BUTTON AND NOT A LOOP. `apply.qafix` takes every step
+        once and stops, because a tool that keeps correcting until the model is
+        happy converges on a deck nobody chose. That argument is about the
+        tool deciding to go round again on its own. A designer who has looked
+        at a before and an after and wants the corrected deck read fresh is
+        making the opposite kind of decision -- they have seen the result and
+        are asking a new question about it -- and there is no reason the answer
+        to that should mean uploading the download.
+
+        THE CORRECTED DECK BECOMES THE DECK. `session.deck` moves to it, so
+        applying, rendering and downloading go on meaning "this check's deck"
+        without knowing which pass they are in. What that costs is the original:
+        after a re-check, the before pictures are of the deck as the last round
+        left it, which is the only honest baseline for a report about that file.
+        The uploaded file is still on disk, and untouched -- nothing here has
+        ever written to it -- but the page stops offering it, because a before
+        and after spanning two rounds is not a comparison anybody asked for.
+
+        Refused when there is nothing new to read. Re-checking a deck no round
+        has touched is a second model call for the answer already on the page,
+        and paying for that by accident is the sort of thing a button does.
+        """
+        body = self._json_body()
+        session = _session(str(body.get("session", "")), _QA_SESSIONS)
+        if not session.fixed.is_file():
+            raise _BadRequest(
+                "nothing has been applied yet, so a re-check would be the same "
+                "question about the same deck"
+            )
+
+        options = body.get("options") or {}
+        ai = AIConfig(
+            model=(str(options.get("model") or "") or SUGGESTED_MODEL).strip(),
+            effort=str(options.get("effort") or "") or DEFAULT_EFFORT,
+        )
+        slides = [int(n) for n in options.get("slides") or []] or None
+
+        with _RUN_LOCK, _capture() as collected:
+            started = time.perf_counter()
+            # Promote first, so `before_dir` and `fixed` already name this
+            # pass's paths and nothing is written over the round being read.
+            corrected = session.fixed
+            session.passes += 1
+            session.run = 0
+            baseline = session.directory / f"pass-{session.passes}-{session.name}"
+            try:
+                copyfile(corrected, baseline)
+            except OSError as exc:
+                raise _BadRequest(f"could not take the corrected deck: {exc}")
+            session.deck = baseline
+
+            profile = read_deck(baseline)
+            rendered = _qa_render(baseline, session.before_dir, slides)
+            if slides:
+                rendered = {
+                    n: name for n, name in rendered.items() if n in set(slides)
+                }
+            report = review_deck(
+                baseline,
+                [(n, session.before_dir / name) for n, name in rendered.items()],
+                ai=ai,
+                profile=profile,
+            )
+            session.report = report
+            elapsed = time.perf_counter() - started
+
+        return {
+            "session": session.id,
+            "report": report.to_dict(),
+            "renderer_ok": bool(rendered),
+            "aspect": _aspect_of(
+                {n: str(session.before_dir / name) for n, name in rendered.items()}
+            ),
+            "pass": session.passes,
+            "slides": [
+                {
+                    "slide": n,
+                    "before": (
+                        f"/api/qa/preview/{session.id}/before/{n}"
+                        f"?pass={session.passes}"
+                    ),
+                    "after": None,
+                }
+                for n in sorted(rendered)
+            ],
+            "logs": collected.records,
+            "elapsed_s": round(elapsed, 2),
+        }
 
     def _run_qa_apply(self) -> dict[str, Any]:
         """Step the type on the ticked shapes, and render what it did.
@@ -703,8 +834,14 @@ class _Handler(BaseHTTPRequestHandler):
         if not chosen and not file_the_rest:
             raise _BadRequest("nothing was ticked")
 
+        # Two kinds of correction, applied by two halves of the tool. The
+        # proposals go through `apply.apply_fixes`, which is where the brand
+        # checks and the geometric guards live; the measured verbs go through
+        # PowerPoint, because their targets are read off the renderer. The page
+        # is shown one list.
+        issues = issues_for(session.report, chosen)
         steps = steps_for(session.report, chosen)
-        if not steps and not file_the_rest:
+        if not steps and not issues and not file_the_rest:
             raise _BadRequest(
                 "none of those are corrections this check can make; they are "
                 "tasks for a designer, and ticking the box beside Apply writes "
@@ -714,11 +851,15 @@ class _Handler(BaseHTTPRequestHandler):
         session.run += 1
         with _RUN_LOCK, _capture() as collected:
             started = time.perf_counter()
-            result = apply_steps(session.deck, session.fixed, steps)
-            if not steps:
-                # Nothing to correct, but the deck still has to exist for the
-                # comments to go into and for the designer to download.
-                result = _qa_copy(session)
+            result = _qa_propose(session, issues)
+            if steps:
+                # In place: the proposals have already written this file, and
+                # copying the upload over it would undo them.
+                measured = apply_steps(session.fixed, session.fixed, steps)
+                result.applied.extend(measured.applied)
+                result.skipped.extend(measured.skipped)
+                result.output = measured.output or result.output
+                result.reason = result.reason or measured.reason
             left = outstanding(session.report, chosen, result.applied)
             written = 0
             if file_the_rest and result.output is not None:
@@ -746,9 +887,13 @@ class _Handler(BaseHTTPRequestHandler):
             "slides": [
                 {
                     "slide": n,
-                    "before": f"/api/qa/preview/{session.id}/before/{n}",
+                    "before": (
+                        f"/api/qa/preview/{session.id}/before/{n}"
+                        f"?pass={session.passes}"
+                    ),
                     "after": (
-                        f"/api/qa/preview/{session.id}/after/{n}?run={session.run}"
+                        f"/api/qa/preview/{session.id}/after/{n}"
+                        f"?pass={session.passes}&run={session.run}"
                         if n in after else None
                     ),
                 }
@@ -782,7 +927,7 @@ class _Handler(BaseHTTPRequestHandler):
             _qa_forget(session, numbers)
 
         with _RUN_LOCK:
-            before = _qa_render(session.deck, session.directory / "before", numbers)
+            before = _qa_render(session.deck, session.before_dir, numbers)
             after: dict[int, str] = {}
             if session.fixed.exists():
                 after = _qa_render(session.fixed, _qa_after_dir(session), numbers)
@@ -793,12 +938,13 @@ class _Handler(BaseHTTPRequestHandler):
                 {
                     "slide": n,
                     "before": (
-                        f"/api/qa/preview/{session.id}/before/{n}?t={int(time.time())}"
+                        f"/api/qa/preview/{session.id}/before/{n}"
+                        f"?pass={session.passes}&t={int(time.time())}"
                         if n in before else None
                     ),
                     "after": (
                         f"/api/qa/preview/{session.id}/after/{n}"
-                        f"?run={session.run}&t={int(time.time())}"
+                        f"?pass={session.passes}&run={session.run}&t={int(time.time())}"
                         if n in after else None
                     ),
                 }
@@ -818,8 +964,7 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         directory = (
-            _qa_after_dir(session) if parts[4] == "after"
-            else session.directory / "before"
+            _qa_after_dir(session) if parts[4] == "after" else session.before_dir
         )
         image = _image_for(directory, parts[5])
         if image is None:
@@ -1192,21 +1337,96 @@ def _qa_render(
     )
 
 
-def _qa_copy(session: "_QaSession") -> Any:
-    """The deck copied, unchanged, so comments have somewhere to go.
+def _qa_propose(session: "_QaSession", issues: list) -> Any:
+    """Carry out the model's proposals through the shared applier.
 
-    A round that corrects nothing still produces a file: the tasks are the
-    point of that round, and they are written into a copy rather than into the
-    designer's upload -- this tool does not edit what it was given.
+    Everything a proposal needs was written for the rule layer: the value
+    checks in `apply.fixers.fix_ai_action`, the overlap and alignment guards
+    every geometric fix goes through, and the second round that clears up what
+    the first one caused. This hands it findings and translates what comes
+    back into the shape the design page speaks.
+
+    With no proposals it still writes the file: a round whose whole purpose is
+    to file the tasks as comments needs a copy to put them in, and this tool
+    never edits the deck it was given.
     """
-    from ..apply.qafix import QaFixResult  # noqa: PLC0415 - COM-side module
+    from ..apply.qafix import Change, QaFixResult, SkippedStep  # noqa: PLC0415
+
+    result = QaFixResult(output=session.fixed)
+    if not issues:
+        try:
+            session.fixed.parent.mkdir(parents=True, exist_ok=True)
+            copyfile(session.deck, session.fixed)
+        except OSError as exc:
+            return QaFixResult(reason=f"could not copy the deck: {exc}")
+        return result
 
     try:
-        session.fixed.parent.mkdir(parents=True, exist_ok=True)
-        copyfile(session.deck, session.fixed)
-    except OSError as exc:
-        return QaFixResult(reason=f"could not copy the deck: {exc}")
-    return QaFixResult(output=session.fixed)
+        applied = apply_fixes(
+            deck=session.deck,
+            issues=issues,
+            out=session.fixed,
+            selected=[issue.id for issue in issues],
+            spec=session.report.spec,
+        )
+    except ApplyError as exc:
+        return QaFixResult(reason=str(exc))
+
+    for outcome in applied.applied:
+        result.applied.append(Change(
+            op=outcome.issue.fix.op if outcome.issue.fix else "",
+            slide=outcome.issue.slide or 0,
+            shape_id=outcome.issue.shape_id or 0,
+            shape=outcome.issue.shape or "",
+            detail=outcome.detail,
+            task_id=outcome.issue.id or "",
+        ))
+    for outcome in applied.skipped:
+        result.skipped.append(SkippedStep(
+            op=outcome.issue.fix.op if outcome.issue.fix else "",
+            slide=outcome.issue.slide or 0,
+            shape_id=outcome.issue.shape_id or 0,
+            shape=outcome.issue.shape or "",
+            # The refusal, which is the interesting half of a guarded
+            # applier: a proposal the deck would not vouch for says so.
+            reason=outcome.detail,
+            task_id=outcome.issue.id or "",
+        ))
+
+    # THE SECOND ROUND IS A CHANGE TO THE DECK AND HAS TO BE ON THE LIST.
+    # `apply_fixes` runs a second pass that clears up what the first one
+    # caused -- a box that no longer clears its neighbour once the type around
+    # it changed size -- and reports it separately, because the rule pipeline's
+    # page gives it a section of its own. This page had no such section and
+    # read only the first round, so those edits were made and shown nowhere:
+    # a slide visibly reflowed under a line saying "1 step(s) taken", which is
+    # the page telling a designer something untrue about their own deck.
+    #
+    # They go in beside the rest rather than into a section of their own. A
+    # designer looking at a before and an after wants to know what accounts for
+    # the difference, and which round a change belongs to is this tool's
+    # bookkeeping. The wording says where it came from.
+    for outcome in applied.second_round:
+        where = "following on from the first round"
+        if outcome.applied:
+            result.applied.append(Change(
+                op=outcome.issue.fix.op if outcome.issue.fix else "",
+                slide=outcome.issue.slide or 0,
+                shape_id=outcome.issue.shape_id or 0,
+                shape=outcome.issue.shape or "",
+                detail=f"{outcome.detail} ({where})",
+                task_id=outcome.issue.id or "",
+            ))
+        else:
+            result.skipped.append(SkippedStep(
+                op=outcome.issue.fix.op if outcome.issue.fix else "",
+                slide=outcome.issue.slide or 0,
+                shape_id=outcome.issue.shape_id or 0,
+                shape=outcome.issue.shape or "",
+                reason=f"{outcome.detail} ({where})",
+                task_id=outcome.issue.id or "",
+            ))
+    return result
 
 
 def _qa_forget(session: "_QaSession", slides: list[int]) -> None:
@@ -1218,7 +1438,7 @@ def _qa_forget(session: "_QaSession", slides: list[int]) -> None:
     per-round directories are what guarantee that.
     """
     for number in slides:
-        for directory in (session.directory / "before", _qa_after_dir(session)):
+        for directory in (session.before_dir, _qa_after_dir(session)):
             try:
                 (directory / f"{number}.png").unlink()
             except OSError:
@@ -1226,7 +1446,10 @@ def _qa_forget(session: "_QaSession", slides: list[int]) -> None:
 
 
 def _qa_after_dir(session: "_QaSession") -> Path:
-    return session.directory / "after" / str(session.run)
+    # Both counters, because a re-check resets the round number: pass 0 round 1
+    # and pass 1 round 1 are different pictures of different decks, and one
+    # directory for the two of them is the page showing the wrong one.
+    return session.directory / "after" / f"{session.passes}-{session.run}"
 
 
 def _qa_sweep(session: "_QaSession") -> None:

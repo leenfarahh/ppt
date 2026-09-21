@@ -24,6 +24,7 @@ from formatting_tool.ai.designqa import (
     deck_issues_from_response,
     review_from_response,
     DeckIssue,
+    Member,
     ShapeVerdict,
     SlideIssue,
     SlideReview,
@@ -38,12 +39,18 @@ from formatting_tool.apply.qafix import (
 )
 from formatting_tool.designqa import (
     DesignQaReport,
+    _deck_fixes,
+    _most_common,
+    _own_spec,
     comments_for,
+    issues_for,
     outstanding,
     steps_for,
 )
+from formatting_tool.ai.designqa import PROPOSABLE_OPS, _proposal
 from formatting_tool.models import (
     DeckProfile,
+    FixAction,
     Geometry,
     ParagraphProfile,
     RunProfile,
@@ -583,6 +590,172 @@ def test_what_cannot_be_ticked_is_what_gets_written_into_the_deck():
 
 
 # --------------------------------------------------------------------------- #
+# Proposals: the open half of the vocabulary
+# --------------------------------------------------------------------------- #
+
+def _shape_with(name, size_pt=None, color=None, role=TextRole.BODY, shape_id=1):
+    run = RunProfile(text="Some copy", size_pt=size_pt, color_hex=color)
+    return ShapeProfile(
+        shape_id=shape_id, name=name, shape_type="PLACEHOLDER (14)",
+        geometry=Geometry(left_in=1.0, top_in=2.0, width_in=8.0, height_in=2.0),
+        role=role, text="Some copy",
+        paragraphs=[ParagraphProfile(text="Some copy", runs=[run])],
+    )
+
+
+def _deck(sizes_and_colors) -> DeckProfile:
+    """A deck of body shapes, one per slide, at the given size and colour."""
+    slides = [
+        SlideProfile(number=number, shapes=[
+            _shape_with(f"Body {number}", size_pt=size, color=color,
+                        shape_id=100 + number)
+        ])
+        for number, (size, color) in enumerate(sizes_and_colors, 1)
+    ]
+    return DeckProfile(path="deck.pptx", width_in=WIDE, height_in=TALL, slides=slides)
+
+
+def test_a_proposal_outside_what_this_check_offers_is_not_a_proposal():
+    """`ai.schema._fix` accepts the whole of FIX_OPS, which includes deleting a
+    shape. A model answering this prompt has no business proposing that."""
+    shape = _shape_with("Body 1")
+    assert _proposal({"op": "remove_note", "shape_id": 1}, shape) is None
+    assert _proposal({"op": "set_font", "font": "Comic Sans"}, shape) is None
+    assert all(
+        _proposal({"op": op, "size_pt": 12, "hex": "112233", "left_in": 1.0,
+                   "top_in": 1.0, "width_in": 2.0, "height_in": 2.0}, shape)
+        is not None
+        for op in PROPOSABLE_OPS
+    )
+
+
+def test_a_proposal_is_anchored_to_the_shape_the_verdict_names():
+    """The ref the schema forced is the anchor. An id that disagrees with it is
+    the model contradicting itself about which shape this is."""
+    shape = _shape_with("Body 1", shape_id=7)
+    action = _proposal({"op": "set_font_size", "size_pt": 12, "shape_id": 999}, shape)
+
+    assert (action.shape_id, action.shape) == (7, "Body 1")
+
+
+def test_a_proposal_makes_a_verdict_executable_without_a_verb():
+    verdict = ShapeVerdict(
+        slide=1, ref="s1", shape="Body 1", shape_id=7, role="body",
+        status="issue", issue="too_small", action="none",
+        note="smaller than the rest", task="set it to 12pt",
+        fix=FixAction(op="set_font_size", shape_id=7, size_pt=12.0),
+    )
+    assert verdict.executable
+
+    report = DesignQaReport(deck="d.pptx", generated_at="now", model="t",
+                            reviews=[SlideReview(slide=1, reviewed=True,
+                                                 verdicts=[verdict])])
+    [issue] = issues_for(report, ["1:s1"])
+    assert issue.id == "1:s1" and issue.fix.op == "set_font_size"
+    assert issue.source.value == "ai"          # routes to fix_ai_action
+    # And it is not also sent to the COM half, which has no word for it.
+    assert steps_for(report, ["1:s1"]) == []
+
+
+def test_a_measured_verb_beats_a_proposal_on_the_same_shape():
+    """Both would do something; one of them has a target this tool measured
+    and the other has a number the model chose."""
+    verdict = ShapeVerdict(
+        slide=1, ref="s1", shape="Body 1", shape_id=7, role="body",
+        status="issue", issue="too_small", action="grow", note="small",
+        task="make it bigger",
+        fix=FixAction(op="set_font_size", shape_id=7, size_pt=40.0),
+    )
+    report = DesignQaReport(deck="d.pptx", generated_at="now", model="t",
+                            reviews=[SlideReview(slide=1, reviewed=True,
+                                                 verdicts=[verdict])])
+
+    assert issues_for(report, ["1:s1"]) == []
+    assert [s.op for s in steps_for(report, ["1:s1"])] == ["grow"]
+
+
+# --------------------------------------------------------------------------- #
+# A mismatch the deck can answer itself
+# --------------------------------------------------------------------------- #
+
+def _mismatch_report(profile, kind="type_scale", slides=(1, 2, 3)):
+    report = DesignQaReport(
+        deck="deck.pptx", generated_at="now", model="t", profile=profile,
+        deck_issues=[DeckIssue(kind=kind, slides=list(slides),
+                               note="they differ", task="make them match")],
+    )
+    report.spec = _own_spec(profile)
+    return report
+
+
+def test_the_odd_slide_is_set_to_what_the_majority_uses():
+    report = _mismatch_report(_deck([(12, "17191C"), (12, "17191C"), (7, "17191C")]))
+    _steps, proposals = _deck_fixes(report, 0, report.deck_issues[0])
+
+    assert [(p.slide, p.fix.op, p.fix.size_pt) for p in proposals] == [
+        (3, "set_font_size", 12.0)
+    ]
+    # Ticking the mismatch selects every correction it needs.
+    assert len(issues_for(report, ["deck:0"])) == 1
+    assert [t.fixable for t in report.tasks if t.kind == "deck"] == [True]
+
+
+def test_the_majority_counts_the_slides_the_mismatch_names():
+    """A mismatch usually names every slide it is about, so counting only the
+    ones left out counts nothing -- which is what made every mismatch come
+    back unfixable the first time."""
+    report = _mismatch_report(
+        _deck([(12, "17191C"), (12, "17191C"), (7, "17191C")]), slides=(1, 2, 3),
+    )
+    _steps, proposals = _deck_fixes(report, 0, report.deck_issues[0])
+    assert proposals and proposals[0].fix.size_pt == 12.0
+
+
+def test_a_colour_the_deck_uses_on_several_slides_is_one_it_vouches_for():
+    """The theme is what the file says; this is what the file does. A body
+    colour on every slide is a decision even when no theme entry names it."""
+    report = _mismatch_report(
+        _deck([(12, "17191C"), (12, "17191C"), (12, "D0211C")]), kind="color",
+    )
+    _steps, proposals = _deck_fixes(report, 0, report.deck_issues[0])
+
+    assert [(p.slide, p.fix.op, p.fix.hex) for p in proposals] == [
+        (3, "recolor_text", "17191C")
+    ]
+    assert "deck:17191C" in report.spec.palette
+
+
+def test_a_colour_on_one_slide_alone_is_not_vouched_for():
+    """It is as likely to be the mistake being reported as the answer to it."""
+    profile = _deck([(12, "17191C"), (12, "17191C"), (12, "D0211C")])
+    spec = _own_spec(profile)
+    assert "deck:D0211C" not in spec.palette
+
+
+def test_a_deck_that_has_not_decided_is_not_decided_for():
+    """Two slides at 11pt and two at 12pt say the deck has not chosen, and
+    picking one would be this tool choosing for it."""
+    report = _mismatch_report(
+        _deck([(11, "17191C"), (11, "17191C"), (12, "17191C"), (12, "17191C")]),
+        slides=(1, 2, 3, 4),
+    )
+    _steps, proposals = _deck_fixes(report, 0, report.deck_issues[0])
+    assert proposals == []
+    assert _most_common([1, 1, 2, 2]) is None
+    assert _most_common([]) is None
+
+
+def test_a_mismatch_with_no_countable_answer_stays_a_task():
+    """`spacing` has no single number to count and `content` is a missing
+    element rather than a wrong value."""
+    profile = _deck([(12, "17191C"), (12, "17191C"), (7, "17191C")])
+    for kind in ("spacing", "content", "other", "size", "alignment"):
+        report = _mismatch_report(profile, kind=kind)
+        steps, proposals = _deck_fixes(report, 0, report.deck_issues[0])
+        assert (steps, proposals) == ([], []), kind
+
+
+# --------------------------------------------------------------------------- #
 # What a round leaves behind
 # --------------------------------------------------------------------------- #
 
@@ -648,3 +821,637 @@ def test_the_stats_count_what_the_page_shows():
     assert stats["slides"] == 1 and stats["reviewed"] == 1
     assert stats["shapes"] == 3 and stats["issues"] == 3
     assert stats["tasks"] == 4 and stats["actions"] == 2 and stats["notes"] == 2
+
+
+# --------------------------------------------------------------------------- #
+# A set of shapes that does not line up
+#
+# The defect the per-shape vocabulary cannot reach, and the reason it could
+# not: every verb in it is about one shape and the thing that holds it, and a
+# row of circles that does not line up is not any one circle being wrong. It
+# used to come back as a sentence and reach a designer as work. What makes it
+# arithmetic instead is the split these tests are really about -- the model
+# names the set and the relation, the FILE says where the shapes belong, and
+# nothing anywhere asks a picture for a coordinate.
+# --------------------------------------------------------------------------- #
+
+def _row(*boxes) -> DeckProfile:
+    """One slide of shapes at the given (left, top, width, height), in inches."""
+    shapes = [
+        ShapeProfile(
+            shape_id=100 + index, name=f"Oval {index}", shape_type="OVAL (9)",
+            geometry=Geometry(left_in=left, top_in=top,
+                              width_in=width, height_in=height),
+        )
+        for index, (left, top, width, height) in enumerate(boxes)
+    ]
+    return DeckProfile(path="deck.pptx", width_in=WIDE, height_in=TALL,
+                       slides=[SlideProfile(number=1, shapes=shapes)])
+
+
+def _arranged(profile: DeckProfile, kind: str, *indexes) -> DesignQaReport:
+    """A report whose one slide finding is an arrangement over those shapes."""
+    shapes = profile.slides[0].shapes
+    members = tuple(
+        Member(ref=f"s{i + 1}", shape=shapes[i].name,
+               shape_id=shapes[i].shape_id, path=(i + 1,))
+        for i in indexes
+    )
+    return DesignQaReport(
+        deck="deck.pptx", generated_at="now", model="test", profile=profile,
+        reviews=[SlideReview(slide=1, reviewed=True, slide_issues=[SlideIssue(
+            note="the circles do not line up",
+            task="put the row back in line",
+            arrangement=kind, members=members,
+        )])],
+    )
+
+
+def test_a_shape_out_of_line_is_moved_to_the_median_edge():
+    """Median rather than mean, for the reason the cross-slide version gives:
+    the shape being reported is the one that is out, and a mean lets it drag
+    the line it is supposed to be joining towards itself."""
+    report = _arranged(
+        _row((1.0, 2.0, 1.5, 1.5), (3.0, 2.0, 1.5, 1.5), (5.0, 2.4, 1.5, 1.5),
+             (7.0, 2.0, 1.5, 1.5), (9.0, 2.0, 1.5, 1.5)),
+        "align_top", 0, 1, 2, 3, 4,
+    )
+
+    [task] = report.tasks
+    assert task.fixable and task.op == "align" and task.issue == "align_top"
+
+    # Only the circle that is out moves: the four already on the line are
+    # inside the floor and produce no step at all.
+    [step] = steps_for(report, ["slide:1:0"])
+    assert (step.shape_id, step.top_in) == (102, 2.0)
+    # And ONLY on the axis the arrangement is about. Levelling a row does not
+    # name a horizontal position at all -- not even the one the shape already
+    # has, which is the whole point: by the time this is applied, a step
+    # before it may have changed that.
+    assert step.left_in is None
+    assert step.task_id == "slide:1:0"
+
+
+def test_aligning_on_an_edge_accounts_for_the_shapes_own_size():
+    """A right edge is a left edge plus a width, and the shapes in a set are
+    not all the same width."""
+    # Right edges of 4.0, 4.0 and 4.0 already agree, so nothing moves.
+    report = _arranged(
+        _row((1.0, 2.0, 3.0, 1.0), (2.0, 3.0, 2.0, 1.0), (0.5, 4.0, 3.5, 1.0)),
+        "align_right", 0, 1, 2,
+    )
+    assert not steps_for(report, ["slide:1:0"])
+
+    # Now they are 4.0, 4.0 and 2.5. The third moves its right edge to 4.0,
+    # which for a 2.0in shape means a left of 2.0.
+    report = _arranged(
+        _row((1.0, 2.0, 3.0, 1.0), (2.0, 3.0, 2.0, 1.0), (0.5, 4.0, 2.0, 1.0)),
+        "align_right", 0, 1, 2,
+    )
+    [step] = steps_for(report, ["slide:1:0"])
+    assert (step.shape_id, step.left_in) == (102, 2.0)
+
+
+def test_distributing_leaves_the_ends_alone_and_evens_the_gaps():
+    """The ends anchor it because they are what the set's extent means. How
+    wide a row should be is a composition somebody chose; how the space inside
+    it is divided is not."""
+    report = _arranged(
+        _row((1.0, 2.0, 1.0, 1.0), (1.5, 2.0, 1.0, 1.0), (6.0, 2.0, 1.0, 1.0)),
+        "distribute_h", 0, 1, 2,
+    )
+    steps = {s.shape_id: s.left_in for s in steps_for(report, ["slide:1:0"])}
+
+    # The span runs 1.0 to 7.0 and holds 3.0in of shape, so each of the two
+    # gaps is 1.5in. The ends are already right and produce no step; the
+    # middle goes to 1.0 + 1.0 + 1.5.
+    assert steps == {101: 3.5}
+
+
+def test_gaps_are_measured_between_boxes_not_between_centres():
+    """The two are the same only when every shape is the same size, and when
+    they are not, evenly spaced centres is the arrangement that looks wrong."""
+    report = _arranged(
+        _row((0.0, 2.0, 1.0, 1.0), (4.0, 2.0, 4.0, 1.0), (9.0, 2.0, 1.0, 1.0)),
+        "distribute_h", 0, 1, 2,
+    )
+    # Span 0.0 to 10.0, holding 6.0in of shape, so each gap is 2.0in and the
+    # wide middle shape starts at 3.0. Evenly spaced CENTRES would have put it
+    # at 3.5, with more white on one side of it than on the other.
+    [step] = steps_for(report, ["slide:1:0"])
+    assert (step.shape_id, step.left_in) == (101, 3.0)
+
+
+def test_shapes_that_do_not_fit_the_span_are_not_distributed():
+    """Equal negative gaps is arithmetic that still produces an answer, and
+    the answer is a tidy pile. The honest reading is that the model named the
+    wrong set, so nothing moves and the finding stays a task."""
+    report = _arranged(
+        _row((0.0, 2.0, 3.0, 1.0), (1.0, 2.0, 3.0, 1.0), (2.0, 2.0, 3.0, 1.0)),
+        "distribute_h", 0, 1, 2,
+    )
+    assert not steps_for(report, ["slide:1:0"])
+    [task] = report.tasks
+    assert not task.fixable
+
+
+def test_a_set_already_in_line_is_not_offered_as_work():
+    """A tick box that would do nothing is worse than no tick box."""
+    report = _arranged(
+        _row((1.0, 2.0, 1.5, 1.5), (3.0, 2.0, 1.5, 1.5), (5.0, 2.0, 1.5, 1.5)),
+        "align_top", 0, 1, 2,
+    )
+    [task] = report.tasks
+    assert not task.fixable and task.op == ""
+    assert not steps_for(report, ["slide:1:0"])
+
+
+def test_an_arrangement_is_not_offered_without_the_deck_to_measure():
+    """No profile, no geometry, no target. The finding is still reported."""
+    report = _arranged(_row((1.0, 2.0, 1.5, 1.5), (3.0, 2.4, 1.5, 1.5)),
+                       "align_top", 0, 1)
+    report.profile = None
+    [task] = report.tasks
+    assert not task.fixable and task.what == "put the row back in line"
+
+
+def test_an_arrangement_names_shapes_from_the_list_or_stops_being_one():
+    """The same rule a verdict lives under: an invented ref is the model
+    having invented a shape. Dropping it can leave too few to measure, and
+    the finding then degrades to the note it used to be -- not to nothing."""
+    review = review_from_response(
+        {
+            "shapes": [],
+            "slide_issues": [{
+                "note": "the two headings sit at different heights",
+                "task": "level them",
+                "arrangement": "align_top",
+                "shapes": ["s1", "s2"],
+            }, {
+                "note": "the badges are unevenly spaced",
+                "task": "even them out",
+                "arrangement": "distribute_h",
+                "shapes": ["s1", "s2", "s404"],
+            }],
+        },
+        1, _refs(), (WIDE, TALL),
+    )
+
+    levelled, spaced = review.slide_issues
+    assert levelled.arrangement == "align_top"
+    assert [m.shape_id for m in levelled.members] == [11, 12]
+    assert levelled.addressable
+
+    # s404 was never sent, and two shapes are already evenly spaced whatever
+    # the gap, so there is nothing left to distribute.
+    assert spaced.arrangement == "" and spaced.members == ()
+    assert spaced.note == "the badges are unevenly spaced"
+
+
+def test_the_same_shape_named_twice_is_counted_once():
+    """Counting it twice would drag a median towards it."""
+    review = review_from_response(
+        {"shapes": [], "slide_issues": [{
+            "note": "n", "task": "t", "arrangement": "align_left",
+            "shapes": ["s1", "s1", "s2"],
+        }]},
+        1, _refs(), (WIDE, TALL),
+    )
+    [issue] = review.slide_issues
+    assert [m.ref for m in issue.members] == ["s1", "s2"]
+
+
+def test_a_relation_nobody_defined_reads_as_no_relation():
+    review = review_from_response(
+        {"shapes": [], "slide_issues": [{
+            "note": "n", "task": "t", "arrangement": "align_diagonally",
+            "shapes": ["s1", "s2"],
+        }]},
+        1, _refs(), (WIDE, TALL),
+    )
+    [issue] = review.slide_issues
+    assert issue.arrangement == "" and not issue.addressable
+
+
+def test_the_model_is_never_asked_where_a_shape_belongs():
+    """The whole split rests on this: it names the set and the relation, and
+    the file supplies every number. A coordinate field on a slide finding
+    would be the guess the rest of the prompt exists to prevent."""
+    from formatting_tool.ai.designqa import _schema
+
+    fields = _schema(["s1"])["properties"]["slide_issues"]["items"]["properties"]
+    assert set(fields) == {"note", "task", "arrangement", "shapes"}
+
+
+def test_a_slide_finding_that_is_not_a_relation_is_still_for_a_designer():
+    """The bucket did not go away. An empty column has no arithmetic and is
+    no less real for it."""
+    [task] = [t for t in _report().tasks if t.kind == "slide"]
+    assert not task.fixable and task.op == ""
+
+
+def test_an_arrangement_whose_moves_were_all_refused_stays_outstanding():
+    """A step that was asked for and did not happen is exactly the finding a
+    page can lose: off the tick list, not in the changes, nowhere."""
+    report = _arranged(
+        _row((1.0, 2.0, 1.5, 1.5), (3.0, 2.0, 1.5, 1.5), (5.0, 2.4, 1.5, 1.5)),
+        "align_top", 0, 1, 2,
+    )
+    left = outstanding(report, ["slide:1:0"], [])
+    assert [t.id for t in left] == ["slide:1:0"]
+
+
+def test_a_row_of_circles_goes_from_answer_to_move_without_a_hand_in_between():
+    """The two halves, joined, on the shape map they actually share.
+
+    Everything above tests one side of the seam: the parse builds members from
+    refs, the arithmetic builds steps from members. The seam itself is the ref
+    -> path -> shape lookup, and it is the part that fails silently -- a path
+    off by one finds a shape, just not the one the model meant, and every
+    assertion about medians still passes while a circle nobody mentioned
+    walks across the slide. So this one starts where the model does, with a
+    map it was handed, and ends at the move.
+    """
+    slide = SlideProfile(number=1, shapes=[
+        _shape("Title 1", 0.6, 0.4, 8.0, 0.9, role=TextRole.TITLE,
+               shape_id=10, text="Goals for the month"),
+        _shape("Oval 1", 1.0, 2.0, 1.5, 1.5, shape_id=21),
+        _shape("Oval 2", 3.0, 2.0, 1.5, 1.5, shape_id=22),
+        _shape("Oval 3", 5.0, 2.6, 1.5, 1.5, shape_id=23),
+        _shape("Oval 4", 7.0, 2.0, 1.5, 1.5, shape_id=24),
+    ])
+    _listing, refs = build_shape_map(slide, WIDE, TALL)
+
+    review = review_from_response(
+        {"shapes": [], "slide_issues": [{
+            "note": "the third circle sits lower than the rest of the row",
+            "task": "level the row on its top edge",
+            "arrangement": "align_top",
+            "shapes": ["s2", "s3", "s4", "s5"],
+        }]},
+        1, refs, (WIDE, TALL),
+    )
+    report = DesignQaReport(
+        deck="deck.pptx", generated_at="now", model="test", reviews=[review],
+        profile=DeckProfile(path="deck.pptx", width_in=WIDE, height_in=TALL,
+                            slides=[slide]),
+    )
+
+    [task] = report.tasks
+    assert task.fixable and task.what == "level the row on its top edge"
+
+    # One move, on the circle that is out, to the top the other three share.
+    # The title was never named and is not touched by a row being levelled.
+    [step] = steps_for(report, [task.id])
+    assert (step.shape, step.shape_id) == ("Oval 3", 23)
+    assert (step.left_in, step.top_in) == (None, 2.0)
+    assert step.measured_off == "level with the others, on their top edge"
+
+
+def _grid() -> DeckProfile:
+    """Ten circles in two rows of five, with one in the top row sitting low.
+
+    The slide that broke this, drawn the way the screenshots had it.
+    """
+    boxes = []
+    for row in range(2):
+        for col in range(5):
+            top = 1.8 + row * 2.2 + (0.3 if (row, col) == (0, 2) else 0.0)
+            boxes.append((0.8 + col * 2.5, top, 1.8, 1.8))
+    return _row(*boxes)
+
+
+def test_a_set_spanning_two_rows_is_split_and_each_row_kept_apart():
+    """The failure that drove this, and the thing no per-move check can catch.
+    Taken whole, the median top of ten circles in two rows falls BETWEEN the
+    rows: every circle is a little over an inch from it, every move passes the
+    two-inch sanity check on its own, and the slide comes back with both rows
+    collapsed onto one line. Nothing is wrong with any single move. The set is
+    wrong, so the set is what gets split."""
+    report = _arranged(_grid(), "align_top", *range(10))
+
+    # One move. The low circle rejoins the four it belongs with, and the row
+    # below it is measured on its own and does not move at all.
+    [step] = steps_for(report, ["slide:1:0"])
+    assert (step.shape_id, step.top_in) == (102, 1.8)
+
+
+def test_naming_the_row_and_naming_the_grid_do_the_same_thing():
+    """Which is the point of splitting rather than refusing. A model shown
+    this slide says "the circles do not line up", and whether it then names
+    five shapes or ten is not something the answer should turn on."""
+    grid = steps_for(_arranged(_grid(), "align_top", *range(10)), ["slide:1:0"])
+    row = steps_for(_arranged(_grid(), "align_top", 0, 1, 2, 3, 4), ["slide:1:0"])
+
+    assert [(s.shape_id, s.top_in) for s in grid] == [(102, 1.8)]
+    assert [(s.shape_id, s.top_in) for s in row] == [(102, 1.8)]
+
+
+def test_the_same_split_happens_on_the_other_axis():
+    """Aligning left edges is about a column, so the set splits into columns.
+    The left-hand one is already square and stays put; only the right-hand
+    one, which is out by 0.3in, is touched."""
+    report = _arranged(
+        _row((1.0, 1.0, 2.0, 1.0), (1.0, 3.0, 2.0, 1.0),
+             (7.0, 1.0, 2.0, 1.0), (7.3, 3.0, 2.0, 1.0)),
+        "align_left", 0, 1, 2, 3,
+    )
+    assert {s.shape_id: s.left_in
+            for s in steps_for(report, ["slide:1:0"])} == {102: 7.15, 103: 7.15}
+
+
+def test_two_shapes_out_of_line_each_move_half_way():
+    """A deliberate consequence of the median, not an accident of it, and the
+    case is worth pinning because it is the one where the median has no
+    majority to find. With four shapes and one out, three agreeing say where
+    the line is and only the fourth moves. With two, there is no way to tell
+    which of them is the one that is wrong -- so neither is called wrong, they
+    meet in the middle, and the complaint is answered without this having to
+    guess which heading a designer meant to keep."""
+    report = _arranged(
+        _row((2.0, 1.6, 3.0, 0.5), (8.0, 1.9, 3.0, 0.5)), "align_top", 0, 1)
+
+    assert {s.shape_id: s.top_in
+            for s in steps_for(report, ["slide:1:0"])} == {100: 1.75, 101: 1.75}
+
+
+def test_distributing_a_grid_spaces_each_row_on_its_own():
+    """Taken whole, sorting a grid by left edge interleaves the rows and the
+    gaps come out measured between shapes that are not beside each other.
+    Split first, each row is spaced against its own neighbours."""
+    # The grid is evenly spaced across already, so an honest answer is no
+    # moves -- and it is the interleaving that would have invented some.
+    assert not steps_for(_arranged(_grid(), "distribute_h", *range(10)),
+                         ["slide:1:0"])
+
+    # Bunch the top row up and only the top row is respaced.
+    crowded = _grid()
+    crowded.slides[0].shapes[1].geometry.left_in = 3.0
+    steps = steps_for(_arranged(crowded, "distribute_h", *range(10)),
+                      ["slide:1:0"])
+    assert {s.shape_id for s in steps} <= {100, 101, 102, 103, 104}
+    assert steps
+
+
+def test_a_shape_far_enough_out_stops_being_part_of_the_row():
+    """Where a row ends is set by the shapes' own sizes, which is the right
+    scale: how far out of line a shape can drift before it is no longer in the
+    row depends on how big the row is. A circle that has cleared its
+    neighbours entirely is not a circle that needs nudging back."""
+    # 1.8in circles, one dropped 2.0in: it shares no height with the other
+    # two, so it is a line of its own -- and a line of one is left alone.
+    report = _arranged(
+        _row((1.0, 2.0, 1.8, 1.8), (3.0, 2.0, 1.8, 1.8), (5.0, 4.0, 1.8, 1.8)),
+        "align_top", 0, 1, 2,
+    )
+    assert not steps_for(report, ["slide:1:0"])
+
+    # Dropped 0.3in, it still overlaps them, and it is levelled.
+    report = _arranged(
+        _row((1.0, 2.0, 1.8, 1.8), (3.0, 2.0, 1.8, 1.8), (5.0, 2.3, 1.8, 1.8)),
+        "align_top", 0, 1, 2,
+    )
+    [step] = steps_for(report, ["slide:1:0"])
+    assert (step.shape_id, step.top_in) == (102, 2.0)
+
+
+# --------------------------------------------------------------------------- #
+# Two corrections on one slide
+#
+# A slide rarely has one thing wrong with it, and the design that survives one
+# finding per slide does not survive three. These are about what happens when
+# several arrangements land in the same round: none of them may quietly undo
+# another, and where two of them genuinely disagree, one has to lose out loud.
+# --------------------------------------------------------------------------- #
+
+def _two_findings(profile: DeckProfile, *findings) -> DesignQaReport:
+    """A report carrying several arrangements on the one slide."""
+    shapes = profile.slides[0].shapes
+    issues = []
+    for kind, indexes in findings:
+        issues.append(SlideIssue(
+            note=f"the shapes are wrong: {kind}", task=f"fix {kind}",
+            arrangement=kind,
+            members=tuple(
+                Member(ref=f"s{i + 1}", shape=shapes[i].name,
+                       shape_id=shapes[i].shape_id, path=(i + 1,))
+                for i in indexes
+            ),
+        ))
+    return DesignQaReport(
+        deck="deck.pptx", generated_at="now", model="test", profile=profile,
+        reviews=[SlideReview(slide=1, reviewed=True, slide_issues=issues)],
+    )
+
+
+def test_a_correction_never_names_the_axis_it_is_not_about():
+    """THE BUG THIS EXISTS FOR, and it is worth stating exactly because it
+    reads as harmless. A correction used to carry the shape's CURRENT position
+    for the axis it was not changing -- writing a value back where it already
+    is should do nothing. It does nothing only while that value is still
+    current. Two findings on one slide are two sets of steps, both measured
+    off the deck as it was read, and the second carries the position the first
+    has just corrected. Seen on a real deck, in one round:
+
+        Oval 7  level with the others, on their top edge  (-0.00in, -0.16in)
+        Oval 7  an equal gap from the shapes either side  (-0.12in, +0.16in)
+
+    Both applied, both reported, net vertical movement zero. Neither step was
+    wrong on its own, which is why nothing refused either of them."""
+    report = _two_findings(
+        _row((0.8, 1.8, 1.8, 1.8), (3.2, 1.8, 1.8, 1.8), (5.7, 1.96, 1.8, 1.8),
+             (8.0, 1.8, 1.8, 1.8), (10.6, 1.8, 1.8, 1.8)),
+        ("align_top", range(5)), ("distribute_h", range(5)),
+    )
+    steps = steps_for(report, [t.id for t in report.tasks])
+    assert steps
+
+    # Exactly one axis per step, always. A step that named both would be a
+    # step asserting something about an axis nobody measured.
+    for step in steps:
+        assert (step.left_in is None) != (step.top_in is None)
+
+    # And the circle that is in both findings is levelled by one and spaced by
+    # the other, rather than levelled and then put back.
+    low = [s for s in steps if s.shape_id == 102]
+    assert [s.top_in for s in low if s.top_in is not None] == [1.8]
+
+
+def test_each_row_of_a_grid_is_spaced_onto_the_same_positions():
+    """Which is how the columns come out square without anything being told to
+    square them: two rows with the same end shapes and the same widths divide
+    the same span, so they land on the same numbers."""
+    report = _two_findings(
+        _row((0.8, 1.8, 1.8, 1.8), (3.2, 1.8, 1.8, 1.8), (5.7, 1.8, 1.8, 1.8),
+             (8.0, 1.8, 1.8, 1.8), (10.6, 1.8, 1.8, 1.8),
+             (0.8, 4.0, 1.8, 1.8), (3.4, 4.0, 1.8, 1.8), (5.8, 4.0, 1.8, 1.8),
+             (8.2, 4.0, 1.8, 1.8), (10.6, 4.0, 1.8, 1.8)),
+        ("distribute_h", range(10)),
+    )
+    placed = {s.shape_id: s.left_in for s in steps_for(report, ["slide:1:0"])}
+    settled = dict(zip(range(100, 110),
+                       [0.8, 3.25, 5.7, 8.15, 10.6] * 2))
+    for shape_id, want in settled.items():
+        assert placed.get(shape_id, want) == want
+
+
+def test_a_row_is_spaced_exactly_rather_than_nearly():
+    """The floor for a set of shapes is not the floor for a title that sits a
+    little low on one slide. A circle left 0.05in short of the line is the
+    defect that was reported, still on the slide, under a page that has just
+    said the row was levelled."""
+    report = _two_findings(
+        _row((0.8, 1.8, 1.8, 1.8), (3.2, 1.8, 1.8, 1.8), (5.7, 1.8, 1.8, 1.8),
+             (8.0, 1.8, 1.8, 1.8), (10.6, 1.8, 1.8, 1.8)),
+        ("distribute_h", range(5)),
+    )
+    # 0.8 and 10.6 anchor an 11.6in span holding 9.0in of circle, so the gaps
+    # are 0.65in and the middle three belong at 3.25, 5.7 and 8.15. The one
+    # 0.05in out is corrected, not waved through.
+    placed = {s.shape_id: s.left_in for s in steps_for(report, ["slide:1:0"])}
+    assert placed[101] == 3.25
+
+
+def test_two_corrections_cannot_both_decide_where_one_shape_sits():
+    """A row spaced evenly and a column lined up both settle a horizontal
+    position and they will not agree. Applied in whatever order they arrive,
+    the second wins and the first is still reported as done -- a page claiming
+    two corrections over a slide carrying one. Arithmetic can compute either
+    answer and cannot choose between them, so the first keeps the axis and the
+    second is refused where somebody can read it."""
+    from formatting_tool.apply.qafix import QaFixResult, Step, _align
+
+    class FakeShape:
+        Left, Top = 72.0, 144.0
+
+    shape, result, settled = FakeShape(), QaFixResult(), set()
+    spaced = Step(op="align", slide=1, shape_id=5, shape="Oval 1", left_in=2.0)
+    _align(shape, spaced, result, settled)
+    assert shape.Left == 144.0 and result.applied
+
+    squared = Step(op="align", slide=1, shape_id=5, shape="Oval 1", left_in=3.0)
+    _align(shape, squared, result, settled)
+    assert shape.Left == 144.0                      # the first answer stands
+    assert "already settled" in result.skipped[0].reason
+    assert "across" in result.skipped[0].reason
+
+
+def test_settling_one_axis_leaves_the_other_free():
+    """Levelling a row and spacing it are not in conflict -- they are the two
+    halves of squaring it up -- so having settled a shape's top must not lock
+    anything out of settling where it sits across."""
+    from formatting_tool.apply.qafix import QaFixResult, Step, _align
+
+    class FakeShape:
+        Left, Top = 72.0, 144.0
+
+    shape, result, settled = FakeShape(), QaFixResult(), set()
+    _align(shape, Step(op="align", slide=1, shape_id=5, shape="Oval 1",
+                       top_in=1.5), result, settled)
+    _align(shape, Step(op="align", slide=1, shape_id=5, shape="Oval 1",
+                       left_in=2.0), result, settled)
+
+    assert not result.skipped
+    assert (shape.Left, shape.Top) == (144.0, 108.0)
+    # Each correction describes only what it did. A levelling that reported
+    # "+0.00in across" was reporting an axis it never touched.
+    assert result.applied[0].detail.endswith("(-0.50in down)")
+    assert result.applied[1].detail.endswith("(+1.00in across)")
+
+
+# --------------------------------------------------------------------------- #
+# The answer has to fit
+#
+# The failure these are about is the quietest one this check has. A slide whose
+# answer runs past the token limit comes back as a truncated string, which is
+# not valid JSON, which is no verdicts at all -- and the answer is long in
+# proportion to how much is wrong with the slide, so the slide that is lost is
+# reliably the slide most worth reading. On a real run: slides 7, 10 and 12 of
+# a 29-slide deck, all "response was not valid JSON", all silently absent from
+# the report.
+# --------------------------------------------------------------------------- #
+
+def test_the_budget_covers_what_the_schema_is_entitled_to_ask_for():
+    """A verdict carrying an issue and a proposal is about 350 characters of
+    JSON -- a ref, a status, an issue, an action, a note, a task, and a `fix`
+    object with eight keys of its own. The old flat 4,096 could not hold a
+    full slide's worth of those, which is not a tuning problem: it is a budget
+    smaller than the answer the schema requires."""
+    from formatting_tool.ai.designqa import _MAX_SHAPES, _answer_tokens
+
+    # Roughly 350 chars a verdict at roughly 3.3 chars a token, and every
+    # listed shape is required to have one.
+    need = _MAX_SHAPES * 350 / 3.3
+    assert _answer_tokens(_MAX_SHAPES) > need
+
+
+def test_a_sparse_slide_still_gets_room_to_think():
+    """The floor is not the answer's size, it is the share of the allowance
+    that thinking would otherwise take from a short answer."""
+    from formatting_tool.ai.designqa import _ANSWER_TOKENS_FLOOR, _answer_tokens
+
+    assert _answer_tokens(0) == _ANSWER_TOKENS_FLOOR
+    assert _answer_tokens(2) == _ANSWER_TOKENS_FLOOR
+
+
+def test_the_budget_grows_with_the_shapes_and_then_stops():
+    from formatting_tool.ai.designqa import _ANSWER_TOKENS_CAP, _answer_tokens
+
+    assert _answer_tokens(60) > _answer_tokens(30) > _answer_tokens(10)
+    assert _answer_tokens(10_000) == _ANSWER_TOKENS_CAP
+
+
+def test_a_cut_off_answer_keeps_the_verdicts_that_arrived():
+    """Decoded one entry at a time from the start, stopping at the first that
+    will not decode. Nothing is repaired -- a half-written verdict is dropped
+    rather than guessed at -- so what comes back is a prefix of what the model
+    actually said and never an invention."""
+    from formatting_tool.ai.gemini import salvage_list
+
+    cut = (
+        '{"shapes": ['
+        '{"shape": "s1", "status": "ok", "issue": "none"}, '
+        '{"shape": "s2", "status": "issue", "issue": "cut_off"}, '
+        '{"shape": "s3", "status": "iss'
+    )
+    kept = salvage_list(cut, "shapes")
+    assert [entry["shape"] for entry in kept] == ["s1", "s2"]
+    # The array that never started is not an error, it is an empty answer.
+    assert salvage_list(cut, "slide_issues") == []
+
+
+def test_salvage_reads_a_whole_answer_the_same_way():
+    """It has to be right on undamaged text too, since what makes an answer
+    the last complete one is not visible from inside the scan."""
+    from formatting_tool.ai.gemini import salvage_list
+
+    whole = '{"shapes": [{"shape": "s1"}, {"shape": "s2"}], "slide_issues": []}'
+    assert [e["shape"] for e in salvage_list(whole, "shapes")] == ["s1", "s2"]
+    assert salvage_list(whole, "slide_issues") == []
+
+
+def test_salvage_gives_nothing_back_rather_than_guessing():
+    from formatting_tool.ai.gemini import salvage_list
+
+    assert salvage_list("", "shapes") == []
+    assert salvage_list("not json at all", "shapes") == []
+    assert salvage_list('{"shapes": [', "shapes") == []
+    # A key that is there but holds something other than an array. The next
+    # "[" in the object belongs to a different key and must not be read as
+    # this one's.
+    assert salvage_list('{"shapes": null}', "shapes") == []
+    mixed = '{"shapes": null, "slide_issues": [{"note": "x"}]}'
+    assert salvage_list(mixed, "shapes") == []
+    assert salvage_list(mixed, "slide_issues") == [{"note": "x"}]
+
+
+def test_a_truncated_answer_carries_its_text_for_the_caller_to_use():
+    """The distinction that makes salvaging possible at all: a refusal leaves
+    nothing to read, and this leaves a complete answer with its tail cut off.
+    Still an AIValidationError, so callers that cannot use half an answer are
+    unaffected."""
+    from formatting_tool.ai.gemini import AIValidationError, Truncated
+
+    exc = Truncated("cut off", text='{"shapes": [{"shape": "s1"}')
+    assert isinstance(exc, AIValidationError)
+    assert exc.text.startswith('{"shapes"')

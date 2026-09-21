@@ -161,10 +161,15 @@ class Issue:
 # implements, and a fix that cannot be run is worse than a finding that says
 # it needs a designer, because it reads as an offer.
 #
-# There is no move or resize here, and that is a decision rather than an
-# omission. The model is told not to measure off a rendered image, and
-# geometry is what the deterministic layer proves from the file; a coordinate
-# from the model would be exactly the guess that instruction exists to stop.
+# `move` and `resize` are here, and they are the two that need a word. The
+# model is told not to measure off a rendered image, and geometry is what the
+# deterministic layer proves from the file, so a coordinate the model made up
+# would be exactly the guess that instruction exists to stop. What makes these
+# safe is that nothing accepts a made-up one: every geometric op goes through
+# the overlap and alignment guards below (`GEOMETRIC_OPS`), and the corrections
+# that move a shape to line it up with others do not come from the model at
+# all -- it names which shapes disagree and arithmetic counts the target off
+# the file. See `designqa._align_steps` and `_arrange_steps`.
 FIX_OPS = frozenset({
     "recolor_fill",
     "recolor_line",

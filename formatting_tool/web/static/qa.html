@@ -260,6 +260,28 @@ input#slides { min-width: 120px; }
 .manual.step ul { list-style: none; padding-left: 0; }
 .manual.step li { display: flex; align-items: baseline; gap: 8px; }
 .manual.step input { width: 14px; height: 14px; accent-color: var(--ink); cursor: pointer; flex: none; position: relative; top: 2px; }
+/* The detail under a pair of pictures, folded away. The pictures ARE the
+   answer to "what did this do"; the sentences under them are for the one
+   change somebody wants to argue with, and an open list of them pushes the
+   next slide's pictures off the screen. The count is on the summary so the
+   fold still says how much is behind it. */
+.changed-fold { margin-top: 8px; }
+.changed-fold > summary {
+  cursor: pointer; list-style: none; width: fit-content;
+  font-size: 11.5px; color: var(--faint);
+}
+.changed-fold > summary::-webkit-details-marker { display: none; }
+.changed-fold > summary:hover { color: var(--ink); }
+.changed-fold[open] > summary { margin-bottom: 4px; }
+
+/* Running: the controls stop taking presses and look like it. See `setBusy`. */
+body.busy { cursor: progress; }
+body.busy button, body.busy select, body.busy input, body.busy .dl,
+body.busy .drop, body.busy .linkish {
+  pointer-events: none; opacity: .5;
+}
+body.busy #status, body.busy #status * { pointer-events: auto; opacity: 1; }
+
 .dead { color: var(--faint); font-size: 12px; margin-top: 10px; }
 
 .empty { margin-top: 34px; padding-top: 18px; border-top: 1px solid var(--line-strong); color: var(--muted); }
@@ -369,6 +391,39 @@ async function boot() {
     notes.push("No <code>GEMINI_API_KEY</code> in the environment, so the model cannot be asked.");
   }
   $("#setup-note").innerHTML = notes.join(" ");
+  await openHandedOver();
+}
+
+/* A check that has already run, named in the link that opened this page.
+ *
+ * The deck check hands its restyled file over by running the design check
+ * server-side and sending the browser here with an id. Nothing was uploaded on
+ * this page, so there is no deck in `state.deck` and the Run button stays as
+ * it is -- the report is simply already there.
+ *
+ * Also what makes a reload survivable, which matters more than it sounds: a
+ * design check is a render of every slide and a model call for each one, and
+ * losing that to an accidental refresh is losing all of it.
+ */
+async function openHandedOver() {
+  const id = new URLSearchParams(location.hash.slice(1)).get("session");
+  if (!id) return;
+  const stopTicking = startTicking("Opening the check");
+  try {
+    const response = await fetch(`/api/qa/session/${encodeURIComponent(id)}`);
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || data.error || `HTTP ${response.status}`);
+    state.result = data;
+    state.session = data.session;
+    for (const task of fixable()) state.ticked.add(task.id);
+    setStatus("");
+    render();
+  } catch (err) {
+    setStatus(`<b>That check could not be opened.</b> ${esc(err.message)}
+      It may have expired; the deck it was about is still on the deck check.`, "err");
+  } finally {
+    stopTicking();
+  }
 }
 
 /* ---------------- the file ---------------- */
@@ -434,15 +489,41 @@ function setStatus(html, cls = "") {
  * line is written once and only the seconds are rewritten -- assigning
  * innerHTML on every tick throws the spinner element away and a new element
  * starts its animation at zero, which reads as an animation that is stuck. */
+/* WHILE SOMETHING IS RUNNING, THE PAGE SAYS SO AND STOPS TAKING ORDERS.
+ *
+ * Every long call already refused to start a second time -- `state.busy` is
+ * checked at the top of each one -- so a second press was always harmless.
+ * That is exactly the problem: it was harmless and INVISIBLE. A designer
+ * presses Apply, nothing appears to happen for the eleven seconds PowerPoint
+ * takes, and presses it again, which also appears to do nothing. The guard
+ * that made the tool safe made it look broken.
+ *
+ * So the refusal moves into the page: a class on <body> greys the controls and
+ * turns the cursor to `progress`, which is a press that visibly does not land
+ * rather than one that silently does not. The status line keeps its spinner
+ * and its running count beside it.
+ *
+ * Counted rather than a boolean. A re-render started while a round is still
+ * finishing would otherwise clear the flag on whichever returned first and
+ * hand a half-busy page back.
+ */
+let _running = 0;
+
+function setBusy(on) {
+  _running = Math.max(0, _running + (on ? 1 : -1));
+  document.body.classList.toggle("busy", _running > 0);
+}
+
 function startTicking(label) {
   const started = Date.now();
+  setBusy(true);
   setStatus(`<span class="spinner"></span>${label}&hellip; <span class="elapsed">0s</span>`);
   const tick = setInterval(() => {
     const elapsed = $("#status .elapsed");
     if (!elapsed) return;
     elapsed.textContent = `${((Date.now() - started) / 1000).toFixed(0)}s`;
   }, 200);
-  return () => clearInterval(tick);
+  return () => { clearInterval(tick); setBusy(false); };
 }
 
 /* "3, 7, 11-14" as [3, 7, 11, 12, 13, 14]. A design check is one model call a
@@ -541,6 +622,10 @@ function summaryHTML(data) {
   // uploaded, and a page that does not say so is quietly relabelling the
   // evidence. Counted from one, because "pass 0" is not how anybody says it.
   const pass = state.result.pass || 0;
+  // And where the deck came from, when it was not uploaded here. "Before"
+  // meaning the output of the deck check is exactly the sort of thing a page
+  // must not leave somebody to infer from a filename.
+  const from = state.result.handed_over || "";
   return `
   <section class="summary">
     <div class="summary-line">
@@ -549,6 +634,10 @@ function summaryHTML(data) {
         s.mismatches ? `, ${s.mismatches} of them across slides` : ""}</span>
       <span class="meta">${meta.join(" &middot; ")}</span>
     </div>
+    ${from && !pass ? `<p class="dim">This deck came from the deck check: it is
+      <b>${esc(from)}</b> with the master applied and the fixes you ticked
+      there already made. "Before" below means that deck, not the file you
+      first uploaded.</p>` : ""}
     ${pass ? `<p class="dim">This is pass ${pass + 1}: the deck read here is
       the one the previous round produced, so "before" below means the deck as
       that round left it rather than the file you uploaded.</p>` : ""}
@@ -702,7 +791,7 @@ function outstandingHTML(done) {
       has been done.</p>`;
   }
   return `
-  <details class="left-over" ${left.length <= 6 ? "open" : ""}>
+  <details class="left-over">
     <summary>${left.length} task(s) still to do${
       done.comments_written ? ", each one a comment in the deck" : ""}</summary>
     <ul class="applied-list">
@@ -861,16 +950,20 @@ function pairHTML(row) {
       ${shotHTML(shown.before, marks, "before")}
       ${shotHTML(shown.after, marks, "after")}
     </div>
-    <ul class="changed">
-      ${changes.map((c) => `
-        <li><span class="num">${c.n}</span>
-          <b>${esc(c.shape)}</b>
-          <span>${esc(c.detail)}</span></li>`).join("")}
-      ${refused.map((sk) => `
-        <li><span class="num off">&times;</span>
-          <b>${esc(sk.shape)}</b>
-          <span class="why">not taken: ${esc(sk.reason)}</span></li>`).join("")}
-    </ul>
+    <details class="changed-fold">
+      <summary>${changes.length} change${changes.length === 1 ? "" : "s"}${
+        refused.length ? `, ${refused.length} refused` : ""} in detail</summary>
+      <ul class="changed">
+        ${changes.map((c) => `
+          <li><span class="num">${c.n}</span>
+            <b>${esc(c.shape)}</b>
+            <span>${esc(c.detail)}</span></li>`).join("")}
+        ${refused.map((sk) => `
+          <li><span class="num off">&times;</span>
+            <b>${esc(sk.shape)}</b>
+            <span class="why">not taken: ${esc(sk.reason)}</span></li>`).join("")}
+      </ul>
+    </details>
   </div>`;
 }
 

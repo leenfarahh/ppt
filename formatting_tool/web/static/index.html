@@ -409,6 +409,13 @@ details.advanced[open] summary::before { content: "\2212  "; }
   border-radius: 8px; padding: 12px 14px; margin: 10px 0 0;
   overflow-x: auto; white-space: pre-wrap; color: var(--muted);
 }
+/* Running: the controls stop taking presses and look like it. See `setBusy`. */
+body.busy { cursor: progress; }
+body.busy button, body.busy select, body.busy input, body.busy .dl,
+body.busy .drop, body.busy .linkish {
+  pointer-events: none; opacity: .5;
+}
+body.busy #status, body.busy #status * { pointer-events: auto; opacity: 1; }
 </style>
 </head>
 <body>
@@ -634,6 +641,53 @@ document.addEventListener("click", (e) => {
 
 /* ---------------- run ---------------- */
 
+/* Hand the restyled deck to the design check.
+ *
+ * THE ORDER IS THIS PIPELINE'S OWN ARGUMENT, one stage further on. Applying
+ * the master goes first because putting content into its placeholders settles
+ * a great many findings and raises a few, so a report written before it
+ * describes a deck nobody will send. The design check reads a PICTURE, and a
+ * picture of a deck that has not been restyled yet is a picture of a deck that
+ * is about to change.
+ *
+ * IT RUNS SERVER-SIDE AND THE BROWSER FOLLOWS A LINK. The alternative is
+ * downloading the corrected deck and uploading it to the other page, which is
+ * the same two files and a round trip through somebody's Downloads folder. So
+ * the check runs against the copy the server already has and the page opens on
+ * its id. Nothing goes up the wire twice.
+ *
+ * Slow on purpose to be honest about: this is a render of every slide and a
+ * model call for each one, the same as the design check always is. The button
+ * says so while it waits rather than looking broken.
+ */
+async function handOverToDesignCheck() {
+  if (state.busy || !state.session) return;
+  const stopTicking = startTicking(
+    "Rendering the corrected deck and running the design check");
+  state.busy = true;
+  try {
+    const response = await fetch("/api/qa/handoff", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session: state.session,
+        options: { model: $("#model")?.value, effort: $("#effort")?.value },
+      }),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || data.error || `HTTP ${response.status}`);
+    // The id, not the report: the design page reads it back from the session,
+    // so a reload there costs nothing and this page does not have to carry a
+    // report it has no way to show.
+    location.href = `/qa#session=${encodeURIComponent(data.session)}`;
+  } catch (err) {
+    setStatus(`<b>The design check could not be started.</b> ${esc(err.message)}`, "err");
+  } finally {
+    stopTicking();
+    state.busy = false;
+  }
+}
+
 function setStatus(html, cls = "") {
   const el = $("#status");
   el.className = `status ${cls}`;
@@ -652,8 +706,34 @@ function setStatus(html, cls = "") {
  * textContent on a node the spinner is not inside. Returns the function that
  * stops it.
  */
+/* WHILE SOMETHING IS RUNNING, THE PAGE SAYS SO AND STOPS TAKING ORDERS.
+ *
+ * Every long call already refused to start a second time -- `state.busy` is
+ * checked at the top of each one -- so a second press was always harmless.
+ * That is exactly the problem: it was harmless and INVISIBLE. A designer
+ * presses Apply, nothing appears to happen for the eleven seconds PowerPoint
+ * takes, and presses it again, which also appears to do nothing. The guard
+ * that made the tool safe made it look broken.
+ *
+ * So the refusal moves into the page: a class on <body> greys the controls and
+ * turns the cursor to `progress`, which is a press that visibly does not land
+ * rather than one that silently does not. The status line keeps its spinner
+ * and its running count beside it.
+ *
+ * Counted rather than a boolean. A re-render started while a round is still
+ * finishing would otherwise clear the flag on whichever returned first and
+ * hand a half-busy page back.
+ */
+let _running = 0;
+
+function setBusy(on) {
+  _running = Math.max(0, _running + (on ? 1 : -1));
+  document.body.classList.toggle("busy", _running > 0);
+}
+
 function startTicking(label) {
   const started = Date.now();
+  setBusy(true);
   setStatus(`<span class="spinner"></span>${label}&hellip; ` +
             `<span class="elapsed">0s</span>`);
   const tick = setInterval(() => {
@@ -663,7 +743,7 @@ function startTicking(label) {
     if (!elapsed) return;
     elapsed.textContent = `${((Date.now() - started) / 1000).toFixed(0)}s`;
   }, 200);
-  return () => clearInterval(tick);
+  return () => { clearInterval(tick); setBusy(false); };
 }
 
 async function runCheck() {
@@ -1038,6 +1118,7 @@ function appliedHTML() {
         ${r.undone.length} undone</span>` : ""}
       <span class="grow"></span>
       <button class="linkish" id="do-preview">Render before / after</button>
+      <button class="linkish" id="to-qa">Run the design check on this</button>
       <a class="dl" href="${esc(r.download)}" download>Download the corrected deck</a>
     </div>
     <details class="runlog changes" ${state.changesOpen ? "open" : ""}>
@@ -1277,11 +1358,16 @@ function changeMarks() {
  * An explicit toggle always wins and is remembered per slide, so re-rendering
  * -- which every tick of the apply bar does -- does not fold a list the reader
  * just opened. */
-const SLIDE_LIST_OPEN_UP_TO = 8;
-
-function slideListOpen(slide, count) {
-  const chosen = state.slideOpen[slide];
-  return chosen === undefined ? count <= SLIDE_LIST_OPEN_UP_TO : chosen;
+/* Every fold starts closed, and the only thing that opens one is somebody
+ * opening it. There used to be a threshold here -- a short list opened itself,
+ * a long one did not -- and what that produces is a page whose shape depends
+ * on how bad the deck is: the same section is open on one run and shut on the
+ * next, so there is nowhere on the screen a designer can learn to look. The
+ * pictures are the exception and are not folded at all; they are the evidence,
+ * and evidence behind a disclosure triangle is evidence nobody sees.
+ */
+function slideListOpen(slide, _count) {
+  return state.slideOpen[slide] === true;
 }
 
 function slideChangesHTML(slide, marks) {
@@ -1801,6 +1887,9 @@ function wireResults() {
 
   const preview = $("#do-preview");
   if (preview) preview.addEventListener("click", () => renderPreview());
+
+  const toQa = $("#to-qa");
+  if (toQa) toQa.addEventListener("click", handOverToDesignCheck);
 
   const changes = document.querySelector("details.changes");
   if (changes) changes.addEventListener("toggle", () => {

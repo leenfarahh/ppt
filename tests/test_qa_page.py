@@ -322,15 +322,17 @@ window.fetch = async (url) => {{
     return path
 
 
-@pytest.fixture(scope="module")
-def dom(tmp_path_factory) -> str:
-    """The page's DOM after a check, an apply and a re-render."""
-    if not PAGE.is_file():
-        pytest.skip("run from the project root")
-    harness = _harness(tmp_path_factory.mktemp("page"))
+def _dump_dom(harness: Path, tmp_path_factory, browsers: list[str]) -> str:
+    """Load a page in each browser in turn until one produces a document.
 
+    Shared with `test_index_script.py`, which asks a much smaller question of
+    the other page. All of them, not the first one, for the reason `_browsers`
+    gives: a browser that exits 0 with an empty stdout is indistinguishable
+    from no browser, and reading that as a skip turns a failing page into a
+    line in the summary nobody looks at twice.
+    """
     complaints = []
-    for index, browser in enumerate(_browsers()):
+    for index, browser in enumerate(browsers):
         profile = tmp_path_factory.mktemp(f"profile{index}")
         finished = subprocess.run(
             [
@@ -353,6 +355,15 @@ def dom(tmp_path_factory) -> str:
             f"{Path(browser).name}: {finished.stderr.decode('utf-8', 'replace')[:200]}"
         )
     pytest.skip("no browser produced a DOM -- " + "; ".join(complaints))
+
+
+@pytest.fixture(scope="module")
+def dom(tmp_path_factory) -> str:
+    """The page's DOM after a check, an apply and a re-render."""
+    if not PAGE.is_file():
+        pytest.skip("run from the project root")
+    harness = _harness(tmp_path_factory.mktemp("page"))
+    return _dump_dom(harness, tmp_path_factory, _browsers())
 
 
 def _results(dom: str) -> str:
@@ -461,6 +472,37 @@ def test_a_finished_round_offers_to_check_what_it_produced(dom: str) -> None:
 
     assert 'id="recheck"' in applied
     assert "Check the corrected deck" in applied
+
+
+def test_the_page_says_when_it_is_running(dom: str) -> None:
+    """Every long call already refused to start twice, which made a second
+    press harmless AND invisible: the guard that made the tool safe made it
+    look broken. The refusal is now something the page shows."""
+    html = PAGE.read_text(encoding="utf-8")
+
+    # Owned by the one function every long call goes through, so a new call
+    # cannot forget it.
+    assert "setBusy(true)" in html
+    assert "clearInterval(tick); setBusy(false);" in html
+    assert "body.busy button" in html
+    # Counted, not a boolean: two overlapping calls must not have the first to
+    # return hand back a half-busy page.
+    assert "_running = Math.max(0, _running" in html
+
+    # And the run that this DOM came from finished, so nothing is left greyed.
+    assert 'class="busy"' not in dom
+
+
+def test_the_detail_under_a_pair_starts_folded(dom: str) -> None:
+    """The pictures are the answer to "what did this do". The sentences under
+    them are for the one change somebody wants to argue with, and an open list
+    of them pushes the next slide's pictures off the screen."""
+    results = _results(dom)
+
+    assert 'class="changed-fold"' in results
+    assert 'class="changed-fold" open' not in results
+    # The fold still says how much is behind it.
+    assert "in detail</summary>" in results
 
 
 def test_the_findings_still_read_as_findings(dom: str) -> None:

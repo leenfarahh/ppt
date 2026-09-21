@@ -517,9 +517,15 @@ def outstanding(
     done = {
         (change.slide, change.shape_id, change.op) for change in (applied or ())
     }
-    aligned = {change.slide for change in (applied or ()) if change.op == "align"}
-    # Proposals come back identified by the finding they were made on, since
-    # that is how the shared applier reports an outcome.
+    # EVERY CORRECTION SAYS WHICH ROW IT ANSWERS. It has to: `align` is applied
+    # by two different findings now -- a title moved to where the deck puts it,
+    # and a shape moved into line with the row beside it -- and this used to
+    # tell them apart by asking whether ANY align had landed on ANY of a
+    # mismatch's slides. Levelling a row on slide 7 therefore answered "did the
+    # title on slide 7 move?" with yes, and the mismatch dropped off this list
+    # without being corrected or written into the deck. Which is worst exactly
+    # when it matters: a title's own move is refused when it is further out
+    # than an alignment allows, and that is when the mismatch is worth having.
     by_id = {getattr(change, "task_id", "") for change in (applied or ())}
 
     left: list[Task] = []
@@ -529,20 +535,15 @@ def outstanding(
             continue
         if task.id in by_id:
             continue
-        if task.kind == "slide":
-            # An arrangement is several moves filed under one id, and any of
-            # them landing is the row having been acted on -- which the check
-            # against `by_id` above has already settled. Reaching here means
-            # every move in the set was refused, so the task stands and says
-            # so, rather than reading as done because it was ticked.
-            left.append(task)
-        elif task.kind == "deck":
-            # A mismatch is answered by several corrections, one per shape,
-            # each carrying the task's id as a prefix. Any of them landing is
-            # the row having been acted on; the rest are reported as refusals
-            # beside it.
-            if not (any(number in aligned for number in task.slides)
-                    or any(key.startswith(f"{task.id}:") for key in by_id)):
+        if task.kind in ("slide", "deck"):
+            # Both are several corrections filed under one id, and any of them
+            # landing is the row having been acted on -- which the check
+            # against `by_id` above has already settled. A proposal made on a
+            # mismatch carries the id as a PREFIX, because one mismatch can
+            # raise a correction per shape. Reaching past both means every
+            # correction in the set was refused, so the task stands and says
+            # so rather than reading as done because it was ticked.
+            if not any(key.startswith(f"{task.id}:") for key in by_id):
                 left.append(task)
         elif (task.slide, task.shape_id, task.op) not in done:
             left.append(task)
@@ -624,7 +625,7 @@ def steps_for(report: DesignQaReport, chosen: Optional[Sequence[str]] = None) ->
 
     for index, issue in enumerate(report.deck_issues):
         if wanted is None or f"deck:{index}" in wanted:
-            steps.extend(_align_steps(report, issue))
+            steps.extend(_align_steps(report, index, issue))
     # Slide-level arrangements come off `report.reviews` rather than off the
     # narrowed copy above, which drops `slide_issues` because `steps_from`
     # has never read them.
@@ -666,7 +667,7 @@ def _deck_fixes(
     if report.profile is None:
         return [], []
     if issue.kind == "position":
-        return _align_steps(report, issue), []
+        return _align_steps(report, index, issue), []
     if issue.kind == "type_scale":
         return [], _size_fixes(report, index, issue)
     if issue.kind == "color":
@@ -838,7 +839,7 @@ def _most_common(values: Sequence[Any]) -> Optional[Any]:
     return ranked[0][0]
 
 
-def _align_steps(report: DesignQaReport, issue: DeckIssue) -> list:
+def _align_steps(report: DesignQaReport, index: int, issue: DeckIssue) -> list:
     """The moves that would settle a cross-slide position mismatch.
 
     THE MODEL SAYS WHICH SLIDES DISAGREE; ARITHMETIC SAYS WHERE THE SHAPE
@@ -891,6 +892,7 @@ def _align_steps(report: DesignQaReport, issue: DeckIssue) -> list:
             path=_path_of(report.profile, number, title),
             left_in=round(left, 3),
             top_in=round(top, 3),
+            task_id=f"deck:{index}",
             note=issue.note,
         ))
     return steps

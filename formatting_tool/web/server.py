@@ -231,6 +231,16 @@ class _QaSession:
     # the first re-check and the working filenames are built from this. Without
     # it they compound: pass-2-pass-1-deck.pptx.
     name: str = ""
+    # The last check's answer, kept so the page can be opened against a session
+    # that already exists rather than only by uploading a deck. That is what
+    # lets the deck check hand its restyled file over: the design check runs
+    # server-side, the page opens on the session id, and nothing goes up the
+    # wire twice. It also means a reload does not throw the report away.
+    payload: dict[str, Any] = field(default_factory=dict)
+    # Where this deck came from, when it was not uploaded here. The page says
+    # so, because "before" meaning the output of another pipeline is exactly
+    # the sort of thing a page must not leave a designer to infer.
+    handed_over: str = ""
 
     def __post_init__(self) -> None:
         self.name = self.name or self.deck.name
@@ -378,6 +388,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._qa_preview(route)
         elif route.startswith("/api/qa/download/"):
             self._qa_download(route)
+        elif route.startswith("/api/qa/session/"):
+            self._qa_session(route)
         elif route.startswith("/api/preview/"):
             self._preview(route)
         elif route.startswith("/api/download/"):
@@ -397,6 +409,8 @@ class _Handler(BaseHTTPRequestHandler):
             code, payload = self._guarded(self._run_preview)
         elif route == "/api/qa/check":
             code, payload = self._guarded(self._run_qa)
+        elif route == "/api/qa/handoff":
+            code, payload = self._guarded(self._run_qa_handoff)
         elif route == "/api/qa/recheck":
             code, payload = self._guarded(self._run_qa_recheck)
         elif route == "/api/qa/apply":
@@ -689,35 +703,87 @@ class _Handler(BaseHTTPRequestHandler):
             )
             _remember(session, _QA_SESSIONS)
             keep = True
-
-            return {
-                "session": session.id,
-                "report": report.to_dict(),
-                "renderer_ok": bool(rendered),
-                "aspect": _aspect_of(
-                    {n: str(workdir / "before" / "0" / name)
-                     for n, name in rendered.items()}
-                ),
-                "pass": session.passes,
-                "slides": [
-                    {
-                        "slide": n,
-                        # The pass is in the URL so a re-check's pictures are
-                        # not the last pass's out of the browser's cache.
-                        "before": (
-                            f"/api/qa/preview/{session.id}/before/{n}"
-                            f"?pass={session.passes}"
-                        ),
-                        "after": None,
-                    }
-                    for n in sorted(rendered)
-                ],
-                "logs": collected.records,
-                "elapsed_s": round(elapsed, 2),
-            }
+            session.payload = _qa_check_payload(
+                session, rendered, collected.records, elapsed
+            )
+            return session.payload
         finally:
             # The deck stays on disk when a session owns it: the page will ask
             # for the ticked steps to be applied to this exact file.
+            if not keep:
+                rmtree(workdir, ignore_errors=True)
+
+    def _run_qa_handoff(self) -> dict[str, Any]:
+        """Run the design check on what the deck check just produced.
+
+        THE ORDER IS THE PIPELINE'S OWN. `pipeline.run` puts applying the
+        master first and says why: putting content into the master's
+        placeholders resolves a great many findings by itself and raises a few
+        of its own, so a report made before it describes a deck nobody will
+        send. The design check is the same argument one stage further on. It
+        reads a picture, and the picture of a deck that has not been restyled
+        yet is a picture of a deck that is about to change.
+
+        WHY IT IS A HAND-OVER AND NOT A STAGE. Applying is the designer's
+        decision -- they tick what to apply and leave the rest -- so there is
+        no restyled deck to look at until they have made it. A single run
+        would have to either apply everything without asking or check the deck
+        it was about to change, and both answer a question nobody posed.
+
+        A SESSION OF ITS OWN, on a copy. The two checks have different
+        lifetimes: the deck check's files are swept when its rounds move on,
+        and a design check holding a path into that directory would be reading
+        a file another page is entitled to delete.
+        """
+        body = self._json_body()
+        source = _session(str(body.get("session", "")))
+        if not source.applied_once or not source.fixed.is_file():
+            raise _BadRequest(
+                "nothing has been applied yet, so there is no restyled deck "
+                "to check"
+            )
+
+        options = body.get("options") or {}
+        ai = AIConfig(
+            model=(str(options.get("model") or "") or SUGGESTED_MODEL).strip(),
+            effort=str(options.get("effort") or "") or DEFAULT_EFFORT,
+        )
+        slides = [int(n) for n in options.get("slides") or []] or None
+
+        workdir = Path(tempfile.mkdtemp(prefix="formatting-tool-qa-", dir=_workroot()))
+        keep = False
+        try:
+            deck = workdir / source.fixed.name
+            copyfile(source.fixed, deck)
+
+            with _RUN_LOCK, _capture() as collected:
+                started = time.perf_counter()
+                profile = read_deck(deck)
+                rendered = _qa_render(deck, workdir / "before" / "0", slides)
+                if slides:
+                    rendered = {
+                        n: name for n, name in rendered.items() if n in set(slides)
+                    }
+                report = review_deck(
+                    deck,
+                    [(n, workdir / "before" / "0" / name)
+                     for n, name in rendered.items()],
+                    ai=ai,
+                    profile=profile,
+                )
+                elapsed = time.perf_counter() - started
+
+            session = _QaSession(
+                id=secrets.token_hex(8), directory=workdir, deck=deck, report=report,
+                handed_over=source.deck.name,
+            )
+            _remember(session, _QA_SESSIONS)
+            keep = True
+            session.payload = _qa_check_payload(
+                session, rendered, collected.records, elapsed
+            )
+            return session.payload
+        finally:
             if not keep:
                 rmtree(workdir, ignore_errors=True)
 
@@ -790,28 +856,10 @@ class _Handler(BaseHTTPRequestHandler):
             session.report = report
             elapsed = time.perf_counter() - started
 
-        return {
-            "session": session.id,
-            "report": report.to_dict(),
-            "renderer_ok": bool(rendered),
-            "aspect": _aspect_of(
-                {n: str(session.before_dir / name) for n, name in rendered.items()}
-            ),
-            "pass": session.passes,
-            "slides": [
-                {
-                    "slide": n,
-                    "before": (
-                        f"/api/qa/preview/{session.id}/before/{n}"
-                        f"?pass={session.passes}"
-                    ),
-                    "after": None,
-                }
-                for n in sorted(rendered)
-            ],
-            "logs": collected.records,
-            "elapsed_s": round(elapsed, 2),
-        }
+        session.payload = _qa_check_payload(
+            session, rendered, collected.records, elapsed
+        )
+        return session.payload
 
     def _run_qa_apply(self) -> dict[str, Any]:
         """Step the type on the ticked shapes, and render what it did.
@@ -867,7 +915,13 @@ class _Handler(BaseHTTPRequestHandler):
             elapsed = time.perf_counter() - started
         _qa_sweep(session)
 
-        touched = sorted({change.slide for change in result.applied})
+        # Real slide numbers only. A correction about the deck rather than
+        # about one slide reports slide 0 -- `_qa_propose` has nothing else to
+        # put there -- and 0 costs twice: the page is handed a preview URL that
+        # 404s, and `render_deck` reads a request naming no valid slide as a
+        # request for the WHOLE DECK, which on a ninety-slide deck is a render
+        # nobody asked for and eighty-nine pairs of identical pictures.
+        touched = sorted({c.slide for c in result.applied if c.slide})
         after: dict[int, str] = {}
         if result.output is not None and result.applied:
             after = _qa_render(session.fixed, _qa_after_dir(session), touched)
@@ -952,6 +1006,29 @@ class _Handler(BaseHTTPRequestHandler):
             ],
         }
 
+    def _qa_session(self, route: str) -> None:
+        """A check that has already run, by id.
+
+        The page normally gets its report as the answer to the upload that
+        produced it. It cannot when the deck check hands a restyled file over:
+        that check runs server-side, and what crosses to the browser is an id
+        in a link. So the last answer is kept on the session and served here.
+
+        A reload gets the same thing, which is worth having on its own: the
+        design check is minutes of rendering and a model call per slide, and
+        losing it to a refresh is losing all of that.
+        """
+        session_id = route.rsplit("/", 1)[-1]
+        try:
+            session = _session(session_id, _QA_SESSIONS)
+        except _BadRequest as exc:
+            self._send_json(404, {"error": str(exc)})
+            return
+        if not session.payload:
+            self._send_json(404, {"error": "that check has no answer to show"})
+            return
+        self._send_json(200, session.payload)
+
     def _qa_preview(self, route: str) -> None:
         parts = route.strip("/").split("/")   # api qa preview <id> <which> <n>
         if len(parts) != 6 or parts[4] not in ("before", "after"):
@@ -979,17 +1056,29 @@ class _Handler(BaseHTTPRequestHandler):
         except _BadRequest as exc:
             self._send_json(404, {"error": str(exc)})
             return
-        if not session.fixed.exists():
+        # This pass's output where there is one, and otherwise the deck this
+        # pass is READING -- which after a re-check is the previous pass's
+        # output, already corrected. Without the fallback, re-checking made the
+        # corrected deck unreachable: the round that produced it belongs to a
+        # pass that is over, and the new pass has written nothing yet.
+        #
+        # Only past pass 0. There, `deck` is still the file they uploaded, and
+        # handing that back labelled as the corrected deck is a lie about a
+        # deck they would then send.
+        source = session.fixed
+        if not source.exists() and session.passes:
+            source = session.deck
+        if not source.exists():
             self._send_json(404, {"error": "nothing has been applied yet"})
             return
-        body = session.fixed.read_bytes()
+        body = source.read_bytes()
         self.send_response(200)
         self.send_header(
             "Content-Type",
             "application/vnd.openxmlformats-officedocument.presentationml.presentation",
         )
         self.send_header(
-            "Content-Disposition", f'attachment; filename="{session.fixed.name}"'
+            "Content-Disposition", f'attachment; filename="{source.name}"'
         )
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -1445,11 +1534,61 @@ def _qa_forget(session: "_QaSession", slides: list[int]) -> None:
                 pass
 
 
+def _qa_check_payload(
+    session: "_QaSession", rendered: dict, logs: list, elapsed: float
+) -> dict[str, Any]:
+    """One answer shape for every way the design check can be started.
+
+    Three routes produce it -- an upload, a re-check of the corrected deck, and
+    a hand-over from the deck check -- and the page reads one of them. Built
+    here so a field added for one arrives in all three, which is not
+    hypothetical: `pass` was added for the re-check and the page reads it on
+    every render.
+    """
+    return {
+        "session": session.id,
+        "report": session.report.to_dict(),
+        "renderer_ok": bool(rendered),
+        "aspect": _aspect_of(
+            {n: str(session.before_dir / name) for n, name in rendered.items()}
+        ),
+        "pass": session.passes,
+        "handed_over": session.handed_over,
+        "slides": [
+            {
+                "slide": n,
+                # The pass is in the URL so a re-check's pictures are not the
+                # last pass's out of the browser's cache.
+                "before": (
+                    f"/api/qa/preview/{session.id}/before/{n}"
+                    f"?pass={session.passes}"
+                ),
+                "after": None,
+            }
+            for n in sorted(rendered)
+        ],
+        "logs": logs,
+        "elapsed_s": round(elapsed, 2),
+    }
+
+
+def _qa_round(session: "_QaSession") -> str:
+    """What this round is called on disk.
+
+    BOTH COUNTERS, because a re-check resets the round number: pass 0 round 1
+    and pass 1 round 1 are different pictures of different decks, and one
+    directory for the two of them is the page showing the wrong one.
+
+    In a function of its own because two places need it and they must agree.
+    `_qa_after_dir` writes the name and `_qa_sweep` reads it to decide which
+    rounds are over, and when only the first of them learned about passes the
+    sweep could no longer recognise the round that was running.
+    """
+    return f"{session.passes}-{session.run}"
+
+
 def _qa_after_dir(session: "_QaSession") -> Path:
-    # Both counters, because a re-check resets the round number: pass 0 round 1
-    # and pass 1 round 1 are different pictures of different decks, and one
-    # directory for the two of them is the page showing the wrong one.
-    return session.directory / "after" / f"{session.passes}-{session.run}"
+    return session.directory / "after" / _qa_round(session)
 
 
 def _qa_sweep(session: "_QaSession") -> None:
@@ -1460,7 +1599,10 @@ def _qa_sweep(session: "_QaSession") -> None:
     than correctness. That is exactly what could not be said when deleting was
     what made the pictures on the page true -- see `_Session.run`.
     """
-    for old_deck in session.directory.glob(f"checked-*-{session.deck.name}"):
+    # On `name` rather than on `deck.name`: `deck` stops being the upload after
+    # the first re-check, and a glob built from it then matched none of the
+    # files this ever writes, so every round's output stayed on disk.
+    for old_deck in session.directory.glob(f"checked-*-{session.name}"):
         if old_deck != session.fixed:
             try:
                 old_deck.unlink()
@@ -1469,8 +1611,9 @@ def _qa_sweep(session: "_QaSession") -> None:
     root = session.directory / "after"
     if not root.is_dir():
         return
+    keep = _qa_round(session)
     for directory in root.iterdir():
-        if directory.is_dir() and directory.name != str(session.run):
+        if directory.is_dir() and directory.name != keep:
             rmtree(directory, ignore_errors=True)
 
 

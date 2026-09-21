@@ -389,3 +389,370 @@ def test_a_pass_that_never_happened_is_not_claimed(tmp_path) -> None:
     session = _QaSession(id="s", directory=tmp_path, deck=tmp_path / "deck.pptx",
                          report=DesignQaReport(deck="d", generated_at="n", model="t"))
     assert session.passes == 0
+
+
+# --------------------------------------------------------------------------- #
+# The deck check handing over to the design check
+#
+# `pipeline.run` puts applying the master first and says why: putting content
+# into its placeholders settles a great many findings and raises a few, so a
+# report written before it describes a deck nobody will send. The design check
+# is that argument one stage further on -- it reads a picture, and a picture of
+# a deck that has not been restyled is a picture of a deck about to change.
+#
+# It is a hand-over rather than a stage because applying is the designer's
+# decision. There is no restyled deck to look at until they have made one.
+# --------------------------------------------------------------------------- #
+
+def test_handing_over_before_anything_was_applied_is_refused(tmp_path) -> None:
+    """A single run cannot do this: it would have to either apply everything
+    without asking or check the deck it is about to change."""
+    from formatting_tool.web import server as web
+
+    deck = tmp_path / "deck.pptx"
+    deck.write_bytes(b"not a real deck")
+    source = web._Session(
+        id="deck-session", directory=tmp_path, master=tmp_path / "m.pptx",
+        deck=deck, report={},
+    )
+    web._SESSIONS[source.id] = source
+    try:
+        handler = web._Handler.__new__(web._Handler)
+        handler._json_body = lambda: {"session": source.id}
+        with pytest.raises(web._BadRequest) as caught:
+            handler._run_qa_handoff()
+        assert "nothing has been applied" in str(caught.value)
+    finally:
+        web._SESSIONS.pop(source.id, None)
+
+
+def test_the_design_check_reads_a_copy_rather_than_the_other_session(wired) -> None:
+    """The two checks have different lifetimes. The deck check sweeps its
+    files as its rounds move on, and a design check holding a path into that
+    directory would be reading a file another page is entitled to delete."""
+    base, session = wired
+
+    # The design session owns a directory of its own, and its deck is inside
+    # it -- never a path into somebody else's working directory.
+    assert session.deck.parent == session.directory
+    assert session.fixed.parent == session.directory
+
+
+def test_a_check_can_be_opened_again_by_its_id(wired) -> None:
+    """What makes the hand-over possible: the check runs server-side and what
+    crosses to the browser is an id. It is also what makes a reload survivable,
+    and a design check is a render of every slide plus a model call for each
+    one -- losing that to a refresh loses all of it."""
+    base, session = wired
+
+    session.payload = {"session": session.id, "report": {"deck": "x"}, "pass": 0}
+    status, _ctype, raw = _get(base, f"/api/qa/session/{session.id}")
+    assert status == 200
+    assert json.loads(raw)["report"]["deck"] == "x"
+
+
+def test_a_check_with_no_answer_yet_is_a_404_rather_than_an_empty_page(wired) -> None:
+    base, session = wired
+    session.payload = {}
+    status, _ctype, raw = _get(base, f"/api/qa/session/{session.id}")
+    assert status == 404
+    assert "no answer" in json.loads(raw)["error"]
+
+
+def test_where_the_deck_came_from_travels_with_the_report(tmp_path) -> None:
+    """"Before" meaning another pipeline's output is exactly the sort of thing
+    a page must not leave somebody to infer from a filename."""
+    from formatting_tool.web.server import _QaSession, _qa_check_payload
+
+    session = _QaSession(
+        id="s", directory=tmp_path, deck=tmp_path / "fixed-deck.pptx",
+        report=DesignQaReport(deck="fixed-deck.pptx", generated_at="n", model="t"),
+        handed_over="deck.pptx",
+    )
+    payload = _qa_check_payload(session, {}, [], 1.0)
+
+    assert payload["handed_over"] == "deck.pptx"
+    assert payload["pass"] == 0
+
+
+def test_an_uploaded_check_says_it_came_from_nowhere(tmp_path) -> None:
+    """The same field, empty, rather than absent: the page reads it on every
+    render and a missing key would be a different bug on each route."""
+    from formatting_tool.web.server import _QaSession, _qa_check_payload
+
+    session = _QaSession(
+        id="s", directory=tmp_path, deck=tmp_path / "deck.pptx",
+        report=DesignQaReport(deck="deck.pptx", generated_at="n", model="t"),
+    )
+    assert _qa_check_payload(session, {}, [], 1.0)["handed_over"] == ""
+
+
+# --------------------------------------------------------------------------- #
+# Serving the pictures
+#
+# The page asks for a rendered slide by session, side and number, and the
+# server works out the directory from the session's counters. Those counters
+# grew a second dimension when the re-check landed, and a directory name that
+# disagrees with the route that reads it is an <img> that 404s -- which on the
+# page is not an error message but an empty frame with the marks piled in the
+# corner, beside a change list saying the corrections were made.
+# --------------------------------------------------------------------------- #
+
+_PNG = bytes.fromhex(
+    "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4"
+    "890000000a49444154789c6300010000050001" "0d0a2db4" "0000000049454e44ae426082"
+)
+
+
+def _write_render(directory, number: int) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / f"{number}.png").write_bytes(_PNG)
+
+
+def test_an_after_picture_is_served_from_where_the_round_wrote_it(wired) -> None:
+    """Round 1 of pass 0 writes its pictures somewhere, and the route the page
+    asks on has to read that same somewhere. They are computed in two places
+    and only agree by construction."""
+    from formatting_tool.web.server import _qa_after_dir
+
+    base, session = wired
+    session.run = 1
+    _write_render(_qa_after_dir(session), 3)
+
+    status, ctype, body = _get(
+        base, f"/api/qa/preview/{session.id}/after/3"
+        f"?pass={session.passes}&run={session.run}")
+    assert status == 200, body
+    assert ctype == "image/png"
+
+
+def test_an_after_picture_survives_a_pass(wired) -> None:
+    """The counters are two-dimensional now: pass 0 round 1 and pass 1 round 1
+    are different pictures of different decks."""
+    from formatting_tool.web.server import _qa_after_dir
+
+    base, session = wired
+    session.run = 1
+    _write_render(_qa_after_dir(session), 3)
+    session.passes, session.run = 1, 1
+    _write_render(_qa_after_dir(session), 3)
+
+    status, _ctype, _body = _get(
+        base, f"/api/qa/preview/{session.id}/after/3?pass=1&run=1")
+    assert status == 200
+
+
+def test_the_sweep_keeps_the_round_that_is_running(wired) -> None:
+    """THE BUG THIS EXISTS FOR. The sweep drops the directories of rounds that
+    are over, and it recognised them by name -- a name that gained the pass
+    number when the re-check landed. Comparing the new name against the old
+    one made every directory look finished, including the one the round about
+    to render was going to write into."""
+    from formatting_tool.web.server import _qa_after_dir, _qa_sweep
+
+    base, session = wired
+    session.run = 2
+    current = _qa_after_dir(session)
+    _write_render(current, 3)
+    session.run = 1
+    stale = _qa_after_dir(session)
+    _write_render(stale, 3)
+    session.run = 2
+
+    _qa_sweep(session)
+
+    assert (current / "3.png").is_file(), "the running round's pictures went"
+    assert not stale.is_dir(), "a finished round's pictures were kept"
+
+
+def test_the_sweep_finds_the_working_decks_after_a_pass(wired, tmp_path) -> None:
+    """The working filenames are built from the UPLOAD's name, which `deck`
+    stops being after a re-check. Globbing on `deck.name` therefore matched
+    nothing from the second pass on, and every round's output stayed on disk."""
+    from formatting_tool.web.server import _qa_sweep
+
+    base, session = wired
+    session.passes, session.run = 1, 1
+    session.deck = session.directory / f"pass-1-{session.name}"
+    session.deck.write_bytes(b"the baseline this pass reads")
+
+    stale = session.directory / f"checked-0-1-{session.name}"
+    stale.write_bytes(b"the round before this one")
+    session.fixed.write_bytes(b"this round")
+
+    _qa_sweep(session)
+
+    assert not stale.is_file(), "the finished round's deck was left on disk"
+    assert session.fixed.is_file(), "this round's deck was swept"
+    assert session.deck.is_file(), "the baseline this pass reads was swept"
+
+
+# --------------------------------------------------------------------------- #
+# Every picture the server promises, fetched
+#
+# The page does not check that a URL it was handed resolves; it puts it in an
+# <img> and moves on. A 404 there is not an error message -- `.frame img` has
+# no aspect ratio, so a missing picture collapses to the height of its alt text
+# and the marks that should be over the slide pile into the corner. What is on
+# screen is an empty white strip beside a list saying the corrections were made.
+#
+# So: run a round for real, take every URL the answer contains, and fetch it.
+# --------------------------------------------------------------------------- #
+
+def _png(directory, number: int) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / f"{number}.png").write_bytes(_PNG)
+
+
+def _urls_in(payload) -> list[str]:
+    """Every preview URL in an answer, whichever route produced it."""
+    out = []
+    for row in payload.get("slides") or []:
+        for side in ("before", "after"):
+            if row.get(side):
+                out.append(row[side])
+    return out
+
+
+def test_every_picture_an_apply_promises_can_be_fetched(wired, monkeypatch) -> None:
+    """THE FAILURE THIS CATCHES. The directory a round renders into and the
+    directory the preview route reads from are computed in two places, and they
+    agree only by construction. When they stopped agreeing the page did not
+    complain -- it showed an empty frame with the marks in the corner, beside a
+    change list saying the work had been done."""
+    from formatting_tool.apply.qafix import Change, QaFixResult
+    from formatting_tool.web import server as web
+
+    base, session = wired
+
+    # A round that corrects slide 1 and renders it, without PowerPoint or the
+    # model: the question here is the plumbing between the two directories.
+    def fake_propose(sess, issues):
+        sess.fixed.write_bytes(b"the corrected deck")
+        return QaFixResult(output=sess.fixed, applied=[Change(
+            op="grow", slide=1, shape_id=11, shape="Shape s1",
+            detail="stepped the type up")])
+
+    def fake_render(deck, directory, slides=None):
+        for n in (slides or [1]):
+            _png(directory, n)
+        return {n: f"{n}.png" for n in (slides or [1])}
+
+    monkeypatch.setattr(web, "_qa_propose", fake_propose)
+    monkeypatch.setattr(web, "_qa_render", fake_render)
+    monkeypatch.setattr(web, "add_comments", lambda *a, **k: 0)
+    _png(session.before_dir, 1)
+
+    status, payload = _post(base, "/api/qa/apply",
+                            {"session": session.id, "fix": ["1:s1"], "notes": False})
+    assert status == 200, payload
+
+    urls = _urls_in(payload)
+    assert any("/after/" in u for u in urls), "the round rendered nothing to show"
+    for url in urls:
+        code, ctype, _body = _get(base, url)
+        assert code == 200, f"{url} came back {code}"
+        assert ctype == "image/png", f"{url} served {ctype}"
+
+
+def test_the_corrected_deck_is_still_downloadable_after_a_recheck(wired) -> None:
+    """A re-check promotes the round's output to the deck the next pass reads,
+    and that pass has written nothing yet. The file is right there, and asking
+    for it used to answer "nothing has been applied yet"."""
+    base, session = wired
+    session.run = 1
+    session.fixed.write_bytes(b"pass 0's corrected deck")
+
+    status, _ctype, body = _get(base, f"/api/qa/download/{session.id}")
+    assert status == 200 and body == b"pass 0's corrected deck"
+
+    # The re-check: that output becomes the baseline, and the round counter
+    # starts again with nothing written under it.
+    session.passes, session.run = 1, 0
+    session.deck = session.directory / f"pass-1-{session.name}"
+    session.deck.write_bytes(b"pass 0's corrected deck")
+    assert not session.fixed.exists()
+
+    status, _ctype, body = _get(base, f"/api/qa/download/{session.id}")
+    assert status == 200, body
+    assert body == b"pass 0's corrected deck"
+
+
+def test_an_untouched_upload_is_never_offered_as_a_corrected_deck(wired) -> None:
+    """The fallback is only past pass 0. On the first pass `deck` is still the
+    file they gave us, and handing that back labelled as corrected is a lie
+    about a deck they would then send."""
+    base, session = wired
+    assert session.passes == 0 and not session.fixed.exists()
+
+    status, _ctype, body = _get(base, f"/api/qa/download/{session.id}")
+    assert status == 404
+    assert "nothing has been applied" in json.loads(body)["error"]
+
+
+def test_a_deck_wide_correction_does_not_ask_for_slide_zero(wired, monkeypatch) -> None:
+    """A correction about the deck rather than about one slide reports slide 0,
+    because `_qa_propose` has nothing else to put there. Passed on as a slide
+    to render, 0 costs twice: the page gets a preview URL that 404s, and
+    `render_deck` reads a request naming no valid slide as a request for the
+    WHOLE deck -- on a ninety-slide deck, a long render nobody asked for and
+    eighty-nine pairs of identical pictures."""
+    from formatting_tool.apply.qafix import Change, QaFixResult
+    from formatting_tool.web import server as web
+
+    base, session = wired
+    asked = []
+
+    def fake_propose(sess, issues):
+        sess.fixed.write_bytes(b"the corrected deck")
+        return QaFixResult(output=sess.fixed, applied=[
+            Change(op="recolor_text", slide=0, shape_id=0, shape="",
+                   detail="a finding about the deck", task_id="deck:0"),
+            Change(op="grow", slide=1, shape_id=11, shape="Shape s1",
+                   detail="stepped the type up"),
+        ])
+
+    def fake_render(deck, directory, slides=None):
+        asked.append(slides)
+        for n in (slides or []):
+            _png(directory, n)
+        return {n: f"{n}.png" for n in (slides or [])}
+
+    monkeypatch.setattr(web, "_qa_propose", fake_propose)
+    monkeypatch.setattr(web, "_qa_render", fake_render)
+    monkeypatch.setattr(web, "add_comments", lambda *a, **k: 0)
+    _png(session.before_dir, 1)
+
+    status, payload = _post(base, "/api/qa/apply",
+                            {"session": session.id, "fix": ["1:s1"], "notes": False})
+    assert status == 200, payload
+    assert asked == [[1]], f"the renderer was asked for {asked}"
+    assert [row["slide"] for row in payload["slides"]] == [1]
+
+
+def test_the_pictures_of_a_round_outlive_the_answer_that_named_them(
+    wired, monkeypatch,
+) -> None:
+    """A designer reads the page, then presses Re-render on a slide. Nothing
+    between those two moments may remove what the first answer pointed at."""
+    from formatting_tool.web import server as web
+
+    base, session = wired
+    session.run = 1
+    _png(web._qa_after_dir(session), 1)
+    _png(session.before_dir, 1)
+
+    def fake_render(deck, directory, slides=None):
+        for n in (slides or [1]):
+            _png(directory, n)
+        return {n: f"{n}.png" for n in (slides or [1])}
+
+    monkeypatch.setattr(web, "_qa_render", fake_render)
+    session.fixed.write_bytes(b"the corrected deck")
+
+    status, payload = _post(base, "/api/qa/render",
+                            {"session": session.id, "slides": [1], "force": True})
+    assert status == 200, payload
+    for url in _urls_in(payload):
+        code, _ctype, _body = _get(base, url)
+        assert code == 200, f"{url} came back {code}"

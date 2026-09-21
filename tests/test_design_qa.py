@@ -1336,6 +1336,33 @@ def test_two_corrections_cannot_both_decide_where_one_shape_sits():
     assert "across" in result.skipped[0].reason
 
 
+def test_two_slides_do_not_share_one_shapes_identity():
+    """A SHAPE ID IS UNIQUE WITHIN A SLIDE, NOT ACROSS A DECK. python-pptx
+    numbers from 2 on every slide, so slide 1 and slide 7 both hold a shape 2
+    and they are different shapes.
+
+    The guard that stops two corrections fighting over one axis remembered
+    which axes were settled by shape id alone, for a round that spans the whole
+    deck. So levelling a row on slide 1 refused to level the row on slide 7,
+    and said so in words about a disagreement that did not exist."""
+    from formatting_tool.apply.qafix import QaFixResult, Step, _align
+
+    class FakeShape:
+        def __init__(self):
+            self.Left, self.Top = 72.0, 144.0
+
+    result, settled = QaFixResult(), set()
+    first, second = FakeShape(), FakeShape()
+
+    _align(first, Step(op="align", slide=1, shape_id=2, shape="Oval 1",
+                       path=(1,), top_in=1.5), result, settled)
+    _align(second, Step(op="align", slide=7, shape_id=2, shape="Oval 1",
+                        path=(1,), top_in=1.5), result, settled)
+
+    assert not result.skipped, [s.reason for s in result.skipped]
+    assert first.Top == second.Top == 108.0
+
+
 def test_settling_one_axis_leaves_the_other_free():
     """Levelling a row and spacing it are not in conflict -- they are the two
     halves of squaring it up -- so having settled a shape's top must not lock
@@ -1455,3 +1482,43 @@ def test_a_truncated_answer_carries_its_text_for_the_caller_to_use():
     exc = Truncated("cut off", text='{"shapes": [{"shape": "s1"}')
     assert isinstance(exc, AIValidationError)
     assert exc.text.startswith('{"shapes"')
+
+
+def test_a_row_being_levelled_does_not_tick_off_a_title_mismatch():
+    """TWO DIFFERENT FINDINGS THAT APPLY THE SAME VERB. A cross-slide position
+    mismatch moves a title to where the deck puts it; a within-slide
+    arrangement moves a circle into line with its row. Both come out as
+    `align`, and what was left to do was worked out by asking whether ANY
+    align had landed on any of the mismatch's slides.
+
+    So a row levelled on slide 7 answered "did the title on slide 7 move?"
+    with yes. The mismatch dropped off the outstanding list, never went into
+    the deck as a comment, and the title stayed exactly where it was. The case
+    is not exotic: the title's own move is refused whenever it is further out
+    than an alignment allows, which is precisely when the mismatch is worth
+    reporting.
+    """
+    from formatting_tool.apply.qafix import Change
+
+    report = _report()
+    report.profile = _deck_with_titles({1: 0.4, 2: 0.42, 3: 0.41, 7: 4.2})
+    report.deck_issues = [DeckIssue(
+        kind="position", slides=[7], note="the title on 7 sits lower",
+        task="move it up to match the rest",
+    )]
+    deck_task = next(t for t in report.tasks if t.kind == "deck")
+    assert deck_task.fixable, "the deck mismatch has to be tickable to be lost"
+
+    # The round: the title's own move was refused for being further than an
+    # alignment, and a row on the same slide was levelled and reported.
+    applied = [Change(op="align", slide=7, shape_id=999, shape="Oval 3",
+                      detail="moved it to level with the others",
+                      task_id="slide:7:0")]
+
+    left = {t.id for t in outstanding(report, [deck_task.id], applied)}
+    assert deck_task.id in left, (
+        "the title mismatch was reported as done because a different finding "
+        "applied the same verb on the same slide"
+    )
+
+

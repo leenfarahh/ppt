@@ -785,8 +785,15 @@ def _align(
         )
         return
 
+    # KEYED ON THE WHOLE ADDRESS, not on the id. A shape id is unique within a
+    # slide and this set spans the round, so `(id, axis)` had slide 1's shape 2
+    # and slide 7's shape 2 as one shape -- levelling a row on one slide then
+    # refused to level the row on the other, in words about a disagreement
+    # that did not exist. The path is included for the case `_find` is built
+    # around: a deck pasted together can carry the same id twice on one slide.
+    here = (step.slide, step.path, step.shape_id)
     for axis, wanted in (("across", step.left_in), ("down", step.top_in)):
-        if wanted is None or (step.shape_id, axis) not in settled:
+        if wanted is None or (here, axis) not in settled:
             continue
         result.skipped.append(_refused(
             step,
@@ -821,9 +828,9 @@ def _align(
         return
 
     if step.left_in is not None:
-        settled.add((step.shape_id, "across"))
+        settled.add((here, "across"))
     if step.top_in is not None:
-        settled.add((step.shape_id, "down"))
+        settled.add((here, "down"))
 
     # Only the axis that actually moved is described. A row being levelled
     # reports how far down it came and says nothing about across, because it

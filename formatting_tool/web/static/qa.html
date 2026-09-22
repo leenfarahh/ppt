@@ -134,6 +134,9 @@ input#slides { min-width: 120px; }
 .applied-list { margin: 10px 0 0; padding-left: 18px; font-size: 12px; line-height: 1.7; }
 .applied-list .dim { color: var(--faint); }
 .applied-list code { color: var(--faint); margin-left: 6px; }
+.changed .undo, .applied-list .undo {
+  padding: 0 7px; font-size: 10.5px; margin-left: 8px; vertical-align: 1px;
+}
 .left-over { margin-top: 12px; padding-top: 10px; border-top: 1px dashed var(--line); font-size: 12.5px; }
 .left-over summary { cursor: pointer; color: var(--muted); }
 .left-over summary:hover { color: var(--ink); }
@@ -141,6 +144,12 @@ input#slides { min-width: 120px; }
 /* ---------- one slide ---------- */
 .slide-block { margin-top: 26px; padding-bottom: 20px; border-bottom: 1px solid var(--line); }
 .slide-block:last-child { border-bottom: 0; }
+/* A slide with nothing on it is still drawn -- a designer cannot otherwise
+   tell a slide that passed from one that was never in the list -- but it is
+   not competing for attention with the ones that have work on them. */
+.slide-block.quiet { opacity: 0.62; }
+.slide-block.quiet:hover, .slide-block.quiet:focus-within { opacity: 1; }
+.slide-block.quiet .frame { max-width: 420px; }
 .slide-bar { display: flex; align-items: baseline; gap: 10px; font-size: 12.5px; margin-bottom: 8px; }
 .slide-bar b { font-size: 13px; }
 .slide-bar .dim { color: var(--faint); }
@@ -769,7 +778,19 @@ function appliedHTML() {
         : ""}
     </div>
     ${applied.length ? `<ul class="applied-list">${applied.map((a) => `
-      <li>slide ${a.slide} &middot; ${esc(a.shape)} &mdash; ${esc(a.detail)}</li>`).join("")}
+      <li>slide ${a.slide} &middot; ${esc(a.shape)} &mdash; ${esc(a.detail)}</li>`
+      ).join("")}
+    </ul>` : ""}
+    ${(done.undone || []).length
+      ? `<p class="dim">${done.undone.length} correction(s) taken back, listed
+         with the slide each was made on.</p>`
+      : ""}
+    ${strandedUndone().length ? `<ul class="applied-list dim">${
+      strandedUndone().map((u) => `
+        <li class="dim">slide ${u.slide || "?"} &middot; ${esc(u.shape)}
+          &mdash; taken back: ${esc(u.what)}
+          <button class="linkish undo" data-redo="${esc(u.id)}"
+            >Put it back</button></li>`).join("")}
     </ul>` : ""}
     ${skipped.length ? `<ul class="applied-list dim">${skipped.map((sk) => `
       <li class="dim">slide ${sk.slide} &middot; ${esc(sk.shape)} &mdash; not taken:
@@ -801,6 +822,49 @@ function outstandingHTML(done) {
           ${esc(task.what)}</li>`).join("")}
     </ul>
   </details>`;
+}
+
+/* Take one correction back, or put one back.
+
+   A REPLAY, NOT A REVERSE. The server runs the round again from the same
+   starting file without the row named, and what comes back is the deck that
+   round would have produced had the row never been ticked -- which is the only
+   honest way to do it here, because none of these corrections has an inverse.
+   A type step rolled back for spilling and a move a guard refused are not
+   deltas anybody can subtract.
+
+   The tick stays where it was. Un-ticking the row would say the designer
+   changed their mind about wanting it, and what they did was ask for this
+   round without it; the row is listed as taken back, with a way to put it
+   back. */
+async function undoChange(key, put) {
+  if (!state.session || state.busy) return;
+  const stopTicking = startTicking(
+    put ? "Making that correction again" : "Taking that correction back");
+  state.busy = true;
+  try {
+    const response = await fetch("/api/qa/undo", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session: state.session,
+        undo: put ? [] : [key],
+        redo: put ? [key] : [],
+      }),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || data.error || `HTTP ${response.status}`);
+    state.applied = data;
+    // Every picture the page was holding is of a deck that no longer exists.
+    state.shots = {};
+    setStatus("");
+    render();
+  } catch (err) {
+    setStatus(`<b>That could not be undone.</b> ${esc(err.message)}`, "err");
+  } finally {
+    stopTicking();
+    state.busy = false;
+  }
 }
 
 async function applyTicked() {
@@ -957,14 +1021,59 @@ function pairHTML(row) {
         ${changes.map((c) => `
           <li><span class="num">${c.n}</span>
             <b>${esc(c.shape)}</b>
-            <span>${esc(c.detail)}</span></li>`).join("")}
+            <span>${esc(c.detail)}</span>
+            ${c.task_id
+              ? `<button class="linkish undo" data-undo="${esc(c.task_id)}"
+                  >Undo</button>`
+              : ""}</li>`).join("")}
         ${refused.map((sk) => `
           <li><span class="num off">&times;</span>
             <b>${esc(sk.shape)}</b>
             <span class="why">not taken: ${esc(sk.reason)}</span></li>`).join("")}
+        ${undoneOn(row.slide).map((u) => `
+          <li class="dim"><span class="num off">&larr;</span>
+            <b>${esc(u.shape)}</b>
+            <span class="why">taken back: ${esc(u.what)}</span>
+            <button class="linkish undo" data-redo="${esc(u.id)}"
+              >Put it back</button></li>`).join("")}
       </ul>
     </details>
   </div>`;
+}
+
+/* The rows taken back on a slide that has no change list of its own.
+
+   THE ONLY WAY BACK FOR THOSE. Undoing the last correction on a slide leaves
+   that slide with nothing to show a pair of pictures for, so its `pair-block`
+   is gone -- and with it the button that would put the correction back. Listed
+   here instead, which is unglamorous and is the difference between a reversible
+   round and a one-way door. */
+function strandedUndone() {
+  const shown = new Set((state.applied?.slides || []).map((row) => row.slide));
+  return (state.applied?.undone || [])
+    .map((id) => ({ ...(taskFor(id) || {}), id }))
+    .filter((task) => !shown.has(task.slide))
+    .map((task) => ({
+      id: task.id, slide: task.slide,
+      shape: task.shape || "", what: task.what || task.id,
+    }));
+}
+
+/* What has been taken back on one slide.
+
+   Beside the changes rather than in a list of its own, because a designer
+   reading a slide's changes is asking what this round did to it -- and a
+   correction that was made and then withdrawn is part of that answer. The
+   summary above counts only what stands. */
+function undoneOn(slide) {
+  return (state.applied?.undone || [])
+    .map((id) => ({ ...(taskFor(id) || {}), id }))
+    .filter((task) => task.slide === slide)
+    .map((task) => ({
+      id: task.id,
+      shape: task.shape || "",
+      what: task.what || task.id,
+    }));
 }
 
 /* Where a stepped shape sits, taken off the verdict that named it. Font steps
@@ -999,10 +1108,23 @@ async function rerender(slide, button) {
 
 /* ---------------- one slide ---------------- */
 
+/* EVERY SLIDE IS SHOWN, WHETHER OR NOT ANYTHING IS WRONG WITH IT.
+
+   This used to return "" for a slide with no verdict, no slide-level finding
+   and no reason, which reads as a tidy page and is not one. Two things went
+   with it. A designer scrolling a checked deck could not tell a slide that
+   was looked at and passed from a slide that was never in the list at all --
+   the page showed neither, and only one of those is good news. And once the
+   deterministic rules joined this page, a slide could be CORRECTED without
+   ever being drawn: the rules found a contrast pairing on a slide the model
+   had nothing to say about, the fix was applied and reported in the changes,
+   and the slide itself was nowhere on the page it came from.
+
+   So the render is always drawn and the sentence beside it says which of the
+   three this is: looked at and clean, corrected, or not looked at. */
 function slideHTML(slide) {
   const shown = (slide.shapes || []).filter(
     (v) => state.showOk || v.status === "issue");
-  if (!shown.length && !(slide.slide_issues || []).length && !slide.reason) return "";
 
   const shot = state.shots[slide.slide] || {};
   const before = shot.before
@@ -1017,11 +1139,25 @@ function slideHTML(slide) {
   // was done, and leave a designer to work out that they are the same slide.
   const changed = (state.applied?.applied || []).some((c) => c.slide === slide.slide);
 
+  const toLookAt = marks.filter((m) => m.status === "issue").length;
+  const measured = (report().tasks || []).filter(
+    (t) => t.slide === slide.slide && t.id.startsWith("rule:")).length;
+  const onSlide = (slide.slide_issues || []).length;
+  const total = toLookAt + measured + onSlide;
+  // A clean slide and a slide nobody looked at are the two answers this page
+  // must never let read the same, which is the whole reason the empty ones are
+  // drawn at all.
+  const summary = slide.reason
+    ? "not looked at"
+    : total
+      ? `${total} to look at`
+      : changed ? "nothing found here; corrected below" : "nothing to change";
+
   return `
-  <section class="slide-block" id="slide-${slide.slide}">
+  <section class="slide-block${total ? "" : " quiet"}" id="slide-${slide.slide}">
     <div class="slide-bar">
       <b>Slide ${slide.slide}</b>
-      <span class="dim">${marks.filter((m) => m.status === "issue").length} to look at</span>
+      <span class="dim">${summary}</span>
       <span class="grow"></span>
       ${changed
         ? `<a class="linkish" href="#pair-${slide.slide}">See before and after</a>`
@@ -1031,6 +1167,7 @@ function slideHTML(slide) {
       ${shotHTML(before, marks.filter((m) => m.status === "issue"), "")}
     </div>
     ${marks.length ? `<ul class="verdicts">${marks.map(verdictHTML).join("")}</ul>` : ""}
+    ${measuredHTML(slide)}
     ${slideIssuesHTML(slide)}
     ${slide.reason ? `<p class="dead">Not looked at: ${esc(slide.reason)}</p>` : ""}
   </section>`;
@@ -1118,6 +1255,10 @@ function opWords(op) {
     shrink: "step the type down",
     center: "centre it in its holder",
     widen: "widen the box",
+    narrow: "pull the box in",
+    resize: "match the rest of its set",
+    set_size: "set the type to match its set",
+    send_to_back: "send it behind the rest",
     align: "align it to the deck",
     set_font_size: "set the type size",
     recolor_text: "recolour the text",
@@ -1142,6 +1283,34 @@ function opWords(op) {
  * The second panel is shown at full weight on purpose. An unused timeline
  * stop and an empty column are exactly the defects no correction can touch,
  * and dropping them quietly is how one reaches a client. */
+/* What was MEASURED off the file on this slide, as opposed to seen on the
+   render. A panel of its own, and the heading is the whole reason for it: a
+   designer reading "the caption reads at 1.4:1 on the fill under it" is owed
+   the fact that nobody's judgement is involved, the way they are owed the
+   opposite about everything else on this page.
+
+   These rows carry an exact number and a fixer, so they are always tickable
+   when they are here at all -- `designqa._rule_tasks` asks the applier before
+   it offers one. */
+function measuredHTML(slide) {
+  const lines = (report().tasks || [])
+    .filter((t) => t.slide === slide.slide && t.id.startsWith("rule:"))
+    .map((t) => ({ task_id: t.id, task: t.what, note: t.why, shape: t.shape }));
+  if (!lines.length) return "";
+  return `
+  <div class="manual step">
+    <h3>Measured off the file, and ticking it does it</h3>
+    <ul>${lines.map((line) => `
+      <li><input type="checkbox" data-key="${esc(line.task_id)}"
+            ${state.ticked.has(line.task_id) ? "checked" : ""}>
+        <div>${line.shape ? `<b>${esc(line.shape)}</b> ` : ""}${esc(line.task)}
+          ${line.note && line.note !== line.task
+            ? `<span class="say">${esc(line.note)}</span>` : ""}
+        </div>
+      </li>`).join("")}</ul>
+  </div>`;
+}
+
 function slideIssuesHTML(slide) {
   const lines = (slide.slide_issues || []).map((line, i) => ({
     ...line, task_id: `slide:${slide.slide}:${i}`,
@@ -1220,6 +1389,13 @@ function wire() {
 
   const recheck = $("#recheck");
   if (recheck) recheck.addEventListener("click", recheckAll);
+
+  for (const button of document.querySelectorAll("[data-undo]")) {
+    button.addEventListener("click", () => undoChange(button.dataset.undo, false));
+  }
+  for (const button of document.querySelectorAll("[data-redo]")) {
+    button.addEventListener("click", () => undoChange(button.dataset.redo, true));
+  }
 
   const marks = $("#mark-toggle");
   if (marks) marks.addEventListener("change", () => {

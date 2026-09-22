@@ -126,6 +126,19 @@ def _check() -> dict:
                     ],
                 }],
                 "reviewed": True, "reason": "",
+            }, {
+                # LOOKED AT AND CLEAN. The page used to draw nothing for one of
+                # these, which reads as a tidy report and is not one: a
+                # designer could not tell a slide that passed from a slide that
+                # was never in the list, and only one of those is good news.
+                "slide": 2, "shapes": [], "slide_issues": [],
+                "reviewed": True, "reason": "",
+            }, {
+                # NOTHING THE MODEL SAW, AND SOMETHING THE RULES MEASURED. This
+                # is the slide that was being CORRECTED without ever being
+                # drawn once the deterministic rules joined the page.
+                "slide": 3, "shapes": [], "slide_issues": [],
+                "reviewed": True, "reason": "",
             }],
             # Every finding, as work. The page reads this rather than
             # re-deriving it, so the list on the screen and the list written
@@ -174,6 +187,12 @@ def _check() -> dict:
                  "slide": 1, "slides": [], "shape": "", "shape_id": None,
                  "issue": "align_top", "fixable": True, "op": "align",
                  "box": None},
+                {"id": "rule:a1b2c3d4", "kind": "shape",
+                 "what": "Recolour the text to #1A1A1A.",
+                 "why": "Text in #FFFFFF on #DEDEDE reads at 1.3:1.",
+                 "slide": 3, "slides": [], "shape": "Card 4", "shape_id": 31,
+                 "issue": "color.text.contrast", "fixable": True,
+                 "op": "color.text.contrast", "box": [0.1, 0.2, 0.3, 0.2]},
             ],
             "deck_issues": [
                 {"kind": "position", "slides": [1],
@@ -197,7 +216,12 @@ def _apply() -> dict:
             "op": "widen", "slide": 1, "shape_id": 7, "shape": "Label 17",
             "detail": "widened the box from 0.72in to 1.05in, so its words "
                       "stop breaking",
+            # The row it answers, on every change and not only the
+            # arrangements: an undo names a row, and a change carrying no row
+            # cannot be named.
+            "task_id": "1:s4",
         }],
+        "undone": ["rule:a1b2c3d4"],
         "skipped": [{
             "op": "center", "slide": 1, "shape_id": 9, "shape": "Icon 3",
             "reason": "it is already centred in the shape that holds it",
@@ -512,3 +536,59 @@ def test_the_findings_still_read_as_findings(dom: str) -> None:
     assert "For a designer, on this slide" in results
     assert "Across the deck" in results          # the cross-slide mismatches
     assert 'href="#pair-1"' in results           # and the way to the evidence
+
+
+def test_every_slide_is_drawn_whether_or_not_anything_is_wrong(dom: str) -> None:
+    """A slide with nothing on it used to render as nothing at all, which
+    reads as a tidy page and is not one: a designer could not tell a slide that
+    was looked at and passed from a slide that was never in the list, and only
+    one of those is good news."""
+    results = _results(dom)
+
+    for number in (1, 2, 3):
+        assert f'id="slide-{number}"' in results, f"slide {number} is missing"
+    # And the empty ones say which of the two they are rather than leaving it
+    # to be inferred from a blank.
+    assert "nothing to change" in results
+
+
+def test_a_slide_the_rules_corrected_is_drawn_even_with_no_verdict_on_it(
+    dom: str,
+) -> None:
+    """The case that made this urgent. Once the deterministic rules joined the
+    page a slide could be CORRECTED without ever being drawn: the rules found
+    a contrast pairing on a slide the model had nothing to say about, the fix
+    was applied and reported in the changes, and the slide was nowhere on the
+    page it came from."""
+    slide = _results(dom).split('id="slide-3"', 1)[1]
+
+    assert "Measured off the file, and ticking it does it" in slide
+    assert 'data-key="rule:a1b2c3d4"' in slide
+    assert "Recolour the text to #1A1A1A." in slide
+
+
+def test_a_correction_is_taken_back_from_the_slide_it_was_made_on(dom: str) -> None:
+    """A replay, not a reverse -- but from the page it has to look like one
+    button beside the change it undoes, in the list of what happened to that
+    slide, the way the deck check puts it."""
+    pair = _results(dom).split('id="pair-1"', 1)[1]
+
+    assert 'data-undo="1:s4"' in pair
+    assert "Undo" in pair
+
+
+def test_a_row_taken_back_on_a_slide_with_nothing_else_is_still_reachable(
+    dom: str,
+) -> None:
+    """Undoing the last correction on a slide leaves it with no pair of
+    pictures, so its change list is gone -- and with it the button that would
+    put the correction back. A one-way door, for the one row somebody is most
+    likely to want back."""
+    applied = _results(dom).split('<section class="applied">', 1)[1].split(
+        '<div class="pair-block"', 1)[0]
+
+    assert "1 correction(s) taken back" in applied
+    assert 'data-redo="rule:a1b2c3d4"' in applied
+    assert "slide 3" in applied
+    # The corrections that stand are summarised here and undone on their slide.
+    assert "data-undo=" not in applied

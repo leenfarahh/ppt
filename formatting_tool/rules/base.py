@@ -70,12 +70,37 @@ class RuleContext:
     def runs(
         self,
     ) -> Iterator[tuple[SlideProfile, ShapeProfile, ParagraphProfile, RunProfile]]:
-        """Every non-empty text run, the unit most formatting rules work on."""
+        """Every non-empty text run, the unit most formatting rules work on.
+
+        A TABLE'S COPY IS IN HERE TOO, and it was not. A table's text lives on
+        its cells, `ShapeProfile.table` keeps those out of `children` on
+        purpose -- a cell is not a shape, and every geometric rule walking into
+        one would report margins and overlaps on forty-two boxes none of them
+        was written for -- and the effect was that no rule reading runs saw a
+        word of it. A deck's tables went out with their text in whatever colour
+        and typeface they arrived in, measured by nothing.
+
+        The cell's own paragraphs are yielded against the TABLE's shape, which
+        is the shape a finding can be addressed to and the shape a fixer is
+        handed. Which cell it was is not carried, because every fixer here
+        matches on the value the finding measured rather than on an address.
+        """
         for slide, shape in self.text_shapes():
             for paragraph in shape.paragraphs:
                 for run in paragraph.runs:
                     if run.text.strip():
                         yield slide, shape, paragraph, run
+
+        for slide, shape in self.shapes():
+            if shape.table is None:
+                continue
+            for cell in shape.table.cells:
+                if cell.spanned:
+                    continue
+                for paragraph in cell.paragraphs:
+                    for run in paragraph.runs:
+                        if run.text.strip():
+                            yield slide, shape, paragraph, run
 
 
 class Rule(ABC):

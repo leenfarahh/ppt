@@ -347,6 +347,18 @@ class OffPaletteShapeRule(Rule):
                 ("fill", shape.fill_hex, shape.fill_theme),
                 ("outline", shape.line_hex, shape.line_theme),
             )
+            # A TABLE'S FILLS ARE ON ITS CELLS, not on the graphic frame that
+            # holds them, so a table shaded in a colour nobody approved read as
+            # a shape with no fill at all. The cells are added to the same list
+            # the shape's own colours go through, so one off-palette shade
+            # across six cells is measured once per distinct colour rather than
+            # once per cell -- `_resolved` and the dedupe below do the rest.
+            if shape.table is not None:
+                sources = sources + tuple(
+                    ("fill", cell.fill_hex, cell.fill_theme)
+                    for cell in shape.table.cells
+                    if not cell.spanned
+                )
             # An icon's colours live inside its SVG, not on the shape. They
             # are measured on the same terms as a fill: a theme-bound one
             # belongs to ThemeMismatchRule, a literal one is the shape's own

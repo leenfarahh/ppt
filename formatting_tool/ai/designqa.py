@@ -84,7 +84,16 @@ log = logging.getLogger(__name__)
 # works through by hand. The rule for what belongs here is unchanged: the
 # correction has to be arithmetic, bounded, and checkable afterwards. Judgement
 # stays out, and what stays out becomes a task instead (see `task` below).
-ACTIONS = ("shrink", "grow", "center", "widen", "none")
+#
+# `send_to_back` is the one that is not arithmetic at all, and it belongs here
+# on the other two counts. A full-bleed photograph sitting IN FRONT of the
+# cards it was meant to sit behind is the commonest overlap on a real deck, and
+# nothing about it is a matter of degree: the picture is in front, and it
+# should not be. It is bounded -- z-order, and no geometry is touched -- and it
+# is the most checkable thing on this list, because it is the only correction
+# whose whole effect is what the next render shows.
+ACTIONS = ("shrink", "grow", "center", "widen", "narrow",
+           "send_to_back", "none")
 
 # What kind of defect a shape has. Whitelisted on the way back rather than
 # trusted: `issue` describes a finding and `action` is what gets applied, so a
@@ -95,9 +104,19 @@ ACTIONS = ("shrink", "grow", "center", "widen", "none")
 # deck built from repeated components, and a placeholder still showing "Click
 # to add text" prints exactly as it looks -- and neither is an overlap, a
 # clipping or a size, so the model had no word for them and said nothing.
+#
+# `low_contrast` is here for the half of the question the file cannot answer.
+# `rules.contrast` measures every pairing the file states -- ink against a
+# fill, a fill against the background behind it -- and goes deliberately silent
+# on the rest, because a photograph, a gradient and a pattern have no colour to
+# measure against and reporting the white slide behind a photograph would give
+# the worst slide in a deck a clean bill of health. That silence is exactly the
+# slide a reader notices first: a caption laid over the dark half of an image,
+# a heading on a gradient that swallows it a third of the way across. Nothing
+# but a picture answers it, and the model is looking at one.
 ISSUES = (
     "overlap", "cut_off", "off_center", "too_small", "too_big", "crowded",
-    "unfilled",
+    "unfilled", "low_contrast",
 )
 
 # The relational defects a SLIDE-level finding may name, and the second thing
@@ -116,18 +135,61 @@ ISSUES = (
 # a picture, and "0.31in too far left" is precisely the guess the rest of this
 # prompt exists to prevent. It says these five should share a top edge; the
 # file says where that top edge is. Same split as the cross-slide `align`.
+#
+# `center_h` is the odd one and was added last. Every other word here is a
+# relation the shapes have with EACH OTHER; this one is a relation the set has
+# with the slide, and it was added because the same finding kept arriving as
+# prose: three cards on a four-column grid, sitting left with an empty column
+# beside them, and a note saying to centre them across the slide. There was no
+# word for it, so it could only ever be a sentence for a designer -- and the
+# arithmetic is as plain as any here: the set's span against the slide's width,
+# with the set moved as one piece so nothing inside it changes.
+#
+# THERE IS NO `center_v`, and that is not symmetry overlooked. A slide is
+# symmetrical across its width and is not symmetrical down its height: the
+# title band is at the top, the footer at the bottom, and the vertical middle
+# of the page is not where a set of cards belongs. Centring across the width
+# needs no knowledge of what else is on the slide; centring down it needs all
+# of it.
+#
+# `same_width` and `same_height` are the other pair that is not about where the
+# shapes sit. Six cards drawn at three widths are a grid nobody laid out, and it
+# is the commonest thing a designer is left to fix by hand on a deck built by
+# copying a card and typing into it -- the copies drift, and no alignment
+# describes the drift because the cards line up perfectly on the edges they
+# share. The set says what the size should be: its median, the same way every
+# other arrangement here takes its number from the set rather than from the
+# model.
+#
+# They RESIZE, which nothing else in this vocabulary does, so they are bounded
+# harder: a shape that would have to change size by more than a third is not a
+# copy that drifted, and the set is left alone. See `designqa._sized`.
 ARRANGEMENTS = (
     "align_top", "align_bottom", "align_left", "align_right",
-    "distribute_h", "distribute_v",
+    "distribute_h", "distribute_v", "center_h",
+    "same_width", "same_height", "same_type_size",
 )
 
 # How many shapes each arrangement needs before it means anything. Aligning
 # needs two, because one shape has nothing to line up with. Distributing needs
 # three: two shapes are already evenly spaced whatever the gap, so asking for
 # that is asking for no change at all.
+#
+# Centring takes two for a different reason from aligning: one shape centred on
+# the slide is arithmetic that works perfectly well, and a model with that word
+# available would use it on a title, a logo and a page number. The set is what
+# makes the finding a composition rather than a preference.
 _ARRANGE_MIN = {
     "align_top": 2, "align_bottom": 2, "align_left": 2, "align_right": 2,
-    "distribute_h": 3, "distribute_v": 3,
+    "distribute_h": 3, "distribute_v": 3, "center_h": 2,
+    # Three headings at three sizes is a set with a majority in it; two
+    # headings at two sizes is a pair somebody may have meant.
+    "same_type_size": 3,
+    # Three to match a size, not two. Two shapes at two widths have no majority
+    # between them -- a median of two is their midpoint, which resizes BOTH and
+    # lands on a width neither was drawn at. Three is the first number at which
+    # the set can say which of its sizes is the one that was meant.
+    "same_width": 3, "same_height": 3,
 }
 
 # The parameterised corrections this check may propose, on top of the verbs
@@ -262,6 +324,19 @@ it, and say whether it is right.
              too_small  it is unreadable, or lost beside its neighbours
              too_big    it dominates the slide, or crowds what is beside it
              crowded    it has no room to breathe where it sits
+             low_contrast
+                        it is too close in tone to what it sits on to be read
+                        comfortably: a caption over the dark half of a
+                        photograph, a heading on a gradient that swallows it
+                        part of the way across, pale type on a pale fill.
+                        REPORT THIS ONLY WHERE THE BACKGROUND IS A PICTURE, A
+                        GRADIENT OR A PATTERN. Flat colour against flat colour
+                        is measured off the file exactly, by a rule that has
+                        both values and WCAG's formula, and it is already on
+                        the report before you see the slide; saying it again
+                        adds a second line about one defect. What that rule
+                        cannot do is look at a photograph, which is why this
+                        word is yours.
              unfilled   a placeholder the design expects content in that has
                         none. The list marks these EMPTY, and you will see
                         nothing at all where they are: PowerPoint does not
@@ -281,6 +356,21 @@ it, and say whether it is right.
              widen     make this text box wider until its words stop breaking
                        in half. For `cut_off` caused by a box too narrow for
                        the copy, which is the usual cause.
+             narrow    pull a text box in until its copy stops running behind
+                       whatever sits over its right-hand end. The mirror of
+                       `widen`, and for the opposite defect: a paragraph set
+                       wider than the room it was given, with an image or a
+                       panel over the end of every line. Only when something is
+                       actually sitting over the box -- a measure that is
+                       merely too long to read comfortably is a layout call.
+             send_to_back
+                       put this shape behind everything else on the slide. For
+                       an `overlap` where one shape is simply in front of what
+                       it should be behind -- a photograph or a panel drawn
+                       over the cards and captions it was meant to sit under.
+                       Only when the shape covering the others is the whole
+                       defect: two boxes that are both in the wrong place do
+                       not get sorted out by restacking them.
              none      nothing mechanical would fix it
            Choose the action that fixes the defect you named, not the one that
            hides it. Type that collides with its neighbour is not fixed by
@@ -319,6 +409,17 @@ it, and say whether it is right.
            `shrink`; a caption that should match the 11pt the rest of the deck
            uses is `set_font_size` with `size_pt: 11`.
 
+           A `low_contrast` finding is where `recolor_text` earns its place.
+           Copy laid over the dark half of a photograph usually wants the
+           colour this deck already uses for text on an image -- the white it
+           sets on its own cover, the dark it sets on a pale one -- and that
+           is a value the deck vouches for, so it passes the check. Propose it
+           where the picture makes the answer obvious. Where it does not, or
+           where what the slide needs is a scrim behind the copy, a darker
+           crop or a different image, leave `fix` null and say so in `task`:
+           those are the designer's, and a recolour that chases them makes
+           white type on a pale sky.
+
 STEP 2 -- WHAT IS WRONG WITH THE SLIDE. Anything the per-shape vocabulary
 cannot express goes in `slide_issues`: shapes that do not line up with each
 other, a row whose gaps are uneven, a timeline with a stop nothing uses, a
@@ -348,10 +449,47 @@ handed over, so it is worth naming precisely.
                align_right    these should share a right edge
                distribute_h   these should have equal gaps left to right
                distribute_v   these should have equal gaps top to bottom
+               same_width     these should all be the width most of them
+                              already are. For copies of one component drawn at
+                              different sizes -- six cards on a grid at three
+                              widths -- where no alignment describes it because
+                              the shapes line up on the edges they share.
+               same_height    the same, down the slide.
+               same_type_size these should all be set at the size most of them
+                              already are. For headings at one level of the
+                              hierarchy drawn at different sizes -- four cards
+                              whose titles are 22, 26, 18 and 20pt. Name the
+                              shapes whose type should agree, not the shapes
+                              that are wrong: the set says which size was
+                              meant.
+               center_h       these should sit centred across the width of the
+                              slide, as a set. For a row that leaves an empty
+                              column beside it -- three cards on a grid drawn
+                              for four. They move together and the spacing
+                              between them does not change, so this is not
+                              distribute_h and does not replace it.
                none           this finding is not about shapes lining up
   shapes       every ref the arrangement is about, from the list. Two or more
-               to align, three or more to distribute -- two shapes are already
-               evenly spaced whatever the gap between them.
+               to align or to centre, three or more to distribute -- two shapes
+               are already evenly spaced whatever the gap between them.
+
+IF YOUR SENTENCE SAYS IT, THE FIELD HAS TO SAY IT TOO. A `note` or a `task`
+about shapes lining up, levelling, squaring up, sitting at the same height,
+being evenly spaced, or being centred across the slide is an arrangement, and
+it is the field that gets it corrected -- the sentence alone reaches a designer
+and nothing else. Findings that arrived as prose and should have carried the
+field, taken from one real deck:
+
+  "align the blue accent lines horizontally across all four cards"
+      -> align_top, naming the four lines
+  "centre the three cards across the full width of the slide"
+      -> center_h, naming the three cards
+  "distribute the cards evenly across the width"
+      -> distribute_h, naming the cards
+
+Write the sentence you would write anyway, and then name the relation and the
+shapes. A finding with an arrangement on it is still shown in your own words;
+it is just also something somebody can tick.
 
 NAME EVERY SHAPE THE RELATION IS ABOUT, including the ones already in the
 right place. The correction is measured off the shapes named: with five circles
@@ -1462,6 +1600,8 @@ def review_from_response(
 
         parent_ref = ref.rsplit(".", 1)[0] if "." in ref else ""
         parent = refs.get(parent_ref)
+        if parent is None and action == "center":
+            parent = _holder_of(ref, listed, refs)
         review.verdicts.append(
             ShapeVerdict(
                 slide=number,
@@ -1567,6 +1707,85 @@ def _proposal(raw: Any, shape: ShapeProfile) -> Optional[FixAction]:
     action.shape_id = shape.shape_id
     action.shape = shape.name
     return action if action.valid else None
+
+
+# How far outside its holder a shape may stick and still be held by it. An
+# icon drawn a hair proud of the circle behind it is the defect being
+# reported, not evidence that the circle is not what holds it.
+_HELD_SLACK_IN = 0.02
+
+# The largest a holder may be, as a share of what it holds. A circle is two or
+# three times its icon and a band a few times its label; the content area of a
+# slide is a hundred times a caption and holds nothing in the sense this word
+# means. Without a ceiling the smallest containing shape on a sparse slide is a
+# background panel, and centring a caption on the panel walks it to the middle
+# of the slide.
+_HOLDER_LIMIT = 12.0
+
+
+def _holder_of(
+    ref: str, listed: "Listed", refs: dict[str, "Listed"]
+) -> Optional["Listed"]:
+    """The shape a `center` verdict is measured against, read off the file.
+
+    CENTRED IS A RELATIONSHIP AND THE MODEL IS NOT ASKED FOR IT. The ref says
+    where a shape sits in the tree, so a shape listed INSIDE a group already
+    names its holder -- `s5.1` is held by `s5` -- and that is where the parent
+    came from and still comes from.
+
+    What it could not reach is the commonest way a deck draws the same thing.
+    An icon on a coloured circle is usually two shapes side by side at the top
+    level, not a group: the circle is `s4`, the icon is `s7`, and no ref
+    relates them. So every `center` on one of those arrived with no parent,
+    `ShapeVerdict.executable` refused it -- centred on what? -- and the
+    commonest mechanical defect in a deck built from repeated components went
+    to a designer with a sentence.
+
+    The file answers it exactly. The holder is the SMALLEST shape that contains
+    this one, which is the tightest of the things it could be sitting in: an
+    icon inside a circle inside a card is held by the circle, not by the card.
+    Ties do not need breaking, because two shapes of the same area containing
+    the same shape are the same rectangle and centring on either is the same
+    move.
+
+    Nothing is guessed. No containing shape, or only ones too big to be
+    holding anything, and this comes back None -- the verdict stays a task and
+    reads as one.
+    """
+    box = listed.shape.geometry
+    if box is None or box.width_in <= 0 or box.height_in <= 0:
+        return None
+    depth = ref.count(".")
+    area = box.width_in * box.height_in
+
+    best: Optional["Listed"] = None
+    best_area = 0.0
+    for other_ref, other in refs.items():
+        # Siblings only. A shape's holder is at its own level of the tree:
+        # reaching up would centre an icon on a group it is not inside, and
+        # reaching down would centre it on something it contains.
+        if other_ref == ref or other_ref.count(".") != depth:
+            continue
+        if depth and other_ref.rsplit(".", 1)[0] != ref.rsplit(".", 1)[0]:
+            continue
+        held = other.shape.geometry
+        if held is None or held.width_in <= 0 or held.height_in <= 0:
+            continue
+        if not (
+            held.left_in - _HELD_SLACK_IN <= box.left_in
+            and held.top_in - _HELD_SLACK_IN <= box.top_in
+            and held.left_in + held.width_in + _HELD_SLACK_IN
+            >= box.left_in + box.width_in
+            and held.top_in + held.height_in + _HELD_SLACK_IN
+            >= box.top_in + box.height_in
+        ):
+            continue
+        held_area = held.width_in * held.height_in
+        if held_area > area * _HOLDER_LIMIT:
+            continue
+        if best is None or held_area < best_area:
+            best, best_area = other, held_area
+    return best
 
 
 def _box_of(

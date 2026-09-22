@@ -837,7 +837,9 @@ def _apply_one_uninstrumented(
     before = (shape.left, shape.top) if geometric else None
     neighbours = (
         _neighbours(presentation, issue, shape, context)
-        if geometric or (issue.rule_id or "") in _NEEDS_NEIGHBOURS
+        if geometric
+        or (issue.rule_id or "") in _NEEDS_NEIGHBOURS
+        or (issue.fix.op if issue.fix else "") in _NEEDS_NEIGHBOURS_OPS
         else []
     )
     # Read once, for both guards below. See `_boxes`.
@@ -962,6 +964,15 @@ _NEEDS_NEIGHBOURS = frozenset(
         "space.matrix_gutter",
     }
 )
+
+# The same, for a proposal, which has no rule id to be recognised by.
+#
+# `recolor_text` needs them to see WHAT THE TEXT SITS ON. A label is usually a
+# text box of its own on top of a filled shape, so the colour a reader sees
+# behind the words is not on the shape being recoloured and cannot be found
+# without looking at the slide. Without that this op set three button labels to
+# the navy of the button under one of them, and the label vanished.
+_NEEDS_NEIGHBOURS_OPS = frozenset({"recolor_text"})
 
 
 _PALETTE_RULES = ("color.text.off_palette", "color.shape.off_palette")

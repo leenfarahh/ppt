@@ -399,6 +399,7 @@ class TableCell:
     geometry: Optional[Geometry] = None
     fill_hex: Optional[str] = None
     fill_theme: Optional[str] = None
+    fill_kind: Optional[str] = None   # see ShapeProfile.fill_kind
     row_span: int = 1
     column_span: int = 1
     spanned: bool = False        # covered by another cell's merge
@@ -482,6 +483,22 @@ class ShapeProfile:
     # colour rules saw nothing at all until these existed.
     fill_theme: Optional[str] = None
     line_theme: Optional[str] = None
+    # WHAT KIND OF FILL IT IS, which `fill_hex` cannot say. A gradient, a
+    # picture fill and a shape with no fill at all all arrive here as
+    # `fill_hex=None`, and a patterned fill arrives as the pattern's
+    # FOREGROUND colour, as though it were solid. Three different things
+    # reading as one is fine for the palette rules -- they ask whether a
+    # colour is on the palette, and there is no colour -- and is not fine for
+    # anything asking what a reader sees behind the text. A caption on a
+    # gradient card, measured as though the card were transparent, is reported
+    # against the slide behind it: a confident answer about the wrong pairing,
+    # which is the one outcome `rules.contrast` is built to avoid.
+    #
+    # One of `solid`, `background` (explicitly none), `gradient`, `picture`,
+    # `textured`, `pattern`, or `inherit` for a shape that states no fill and
+    # takes the theme's -- an autoshape drawing the theme's accent while the
+    # file says nothing at all.
+    fill_kind: Optional[str] = None
     # The colours inside an SVG icon. PowerPoint calls this a Graphics Fill
     # and gives it its own ribbon tab; it is not `a:solidFill` on the shape,
     # so `fill_hex` is None for every icon and the colour rules saw none of
@@ -492,6 +509,29 @@ class ShapeProfile:
     image_sha1: Optional[str] = None    # identifies a logo asset across decks
     autofit: Optional[str] = None
     word_wrap: Optional[bool] = None
+    # Where the text sits in its box: "top", "middle" or "bottom". None when
+    # the shape states none, which PowerPoint draws as top.
+    #
+    # Read because it decides whether a box can be GROWN to fit its copy at
+    # all: growing a box does not move top-anchored text and does move middle-
+    # or bottom-anchored text, by half the growth and all of it. The overflow
+    # fix has always refused those and told the designer to "anchor the text to
+    # the top first", which is a correction nothing could make because nothing
+    # read the anchor.
+    vertical_anchor: Optional[str] = None
+    # `a:normAutofit/@fontScale` as a fraction: 0.625 for a box PowerPoint is
+    # drawing at five eighths of its stored size. None when the shape does not
+    # shrink its text, and 1.0 when it is set to but is not having to.
+    #
+    # THE NUMBER IS THE WHOLE POINT. "This box shrinks its text" is a setting;
+    # "this box is drawing 14pt copy at 8.75pt" is a defect, and it is the one
+    # that defeats every size rule in the tool, because the file says 14 and
+    # the reader sees 8.75.
+    autofit_scale: Optional[float] = None
+    # The text frame's internal margins in inches, left, top, right, bottom.
+    # A row of cards whose copy starts at four different insets is a row that
+    # reads as misaligned while every box on it is exactly where it should be.
+    text_margins: Optional[tuple] = None
     # What the MASTER says text in this placeholder is coloured, resolved
     # through the chain that decides it: the layout placeholder's own default
     # run properties, the master's placeholder, the master's text styles, the
@@ -531,6 +571,19 @@ class SlideProfile:
     shapes: list[ShapeProfile] = field(default_factory=list)
     notes: str = ""
     hidden: bool = False
+    # The colour drawn behind everything on this slide, resolved through the
+    # chain that decides it: the slide's own background, the layout's, the
+    # master's, and the theme behind all three.
+    #
+    # None MEANS "NOT A COLOUR", NOT "WHITE". A photograph, a gradient or a
+    # pattern behind the copy has no single value to measure against, and the
+    # one question this exists for -- can the text on top of it be read -- has
+    # no answer from the file in that case. Defaulting it to white would give
+    # every caption over a dark photograph a clean bill of health, which is
+    # the exact slide a contrast check exists to catch. See
+    # `rules.contrast.TextContrastRule`, which stays silent, and the design
+    # check, which can look at the picture.
+    background_hex: Optional[str] = None
 
 
 @dataclass

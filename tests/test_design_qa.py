@@ -19,6 +19,8 @@ clipped grow is a shrink and nobody asked for one.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from formatting_tool.ai.designqa import (
     build_shape_map,
     deck_issues_from_response,
@@ -37,6 +39,8 @@ from formatting_tool.apply.qafix import (
     next_size,
     steps_from,
 )
+from formatting_tool.extract import derive_master_spec
+from formatting_tool.guidelines import BrandGuidelines
 from formatting_tool.designqa import (
     DesignQaReport,
     _deck_fixes,
@@ -49,13 +53,17 @@ from formatting_tool.designqa import (
 )
 from formatting_tool.ai.designqa import PROPOSABLE_OPS, _proposal
 from formatting_tool.models import (
+    Category,
     DeckProfile,
     FixAction,
     Geometry,
+    Issue,
     ParagraphProfile,
     RunProfile,
+    Severity,
     ShapeProfile,
     SlideProfile,
+    Source,
     TextRole,
 )
 
@@ -234,6 +242,73 @@ def test_a_verdict_is_anchored_to_the_shape_it_names():
     assert [(i.note, i.task) for i in review.slide_issues] == [
         ("the right half of the slide is empty", "")
     ]
+
+
+def test_centring_finds_the_holder_in_the_file_when_no_group_states_it():
+    """A deck usually draws a component as two shapes side by side rather than
+    as a group: a circle, and an icon on top of it. No ref relates them, so
+    `center` used to arrive with no parent and be refused -- centred on what? --
+    and the commonest mechanical defect in a deck built from repeated
+    components went to a designer with a sentence."""
+    slide = _slide(
+        _shape("Card 2", 0.5, 1.5, 3.0, 3.0, shape_id=2),
+        _shape("Oval 3", 1.0, 2.0, 1.0, 1.0, shape_id=3),
+        _shape("Icon 4", 1.15, 2.3, 0.5, 0.5, shape_id=4,
+               shape_type="PICTURE (13)"),
+    )
+    _listing, refs = build_shape_map(slide, WIDE, TALL)
+
+    review = review_from_response(
+        {"shapes": [
+            {"shape": "s3", "status": "issue", "issue": "off_center",
+             "action": "center", "note": "the icon sits low in its circle"},
+        ], "slide_issues": []},
+        1, refs, (WIDE, TALL),
+    )
+    [verdict] = review.verdicts
+    # The circle, not the card behind it: the holder is the SMALLEST shape
+    # that contains this one, which is the tightest thing it could be sitting
+    # in. Centring the icon on the card would walk it across the component.
+    assert (verdict.parent, verdict.parent_id) == ("Oval 3", 3)
+    assert verdict.executable
+
+
+def test_a_shape_with_nothing_tight_enough_around_it_is_not_centred():
+    """No containing shape, or only ones far too big to be holding anything,
+    and the verdict stays a task rather than being centred on a background."""
+    slide = _slide(
+        _shape("Backdrop 2", 0.0, 0.0, WIDE, TALL, shape_id=2),
+        _shape("Caption 3", 1.0, 6.0, 0.6, 0.3, shape_id=3, text="Source"),
+    )
+    _listing, refs = build_shape_map(slide, WIDE, TALL)
+
+    review = review_from_response(
+        {"shapes": [
+            {"shape": "s2", "status": "issue", "issue": "off_center",
+             "action": "center", "note": "the caption is not centred"},
+        ], "slide_issues": []},
+        1, refs, (WIDE, TALL),
+    )
+    [verdict] = review.verdicts
+    assert verdict.parent_id is None and not verdict.executable
+
+
+def test_a_picture_over_the_slide_is_sent_behind_it():
+    """The commonest overlap on a real deck is a full-bleed photograph drawn
+    in front of the cards it was meant to sit under. Nothing is in the wrong
+    place, so no move answers it; which shape was added last is the defect."""
+    review = review_from_response(
+        {"shapes": [
+            {"shape": "s2", "status": "issue", "issue": "overlap",
+             "action": "send_to_back",
+             "note": "the photograph covers the cards"},
+        ], "slide_issues": []},
+        1, _refs(), (WIDE, TALL),
+    )
+    [verdict] = review.verdicts
+    assert verdict.action == "send_to_back" and verdict.executable
+    [step] = steps_from([review])
+    assert (step.op, step.shape_id) == ("send_to_back", 12)
 
 
 def test_a_shape_that_was_never_sent_is_dropped():
@@ -521,6 +596,25 @@ def test_a_title_out_of_line_with_the_deck_is_moved_to_the_median():
     # The median of 0.40, 0.41, 0.42 and 1.20, which the slide that is out of
     # line cannot drag towards itself the way a mean would.
     assert step.top_in == 0.415
+
+
+def test_the_same_mismatch_under_the_other_word_is_answered_the_same_way():
+    """`position` and `alignment` are two words the consistency pass has for
+    one defect, and the model picks whichever suits the sentence it is writing.
+    Only one of them used to reach any arithmetic, so half of the same finding
+    was fixable and half was prose."""
+    report = _report()
+    report.profile = _deck_with_titles({1: 0.4, 2: 0.42, 3: 0.41, 7: 1.2})
+    report.deck_issues = [DeckIssue(
+        kind="alignment", slides=[7],
+        note="slide 7 starts on a different grid line from the rest",
+        task="put it back on the line the rest of the deck uses",
+    )]
+
+    [task] = [t for t in report.tasks if t.kind == "deck"]
+    assert task.fixable and task.op == "align"
+    [step] = [s for s in steps_for(report, ["deck:0"]) if s.op == "align"]
+    assert (step.slide, step.top_in) == (7, 0.415)
 
 
 def test_a_deck_with_too_few_titles_has_no_usual_position():
@@ -964,6 +1058,91 @@ def test_a_set_already_in_line_is_not_offered_as_work():
     [task] = report.tasks
     assert not task.fixable and task.op == ""
     assert not steps_for(report, ["slide:1:0"])
+
+
+def test_a_row_that_already_shares_the_other_edge_is_not_moved():
+    """A set cannot share both edges of an axis unless its shapes are the same
+    size along it, so granting the second one takes the first one away.
+
+    The geometry is a real slide: four column headings, one box per heading,
+    all four drawn at the same top and the same width, and the first of them
+    0.28in taller because its heading wraps to a second line where the other
+    three sit on one. The model saw three headings sharing a baseline and the
+    fourth not, and asked for `align_bottom`. Applied, that lifted the
+    two-line box clear of the top edge its row is actually built on.
+
+    The rule layer's answer for this slide is `typography.heading_balance`,
+    which breaks the short headings across two lines and moves no box at all.
+    """
+    row = _row(
+        (0.708, 2.779, 2.75, 0.662),      # "Decision momentum stalls", 2 lines
+        (3.764, 2.779, 2.75, 0.381),
+        (6.819, 2.779, 2.75, 0.381),
+        (9.875, 2.779, 2.75, 0.381),
+    )
+    report = _arranged(row, "align_bottom", 0, 1, 2, 3)
+    assert not steps_for(report, ["slide:1:0"])
+    [task] = report.tasks
+    assert not task.fixable
+
+    # And the same row asked the other way round, which is the same slide
+    # reported by a model that named the edge the boxes already share.
+    assert not steps_for(_arranged(row, "align_top", 0, 1, 2, 3), ["slide:1:0"])
+
+
+def test_a_row_out_of_line_on_both_edges_is_still_levelled():
+    """The refusal above is about a set that already agrees somewhere, not
+    about a set whose shapes are different sizes. Four cards of three heights
+    with nothing shared between them is the ragged row this exists to fix."""
+    report = _arranged(
+        _row((1.0, 2.0, 1.5, 1.0), (3.0, 2.0, 1.5, 1.2),
+             (5.0, 2.3, 1.5, 0.9), (7.0, 2.0, 1.5, 1.0)),
+        "align_top", 0, 1, 2, 3,
+    )
+    [step] = steps_for(report, ["slide:1:0"])
+    assert (step.shape_id, step.top_in) == (102, 2.0)
+
+
+def test_a_short_row_is_centred_across_the_slide_as_one_piece():
+    """The one arrangement measured off the slide rather than off the set, and
+    the one where every member moves by the same amount: the gaps a designer
+    drew between the cards are not this correction's business."""
+    # Three 3.0in cards with 0.4in gaps, sitting left on a grid drawn for four.
+    # The set runs 0.7 to 10.5, so 9.8in of row in a 13.333in slide starts at
+    # 1.766 and every card shifts by the same 1.066.
+    report = _arranged(
+        _row((0.7, 2.0, 3.0, 2.0), (4.1, 2.0, 3.0, 2.0), (7.5, 2.0, 3.0, 2.0)),
+        "center_h", 0, 1, 2,
+    )
+    [task] = report.tasks
+    assert task.fixable and task.op == "align" and task.issue == "center_h"
+
+    steps = sorted(steps_for(report, ["slide:1:0"]), key=lambda s: s.left_in)
+    assert [s.left_in for s in steps] == [1.766, 5.166, 8.566]
+    # The gaps are exactly the gaps that were drawn, and nothing is said about
+    # how far down the slide the row sits.
+    assert all(step.top_in is None for step in steps)
+
+
+def test_a_row_already_centred_is_not_offered_as_work():
+    report = _arranged(
+        _row((1.667, 2.0, 4.0, 2.0), (6.667, 2.0, 5.0, 2.0)),
+        "center_h", 0, 1,
+    )
+    assert not steps_for(report, ["slide:1:0"])
+
+
+def test_centring_stops_where_the_applier_would_refuse_the_move():
+    """A set that has to travel further than an alignment allows is not sitting
+    slightly off centre. Refused here rather than there, so the designer reads
+    the model's instruction instead of a sentence about wrong neighbours."""
+    report = _arranged(
+        _row((0.2, 2.0, 1.5, 2.0), (2.0, 2.0, 1.5, 2.0)),
+        "center_h", 0, 1,
+    )
+    assert not steps_for(report, ["slide:1:0"])
+    [task] = report.tasks
+    assert not task.fixable
 
 
 def test_an_arrangement_is_not_offered_without_the_deck_to_measure():
@@ -1522,3 +1701,414 @@ def test_a_row_being_levelled_does_not_tick_off_a_title_mismatch():
     )
 
 
+
+
+# --------------------------------------------------------------------------- #
+# The deterministic half
+#
+# This check was built as the model's half of the tool and never asked the rule
+# layer anything, which was an absence rather than a decision. What it cost was
+# every finding that already had arithmetic and a fixer behind it: on a deck
+# built to demonstrate contrast failures, the page reported one finding on the
+# contrast slide -- a clipped caption -- while the rules find five there,
+# including all four pairings the slide was drawn to show.
+# --------------------------------------------------------------------------- #
+
+def _rule_issue(rule_id, slide=1, shape="Card 1", shape_id=11, **kwargs):
+    issue = Issue(
+        category=Category.COLOR,
+        severity=Severity.WARNING,
+        message=kwargs.pop("message", "something measurable is wrong"),
+        source=Source.RULE,
+        rule_id=rule_id,
+        slide=slide,
+        shape=shape,
+        shape_id=shape_id,
+        deck="deck.pptx",
+        **kwargs,
+    )
+    issue.id = issue.fingerprint()
+    return issue
+
+
+def test_a_measured_finding_is_work_like_any_other():
+    """One list, and which half of the tool noticed a defect is this tool's
+    bookkeeping rather than a designer's problem."""
+    report = _report()
+    report.rule_issues = [_rule_issue(
+        "color.text.contrast",
+        message="Text in #FFFFFF on #DEDEDE reads at 1.3:1.",
+        suggestion="Recolour the text to #1A1A1A.",
+    )]
+
+    task = next(t for t in report.tasks if t.id.startswith("rule:"))
+    assert task.fixable and task.slide == 1 and task.shape == "Card 1"
+    # The instruction leads and the measurement follows, the same way round as
+    # every other row on the page.
+    assert task.what == "Recolour the text to #1A1A1A."
+    assert task.why.startswith("Text in #FFFFFF")
+
+
+def test_a_measured_finding_is_drawn_on_the_render_like_a_verdict():
+    """A verdict carries the rectangle the model was given. A rule finding
+    carries a slide and a shape id, so without this the page has nothing to
+    draw and nothing to anchor a comment to -- and half the value of the page
+    is that a finding points at the thing it is about."""
+    profile = _row((1.0, 2.0, 3.0, 1.5))
+    shape = profile.slides[0].shapes[0]
+    report = _report()
+    report.profile = profile
+    report.width_in, report.height_in = WIDE, TALL
+    report.rule_issues = [_rule_issue(
+        "color.text.contrast", shape=shape.name, shape_id=shape.shape_id
+    )]
+
+    task = next(t for t in report.tasks if t.id.startswith("rule:"))
+    assert task.box == (round(1.0 / WIDE, 5), round(2.0 / TALL, 5),
+                        round(3.0 / WIDE, 5), round(1.5 / TALL, 5))
+
+
+def test_a_finding_both_halves_made_is_shown_once():
+    """The rule wins, and not because it is cleverer: it carries a number
+    nobody has to be trusted for and a fixer that can act on it, where the
+    model's version of the same finding carries a sentence. Two rows about one
+    defect, one of them tickable, is a page asking a designer to work out
+    which is which."""
+    report = DesignQaReport(
+        deck="deck.pptx", generated_at="now", model="test",
+        reviews=[SlideReview(slide=1, reviewed=True, verdicts=[
+            _verdict("s1", "none", shape_id=11, status="issue"),
+        ])],
+    )
+    report.reviews[0].verdicts[0] = ShapeVerdict(
+        slide=1, ref="s1", shape="Card 1", shape_id=11, role="body",
+        status="issue", issue="low_contrast", action="none",
+        note="the grey text is hard to read on the grey panel",
+    )
+    assert len(report.tasks) == 1               # the model's, on its own
+
+    report.rule_issues = [_rule_issue("color.text.contrast", shape_id=11)]
+    ids = [t.id for t in report.tasks]
+    assert ids == [f"rule:{report.rule_issues[0].id}"]
+
+
+def test_the_two_halves_are_not_deduplicated_where_they_disagree():
+    """They overlap in three places and are complementary everywhere else,
+    which is the point of running both. A verdict about a shape the rules
+    reported something ELSE on is still that verdict's own finding."""
+    report = DesignQaReport(
+        deck="deck.pptx", generated_at="now", model="test",
+        reviews=[SlideReview(slide=1, reviewed=True, verdicts=[ShapeVerdict(
+            slide=1, ref="s1", shape="Card 1", shape_id=11, role="body",
+            status="issue", issue="crowded", action="none",
+            note="it has no room to breathe",
+        )])],
+    )
+    report.rule_issues = [_rule_issue("color.text.contrast", shape_id=11)]
+    assert len(report.tasks) == 2
+
+
+def test_a_measured_finding_reaches_the_applier_unprefixed():
+    """The page addresses it as `rule:<id>` and `apply_fixes` selects on the id
+    the issue itself carries."""
+    report = _report()
+    issue = _rule_issue("color.text.contrast")
+    report.rule_issues = [issue]
+
+    assert [i.id for i in issues_for(report, [f"rule:{issue.id}"])] == [issue.id]
+    assert issues_for(report, ["1:s3"]) == []
+
+
+def test_a_measured_finding_that_was_ticked_and_applied_is_not_outstanding():
+    """Matched on the bare id rather than on shape and op: a rule issue has no
+    `fix`, so the op the applier reports for it is empty, and the shape-and-op
+    match every other row uses would call every one of them outstanding."""
+    from formatting_tool.apply.qafix import Change
+
+    report = _report()
+    issue = _rule_issue("color.text.contrast")
+    report.rule_issues = [issue]
+    key = f"rule:{issue.id}"
+
+    applied = [Change(op="", slide=1, shape_id=11, shape="Card 1",
+                      detail="recoloured 1 run(s)", task_id=issue.id)]
+    assert key not in {t.id for t in outstanding(report, [key], applied)}
+    # And a round where it was ticked and refused leaves it on the list.
+    assert key in {t.id for t in outstanding(report, [key], [])}
+
+
+def test_everything_is_measured_and_only_the_master_free_half_is_offered():
+    """The gap between the two lists is not waste.
+
+    What is OFFERED has to be narrow: the spec here is derived from the deck
+    itself, so the brand rules would be measuring the deck against its own
+    theme. What is MEASURED has to be complete, because this list is also the
+    baseline `apply_fixes` compares its own work against -- handed only the
+    narrow set, it read every palette and margin finding on the deck as newly
+    introduced and corrected them unasked.
+    """
+    report = _report()
+    report.rule_issues = [
+        _rule_issue("color.text.contrast", shape_id=11),
+        _rule_issue("color.text.off_palette", shape_id=12),
+        _rule_issue("space.safe_margin", shape_id=13),
+        _rule_issue("space.text_collision", shape_id=14),
+    ]
+
+    offered = {i.rule_id for i in report.offered_rule_issues}
+    assert offered == {"color.text.contrast", "space.text_collision"}
+    assert {t.issue for t in report.tasks if t.id.startswith("rule:")} == offered
+    # And nothing outside the offered half can be ticked into the applier.
+    assert issues_for(report, None) and all(
+        i.rule_id in offered for i in issues_for(report, None)
+    )
+
+
+def test_a_rectangle_overlap_is_offered_only_where_the_model_saw_a_collision():
+    """The model is told on this same page that two overlapping rectangles are
+    not a collision and type touching type is, so offering the rectangle
+    arithmetic unconditionally would be the page contradicting itself. But
+    refusing it outright threw the move away: a badge over the words of its
+    button is a real collision, the model sees it, and `fix_overlap` knows
+    exactly how far to nudge. The render supplies the judgement and the file
+    supplies the number."""
+    report = DesignQaReport(
+        deck="deck.pptx", generated_at="now", model="test",
+        reviews=[SlideReview(slide=1, reviewed=True, verdicts=[ShapeVerdict(
+            slide=1, ref="s1", shape="Badge 3", shape_id=11, role="other",
+            status="issue", issue="crowded", action="none",
+            note="it has no room to breathe",
+        )])],
+    )
+    report.rule_issues = [_rule_issue("space.overlap", shape_id=11)]
+    # The model looked at this shape and did not call it a collision.
+    assert report.offered_rule_issues == []
+
+    report.reviews[0].verdicts[0] = ShapeVerdict(
+        slide=1, ref="s1", shape="Badge 3", shape_id=11, role="other",
+        status="issue", issue="overlap", action="none",
+        note="the badge covers the words of the button it sits on",
+    )
+    assert [i.rule_id for i in report.offered_rule_issues] == ["space.overlap"]
+    # And it is shown once, not twice: the rule carries the number and the fix.
+    assert [t.issue for t in report.tasks] == ["space.overlap"]
+
+
+def test_a_mismatch_that_would_rewrite_the_slide_is_left_as_a_task():
+    """A cross-slide mismatch is about a repeated element. What `_by_role`
+    produces is every text shape on every named slide corrected towards a
+    majority counted over the whole deck, which is the same answer on a regular
+    deck and a very different one otherwise.
+
+    Measured on a deck built to demonstrate mismatched type: one `type_scale`
+    finding produced 107 proposals, every one setting text to 12pt, and one
+    `color` finding produced 96, every one to the same navy. Four headings at
+    22, 26, 18 and 20pt all became 12pt and three button labels became the
+    colour of the buttons they sat on.
+    """
+    # A regular deck with one slide out of step: the correction is small and
+    # is exactly the finding, so it stands.
+    report = _report()
+    report.profile = _typed_deck([11.0, 11.0, 11.0], odd={5: 9.0})
+    report.spec = derive_master_spec(report.profile, BrandGuidelines())
+
+    _steps, proposals = _deck_fixes(
+        report, 0, DeckIssue(kind="type_scale", slides=[5], note="n", task="t"))
+    assert [(p.slide, p.fix.size_pt) for p in proposals] == [(5, 11.0), (5, 11.0)]
+
+    # A deck whose type disagrees with itself everywhere has no majority worth
+    # moving towards, and correcting it rewrites the deck rather than the
+    # element the model was looking at.
+    report.profile = _typed_deck([22.0, 26.0, 18.0, 12.0])
+    report.spec = derive_master_spec(report.profile, BrandGuidelines())
+    _steps, proposals = _deck_fixes(
+        report, 0,
+        DeckIssue(kind="type_scale", slides=[1, 2, 3, 4, 5], note="n", task="t"))
+    assert proposals == []
+
+
+def test_a_capped_mismatch_is_refused_whole_rather_than_in_part():
+    """Taking the first few would correct an arbitrary subset of a set the
+    model described as one thing, which is worse than correcting none: the deck
+    comes back half rewritten and the finding reads as done."""
+    report = _report()
+    report.profile = _typed_deck([22.0, 26.0, 18.0, 12.0])
+    report.spec = derive_master_spec(report.profile, BrandGuidelines())
+
+    _steps, proposals = _deck_fixes(
+        report, 0,
+        DeckIssue(kind="color", slides=[1, 2, 3, 4, 5], note="n", task="t"))
+    assert proposals == []
+
+
+def _typed_deck(sizes: list, odd: dict | None = None) -> DeckProfile:
+    """Five slides carrying the given run sizes, one shape each.
+
+    `odd` overrides the sizes on the named slides, for the regular deck with
+    one slide out of step.
+    """
+    inks = ["1A1A1A", "F96167", "2C5F2D", "1E2761"]
+
+    def body(name, size, sid, ink):
+        run = RunProfile(text="copy", size_pt=size, color_hex=ink)
+        return ShapeProfile(
+            shape_id=sid, name=name, shape_type="TEXT_BOX (17)",
+            geometry=Geometry(left_in=0.5, top_in=2.0, width_in=6.0, height_in=1.0),
+            role=TextRole.BODY, text="copy",
+            paragraphs=[ParagraphProfile(text="copy", runs=[run])],
+        )
+
+    slides = []
+    for number in range(1, 6):
+        shapes = []
+        for index, size in enumerate(sizes):
+            if odd and number in odd and index < len(sizes) - 1:
+                size = odd[number]
+            shapes.append(body(f"Body {number}{index}", size,
+                               number * 10 + index, inks[index % len(inks)]))
+        slides.append(SlideProfile(number=number, layout_name="content",
+                                   shapes=shapes))
+    return DeckProfile(path="deck.pptx", width_in=WIDE, height_in=TALL,
+                       slides=slides)
+
+
+# --------------------------------------------------------------------------- #
+# The arrangements that change a size rather than a position
+# --------------------------------------------------------------------------- #
+
+def test_a_row_of_copies_that_drifted_takes_the_width_most_of_them_are():
+    """Six cards drawn at three widths are a grid nobody laid out, and no
+    alignment describes it because the cards line up perfectly on the edges
+    they share. The median says which width was meant where a mean would let
+    the three that drifted drag all six."""
+    report = _arranged(
+        _row((0.6, 1.9, 3.6, 1.5), (4.75, 1.85, 3.6, 1.5), (8.6, 2.05, 3.4, 1.5),
+             (0.6, 4.15, 3.6, 1.5), (4.55, 4.35, 3.75, 1.5), (8.75, 4.0, 3.4, 1.5)),
+        "same_width", 0, 1, 2, 3, 4, 5,
+    )
+    steps = steps_for(report, ["slide:1:0"])
+
+    assert {s.op for s in steps} == {"resize"}
+    assert {s.width_in for s in steps} == {3.6}
+    # Only the three that are out move, and only their width: a row of cards
+    # holding different amounts of copy may be different heights.
+    assert len(steps) == 3
+    assert all(s.height_in is None and s.left_in is None for s in steps)
+
+
+def test_a_set_taken_whole_rather_than_split_into_rows():
+    """A size is not a position. Six cards in two rows of three should be one
+    width; taking each row's own median would leave the rows disagreeing."""
+    report = _arranged(
+        _row((0.6, 1.0, 3.0, 1.0), (4.0, 1.0, 3.0, 1.0), (8.0, 1.0, 3.0, 1.0),
+             (0.6, 4.0, 2.6, 1.0), (4.0, 4.0, 3.0, 1.0), (8.0, 4.0, 3.0, 1.0)),
+        "same_width", 0, 1, 2, 3, 4, 5,
+    )
+    [step] = steps_for(report, ["slide:1:0"])
+    assert step.width_in == 3.0
+
+
+def test_a_shape_too_far_out_to_be_a_copy_stops_the_whole_set():
+    """A copy of a component that drifted is within a few per cent of its
+    siblings. Something a third out is a different element, and a row corrected
+    with one member left out is a row that still does not match, reported as
+    done."""
+    report = _arranged(
+        _row((0.6, 1.0, 3.6, 1.0), (4.0, 1.0, 3.6, 1.0), (8.0, 1.0, 1.2, 1.0)),
+        "same_width", 0, 1, 2,
+    )
+    assert steps_for(report, ["slide:1:0"]) == []
+
+
+def test_headings_at_four_sizes_are_left_for_a_designer():
+    """A size is a chosen value rather than a measurement. Four headings at 22,
+    26, 18 and 20pt have no majority, and their median is 21 -- a size nobody
+    typed and no other heading on the deck uses."""
+    report = _typed_row([22.0, 26.0, 18.0, 20.0])
+    assert steps_for(report, ["slide:1:0"]) == []
+
+
+def test_headings_with_a_majority_take_the_size_most_of_them_are():
+    report = _typed_row([22.0, 22.0, 18.0, 22.0])
+    [step] = steps_for(report, ["slide:1:0"])
+
+    assert (step.op, step.size_pt) == ("set_size", 22.0)
+    assert step.shape == "Heading 2"
+
+
+def _typed_row(sizes: list) -> DesignQaReport:
+    """One slide of headings at the given sizes, named as one set."""
+    shapes = [
+        ShapeProfile(
+            shape_id=100 + index, name=f"Heading {index}",
+            shape_type="TEXT_BOX (17)",
+            geometry=Geometry(left_in=1.0 + index * 3.0, top_in=1.0,
+                              width_in=2.6, height_in=0.8),
+            text="Aa", paragraphs=[ParagraphProfile(
+                text="Aa", runs=[RunProfile(text="Aa", size_pt=size)])],
+        )
+        for index, size in enumerate(sizes)
+    ]
+    profile = DeckProfile(path="deck.pptx", width_in=WIDE, height_in=TALL,
+                          slides=[SlideProfile(number=1, shapes=shapes)])
+    return _arranged(profile, "same_type_size", *range(len(sizes)))
+
+
+# --------------------------------------------------------------------------- #
+# The brand rules, when there is a brand to measure against
+#
+# The objection to them on this page was never the rules, it was the reference.
+# Measured against a spec derived from the deck itself they are noise; handed
+# the master the deck was restyled onto they are the question somebody looking
+# at that deck is actually asking.
+# --------------------------------------------------------------------------- #
+
+def test_without_a_master_the_brand_rules_are_not_offered():
+    """Every colour is on the palette by construction, or off it by an accident
+    of what the theme happens to hold."""
+    report = _report()
+    report.rule_issues = [
+        _rule_issue("color.text.off_palette", shape_id=11),
+        _rule_issue("color.shape.off_palette", shape_id=12),
+        _rule_issue("color.text.contrast", shape_id=13),
+    ]
+    assert report.has_master is False
+    assert [i.rule_id for i in report.offered_rule_issues] == [
+        "color.text.contrast"
+    ]
+
+
+def test_with_the_master_the_deck_was_restyled_onto_they_are():
+    """The deck check hands this page the deck it has just restyled and knows
+    the master it used. Passing that through is the difference between "these
+    colours are consistent with themselves" and "these colours are the
+    brand's"."""
+    report = _report()
+    report.has_master = True
+    report.rule_issues = [
+        _rule_issue("color.text.off_palette", shape_id=11),
+        _rule_issue("color.shape.off_palette", shape_id=12),
+        # Still not everything: a rule needing the master's grid is a different
+        # question from whether the colours are the brand's.
+        _rule_issue("space.alignment_grid", shape_id=13),
+    ]
+    offered = {i.rule_id for i in report.offered_rule_issues}
+    assert offered == {"color.text.off_palette", "color.shape.off_palette"}
+    assert all(t.fixable for t in report.tasks if t.id.startswith("rule:"))
+
+
+def test_the_master_is_what_makes_the_report_say_it_has_one():
+    """Carried rather than inferred from the spec: a spec derived from a deck
+    and a spec read off a master are the same type and tell the same story
+    about themselves."""
+    from formatting_tool.designqa import review_deck
+
+    # No images, so nothing is asked of the model and the spec is all that is
+    # being checked here.
+    profile = _typed_deck([11.0])
+    spec = derive_master_spec(profile, BrandGuidelines())
+
+    assert review_deck(Path("deck.pptx"), [], profile=profile).has_master is False
+    assert review_deck(
+        Path("deck.pptx"), [], profile=profile, spec=spec
+    ).has_master is True

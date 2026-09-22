@@ -294,6 +294,10 @@ there is one way to reach the target:
 | `logo.geometry` | moves the logo onto the master's position |
 | `color.text.off_palette` | in a placeholder, sets the colour the master gives it; elsewhere, the nearest palette entry |
 | `color.shape.off_palette` | recolours the fill, the outline, or the SVG an icon draws from |
+| `color.text.contrast` | recolours text that cannot be read off what it sits on, to the colour the master gives the placeholder or the nearest one it writes text in |
+| `typography.anchor_blocks_fit` | anchors text to the top so the box under it can be grown to fit |
+| `size.autofit_scale` | writes down the size the text is already drawn at and takes the shrink-to-fit off |
+| `space.text_insets` | sets a shape's text insets to the ones the rest of its row uses |
 | `typography.terminal_punctuation` | takes the full stop off the end of a title |
 | `font.family.arabic` | sets the Arabic runs in the brand's Arabic face, when it declares one |
 | `typography.rtl_not_set` | marks the Arabic paragraphs right-to-left |
@@ -571,6 +575,83 @@ qualifying entry means a designer picks, which is a better answer than one
 chosen by arithmetic that had nothing suitable to choose from. Distance is
 CIEDE2000, checked against the Sharma reference pairs; CIE76 overstated the
 blues, which is what pushed them onto neutrals.
+
+**Being on the palette is not the same as being readable.** A palette says
+which colours are allowed and never which pairs of them may be stacked, and
+delta-E cannot tell you: a mid grey and a navy sit far apart in Lab and white
+text is fine on one and gone on the other. That is a luminance question, so
+`color.text.contrast` asks WCAG's -- 4.5:1 for body copy, 3.0:1 for large text
+(18pt, or 14pt bold), with anything under 3.0:1 an error because no size
+rescues it. It reports one finding per shape, on that shape's worst run.
+
+It runs at all three points a colour can change, and that is the whole reason
+it is a rule rather than a one-off check. `pipeline.run` restyles the deck onto
+the master before the rules measure anything, so the first reading is of the
+deck a designer will actually send -- and the restyle is the commonest way a
+deck acquires the defect, a pale card snapped to the nearest palette entry with
+the copy on it keeping the dark colour it was typed in. It runs again in the
+recheck after fixes are applied, where a contrast defect that a recolour
+CAUSED lands in `introduced` and is corrected in the second round. Which
+closes a loop that was half open: `_refuse_illegible` could already stop a fill
+recolour from making text unreadable, and nothing was watching the other three
+ways a round could arrive at the same pairing.
+
+It measures a table's cells too, each against its own fill, grouped so that a
+header row of five cells carrying white on the same mid-tone is one finding and
+not five. That is the commonest place this defect lives on a client deck and it
+was unmeasured: a table's copy is on its cells, `ShapeProfile.table` keeps those
+out of `children` on purpose, and a rule walking `shape.paragraphs` sees an
+empty graphic frame.
+
+What it sits on is resolved the way an eye reads it: the shape's own fill, then
+the nearest filled shape under it that contains it, then the slide background,
+which is itself resolved through the layout, the master and the theme's colour
+map. A fill that is drawn and is not one colour stops that search rather than
+being stepped over: `fill_hex` cannot tell a gradient card from an unfilled
+text box -- both arrive as None -- so a gradient was stepped straight over and
+its caption measured against the slide behind it, and a patterned fill arrived
+as the pattern's foreground colour as though the whole shape were solid black.
+`ShapeProfile.fill_kind` is what tells the three apart. **None of that is guessed.** Text over a photograph, a gradient or a
+pattern has no background colour, and rather than fall through to the white
+slide behind the photograph -- which would give the worst slide in a deck a
+clean bill of health -- the rule goes silent and the design check picks it up:
+`low_contrast` is a verdict a model reading a render can give and no reading of
+the file ever will. Text whose own colour is inherited is measured against what
+the master states for the placeholder, and a colour carrying `lumMod` or a tint
+is not measured at all, because what it draws is not what it says.
+
+**What a shape does with the text INSIDE its box** is read too, and three
+settings there each defeat something the tool otherwise does well.
+
+`typography.anchor_blocks_fit` is the finding the applier had been asking for.
+`fix_text_overflow` grows a box to the size its copy needs and refuses outright
+when the text is middle- or bottom-anchored, because growing such a box moves
+the copy rather than giving it room -- measured on a real box, growing it
+0.22in to 0.50in moved bottom-anchored copy 0.28in *down*, onto the bar it was
+meant to clear and had not even been touching. That refusal ends "anchor the
+text to the top first", which was an instruction to a designer for a correction
+nothing could make, because nothing read the anchor. It is reported only where
+the copy also does not fit: middle-anchoring on its own is how most labels on
+most decks are set.
+
+`size.autofit_scale` reports the AMOUNT of a shrink where `size.autofit_shrink`
+reports only the setting, and the amount is the defect. A heading stored at 14pt
+and drawn at 8.75pt passes every size check here, because they all read the
+file and the file says 14. The number lives in `a:normAutofit/@fontScale` and
+nothing was reading it. The correction is to write down what is already on the
+screen -- set the runs to the drawn size and take the shrinking off -- so the
+slide renders exactly as it did and the tool can finally see what it renders as.
+What happens to a heading three steps below the deck's scale is then the rest of
+the report's business, which is where it belongs.
+
+`space.text_insets` is the misalignment no alignment rule can see. Four cards at
+the same size on the same top edge, evenly spaced, and the copy in one starts a
+tenth of an inch further in because somebody pasted it from another slide: every
+geometric rule here measures the box, every box is exactly where it should be,
+and what a reader sees is four cards whose text does not line up. Grouped the
+way the heading rules group, and corrected to the inset more than half the row
+uses -- a row with no majority is a set of decisions somebody made rather than a
+drift.
 
 **Artwork a slide inherits from its layout is carried onto the slide** before
 the rebuild swaps layouts. What a designed slide shows is often not on the
@@ -1270,13 +1351,14 @@ schema has no word for one.
 **Two buckets come back, and both are kept.**
 
 - **A verdict per shape**, as `{shape, status, issue, action, note, task}`.
-  `action` is `shrink`, `grow`, `center`, `widen` or `none`; `issue` is
-  `overlap`, `cut_off`, `off_center`, `too_small`, `too_big`, `crowded` or
-  `unfilled`. Both are whitelisted in Python on the way in, so a word nobody
+  `action` is `shrink`, `grow`, `center`, `widen`, `send_to_back` or `none`;
+  `issue` is
+  `overlap`, `cut_off`, `off_center`, `too_small`, `too_big`, `crowded`,
+  `unfilled` or `low_contrast`. Both are whitelisted in Python on the way in, so a word nobody
   defined reads as unlabelled rather than as a new behaviour. `task` is
   required whenever `status` is `issue`, whatever the action.
 
-  Three of those are worth spelling out. **`cut_off`** covers a word broken
+  Four of those are worth spelling out. **`cut_off`** covers a word broken
   across lines because its box is too narrow -- "Proportionalit / y" -- as well
   as text clipped by its box: both mean the box cannot show the words it was
   given, and the first is the one a designer sees and no rule measures.
@@ -1286,11 +1368,113 @@ schema has no word for one.
   does not export the "Click to add text" prompt, so an unfilled region renders
   as blank space rather than as a mistake. The map marks those `EMPTY` and the
   model is told to trust the mark over the picture for that one.
+  **`low_contrast`** is the reverse of it: the one verdict ONLY the picture
+  supports. `color.text.contrast` measures every pairing the file states and
+  goes deliberately silent on a photograph, a gradient or a pattern, because
+  none of those has a colour to measure against. So the model is told to use
+  this word only there, and never for flat colour on flat colour -- that is
+  already on the report, measured exactly, before it sees the slide.
 - **`slide_issues`**, for everything that vocabulary cannot express: a timeline
   with a stop nothing uses, a column left empty, a layout weighted to one side.
   Each is a `{note, task}` pair for the same reason -- the note is what is
   wrong, the task is what to do about it. Dropping these quietly is how a bad
   slide reaches a client.
+
+  One of these is corrected rather than handed over. A finding about how
+  several shapes sit relative to each other also carries an `arrangement` and
+  the `shapes` it is about: `align_top`, `align_bottom`, `align_left`,
+  `align_right`, `distribute_h`, `distribute_v`, or `center_h`. The split is
+  the one the `align` verb uses -- the model says which shapes should relate
+  and how, and the file says where they belong, so no picture is ever asked
+  for a coordinate. `center_h` is the one measured off the slide rather than
+  off the set: three cards on a grid drawn for four sit left with an empty
+  column beside them, and nothing about the three cards is wrong, so no
+  relation between them describes it. They move together and the gaps between
+  them do not change. There is no `center_v`: a slide is symmetrical across
+  its width and is not symmetrical down its height.
+
+  **A set that already shares one edge is not moved onto the other.** Four
+  column headings at the same top, one of them taller because its heading
+  wraps to two lines, reads off a render as three baselines and an odd one
+  out, and `align_bottom` is a fair reading of that picture. Applied, it lifts
+  the two-line box clear of the top edge the row is actually built on -- a set
+  cannot share both edges of an axis unless its shapes are the same size along
+  it. The rule layer's answer for that row is `typography.heading_balance`,
+  which breaks the short headings across two lines and moves no box at all.
+  So the arrangement is refused and the finding stays a task.
+
+**The rules run on this page too, and that is new.** The design check was
+built as the model's half of the tool and never asked the rule layer anything,
+which was an absence rather than a decision. What it cost was every finding
+that already had arithmetic and a fixer behind it: on a deck built to
+demonstrate contrast failures, the page reported one finding on the contrast
+slide -- a clipped caption -- while the rules find five there, including all
+four of the pairings the slide was drawn to show, each with the ratio and the
+colour to set.
+
+**The brand rules run here too, when there is a brand to measure against.**
+The design check normally infers its reference from the deck it is auditing,
+which is why the palette rules are kept off the list: measured against a theme
+taken from the file in front of it, every colour is on the palette by
+construction or off it by accident. That objection is about the reference and
+not about the rules. The deck check hands this page the deck it has just
+restyled and knows the master it used, so that master's spec is handed over
+with it -- and with a real palette in hand, `color.text.off_palette` and
+`color.shape.off_palette` are the question somebody looking at a restyled deck
+is actually asking. Any text, fill, outline or icon drawn in a colour the
+master does not hold is a tick box, and the rest of the brand rules stay off:
+whether a shape sits on the master's grid is a different question from whether
+its colour is the brand's.
+
+`color.shape.off_palette` is the one that reaches the icons. An icon from
+PowerPoint's library is a picture, and what the ribbon calls a Graphics Fill is
+not `a:solidFill` on the shape -- the colour lives inside the SVG the picture
+draws from, which `svgicon` reads and `fixers._recolor_icon` writes. Nothing
+else in the tool recolours an icon, and on a deck of attribute cards the icons
+are most of what a reader sees.
+
+**And a table's colours are measured at last.** A table's copy lives on its
+cells and `ShapeProfile.table` keeps those out of `children` on purpose -- a
+cell is not a shape, and every geometric rule walking into one would report
+margins and overlaps on forty-two boxes none of them was written for. The side
+effect was that no rule reading runs saw a word of a table and no rule reading
+fills saw a cell, so a deck's tables went out in whatever colours and typefaces
+they arrived in, measured by nothing. `RuleContext.runs` now yields a table's
+runs against the table, and the shape palette rule reads its cell fills; both
+fixes match on the value the finding measured rather than on a cell address,
+so one shade across six cells is one decision.
+
+**Narrowed to the rules that need no master.** The reference here is derived
+from the deck itself, which is the right authority for "does this agree with
+itself" and the wrong one for "is this on brand": run the palette rules against
+it and the same test deck produces 156 findings about colours the master never
+writes text in and 135 about colours off a palette it inferred from the file it
+is auditing. What is offered is the sixteen rules that measure the deck against
+itself or against arithmetic -- a contrast ratio, copy that does not fit its
+box, a row whose members disagree. `space.overlap` is left out of even that,
+and it is the only rule that passes every other test: it reports two rectangles
+that overlap, and this page tells the model in as many words that two
+overlapping rectangles are not a collision and type touching type is.
+`space.text_collision` asks the same question of the render, and that one is in.
+
+**Everything is measured even though only that half is offered,** because the
+list is also the baseline `apply_fixes` compares its own work against. That
+applier runs a second round over what its corrections introduced, and works out
+which those are by asking what the deck had beforehand -- the list it was
+handed. Handed only the narrow set, it read every palette and margin finding on
+the deck as newly introduced and corrected them unasked: 56 rows ticked and a
+second round of 121 corrections nobody chose, 27 of them recolours measured
+against a theme inferred from the file being audited. With the full reading as
+the baseline that second round is empty.
+
+**The two halves overlap in three places and are complementary everywhere
+else,** which is the point of running both. `low_contrast`, `overlap` and
+`cut_off` are the verdicts a rule also makes; where both describe the same
+defect on the same shape the rule's row is kept, because it carries a number
+nobody has to be trusted for and a fixer that can act on it while the model's
+carries a sentence. Everywhere else both stand: on one slide of the test deck
+the model reported seven collisions of rendered type where the rules reported
+three overlapping boxes, and neither list is the other.
 
 **Every finding is a task.** Not a note, not an observation: a line that says
 what to do, with the slide and the shape it is about. The model is required to
@@ -1365,10 +1549,24 @@ grow           slide 1 Content Placeholder 2  stepped the type up from 12pt to 1
 | `shrink` / `grow` | steps the type one notch, x0.85 or x1.15 | the 9pt floor and the 40pt cap; put back if the copy stops fitting |
 | `center` | moves a shape to the middle of the thing holding it | refuses when it is not inside anything, or is already centred to within half a point |
 | `widen` | widens a box until its words stop breaking in half | a neighbour, the slide edge, or 1.6x; put back if the break survives |
+| `send_to_back` | puts a shape behind everything else on its slide | a shape inside a group, where the stacking is the group's own, or one already at the back |
+| `narrow` | pulls a text box in until its copy stops running behind what sits over its right-hand end | nothing sitting over it, a floor at 55% of its width, or the copy no longer fitting the shorter measure |
+| `resize` | gives a shape the width or height most of its set already is | a shape more than a third out, which stops the whole set, or the copy no longer fitting |
+| `set_size` | sets type to the size most of the named set is at | no majority in the set, mixed sizes on one shape, or the copy no longer fitting |
 | `align` | moves a shape to where the rest of the deck puts it | fewer than three slides to measure, or a move over 2in |
 
 A step that would pass a bound is not taken at all rather than clipped to it,
 since a clipped grow is a shrink and nobody asked for one.
+
+**`center` reads the holder off the file, not off the model.** A shape listed
+inside a group already names its holder -- `s5.1` is held by `s5` -- but a deck
+usually draws the same component as two shapes side by side rather than as a
+group: a circle, and an icon on top of it. No ref relates those, so the
+question is answered from the geometry instead, and the holder is the smallest
+shape that contains the one being centred: the circle, not the card behind it.
+A shape with nothing tight enough around it -- only a background panel, or
+nothing at all -- stays a task, because centring a caption on a panel walks it
+to the middle of the slide.
 
 **`widen` re-reads the renderer rather than computing a width.** How wide a
 word draws depends on the typeface, the size, the kerning and the language, and
@@ -1384,7 +1582,67 @@ of the title across the deck, median rather than mean so the slide being
 reported cannot drag the target towards itself. Titles only: a title is the one
 shape a deck has on nearly every slide in a role this tool can identify, so
 "where the rest of the deck puts it" means something. For a logo that drifts
-there is no such set, and the finding stays a task.
+there is no such set, and the finding stays a task. A cross-slide mismatch
+reaches it under either of the two words the consistency pass has for the same
+defect, `position` and `alignment`; the model picks whichever suits the
+sentence it is writing, and both are answered by the same median.
+
+**A cross-slide correction is capped at what it can plausibly be about.** A
+mismatch is about a repeated element -- "the body copy on slide 3 is smaller
+than on slides 1 and 2" is a sentence about one kind of text in one place --
+but what `_by_role` produces is every text shape on every named slide,
+corrected towards a majority counted over the whole deck. That is the same
+answer on a regular deck and a very different one otherwise. On a deck built to
+demonstrate mismatched type, one `type_scale` finding produced 107 proposals,
+every one setting text to 12pt, and one `color` finding produced 96, every one
+to the same navy; applied, four headings at 22, 26, 18 and 20pt all became
+12pt. So a correction that would rewrite more than a third of the text on the
+slides it names is refused as a set -- all of it, since half a rewrite reads as
+done -- and the finding stays a task. A deck that really is wrong throughout is
+the deck check's problem, which has a master to measure against rather than one
+inferred from the file being audited.
+
+**And a text recolour is now guarded the way a fill recolour always was.**
+`_refuse_illegible` stops a fill change leaving the text on it unreadable;
+nothing stopped a text change doing the same from the other side, and a text
+colour is the easier of the two to get wrong because the colour it has to be
+read against is usually not on the shape being recoloured at all. Three button
+labels were set to the deck's majority navy and one of those buttons was navy:
+1.0:1, and the word disappeared. The guard reads what the text actually sits
+on -- the shape's own fill, then the nearest shape behind it that contains it
+-- and stays silent where that is not a colour.
+
+**Every slide is drawn, whether or not anything is wrong with it.** A slide
+with no verdict, no slide-level finding and no reason used to render as nothing
+at all, which reads as a tidy page and is not one: a designer could not tell a
+slide that was looked at and passed from a slide that was never in the list,
+and only one of those is good news. It cost more than that once the
+deterministic rules joined this page -- a slide could be CORRECTED without ever
+being drawn, because the rules found a contrast pairing on a slide the model
+had nothing to say about and the fix landed on a slide that appeared nowhere.
+The empty ones are quieter than the rest and say which of the three they are:
+looked at and clean, corrected, or not looked at.
+
+**A correction can be taken back one at a time,** the same way it can on the
+deck check and for the same reason: it is a REPLAY, not a reverse. None of
+these corrections has an inverse -- a type step rolled back for spilling, a
+move a guard refused, a widening that stopped at a neighbour are not deltas
+anybody can subtract, and a deck edited twice is not the deck edited once. So
+the round is run again from the same starting file without the row named, and
+what comes back is the deck that round would have produced had the row never
+been ticked. The button sits with the change it
+undoes, in the list of what happened to that slide, the way the deck check puts
+it -- and a correction that was made and then withdrawn stays in that list with
+a way back, because it is part of the answer to what this round did to the
+slide. A row taken back on a slide where nothing else changed has no such list
+to sit in, since the slide no longer has a pair of pictures to show, so those
+are listed with the round instead: unglamorous, and the difference between a
+reversible round and a one-way door for the one row somebody is most likely to
+want back. Cumulative and reversible: rows accumulate on the undo list and
+`Put it back` takes them off. The tick itself is left alone, because un-ticking
+would say the designer changed their mind about wanting it and what they did
+was ask for this round without it. A fresh Apply clears the list, since a new
+set of ticks is a new decision about the whole deck.
 
 **Everything else is written into the deck as a comment.** Ticking Apply does
 two things: it makes the corrections, and it files every remaining task as a
@@ -1510,6 +1768,11 @@ Skipped where no browser is installed.
 | `formatting_tool/rebuild/builder.py` | Recreates the deck on the master. |
 | `formatting_tool/apply/fixers.py` | One fixer per rule, for the findings a machine can correct. |
 | `formatting_tool/apply/applier.py` | Applies the ticked findings, then optionally the rebuild. |
+| `formatting_tool/arrange/` | Align elements and the text inside them. A file-based port of the Wizardly add-in's Productivity Tools service. |
+| `formatting_tool/arrange/elements.py` | The fifteen alignments, the dock family, and distribution. |
+| `formatting_tool/arrange/text.py` | Anchors, insets, paragraph alignment and reading order, table cell by table cell. |
+| `formatting_tool/arrange/properties.py` | Make Same: capture one shape's property, write it onto the others. |
+| `formatting_tool/arrange/signature.py` | Select Same: sign a shape from its XML, then compare. |
 | `formatting_tool/report/reader.py` | Reads a report back from JSON, so a selection round-trips. |
 | `formatting_tool/ai/payload.py` | Builds the cached prefix and the per-batch payload. |
 | `formatting_tool/ai/schema.py` | The JSON contract, enforced server-side. |

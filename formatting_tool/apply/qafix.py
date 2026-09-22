@@ -16,6 +16,12 @@ comments rather than dropped.
     widen           widen a text box until PowerPoint stops breaking its words
                     in half, in steps, stopping at a neighbour, at the slide
                     edge, or at a cap, and rolled back if the break survives.
+    narrow          its mirror: pull a text box in until its copy stops running
+                    behind whatever sits over its right-hand end, stopping at
+                    that shape or at a floor, and rolled back if the copy stops
+                    fitting the shorter measure.
+    send_to_back    put a shape behind everything else on its slide. The one
+                    correction here that moves nothing.
     align           move a shape to a position measured off other shapes. Two
                     findings arrive as this one op. A title that sits 4% lower
                     than on every other slide is measured off the deck; a
@@ -142,6 +148,15 @@ class Step:
     parent: str = ""
     left_in: Optional[float] = None
     top_in: Optional[float] = None
+    # `resize` needs a size instead, and on ONE axis: a row of cards made one
+    # width is still allowed to be different heights, and usually should be.
+    # The axis left None is not written, the same way an align's is not.
+    width_in: Optional[float] = None
+    height_in: Optional[float] = None
+    # `set_size` needs a type size, in points. Not a step up or down like
+    # `grow` and `shrink`: the number is the one the rest of the named set is
+    # already set at, counted in `designqa._type_steps`.
+    size_pt: Optional[float] = None
     note: str = ""                # what the model said, carried for the page
     # What `align` measured its target off, in the words the page will show.
     # The default is the cross-slide case the op was written for; a within-
@@ -329,7 +344,9 @@ def steps_from(reviews: Iterable[Any]) -> list[Step]:
             # this loop became a Step whose op is "none", which the applier
             # then refused -- a refusal on the page for a correction the other
             # half had already made.
-            if verdict.action not in ("shrink", "grow", "center", "widen"):
+            if verdict.action not in (
+                "shrink", "grow", "center", "widen", "narrow", "send_to_back",
+            ):
                 continue
             steps.append(
                 Step(
@@ -342,6 +359,13 @@ def steps_from(reviews: Iterable[Any]) -> list[Step]:
                     parent_id=verdict.parent_id,
                     parent=verdict.parent,
                     note=verdict.note,
+                    # THE ROW THIS ANSWERS, on every step and not only on the
+                    # arrangements. It was left empty here because the page
+                    # could match a measured verb back to its row by shape and
+                    # op, which is true right up until somebody wants to take
+                    # ONE change back: an undo names a row, and a change that
+                    # carries no row cannot be named.
+                    task_id=f"{verdict.slide}:{verdict.ref}",
                 )
             )
     return steps
@@ -451,8 +475,16 @@ def _apply_one(
         _center(slide, shape, step, result)
     elif step.op == "widen":
         _widen(presentation, slide, shape, step, result)
+    elif step.op == "narrow":
+        _narrow(presentation, slide, shape, step, result)
+    elif step.op == "send_to_back":
+        _send_to_back(slide, shape, step, result)
     elif step.op == "align":
         _align(shape, step, result, settled if settled is not None else set())
+    elif step.op == "resize":
+        _resize(shape, step, result)
+    elif step.op == "set_size":
+        _set_size(shape, step, result)
     else:
         result.skipped.append(_refused(step, f"there is no {step.op!r} correction"))
 
@@ -588,6 +620,13 @@ def _holder_of(
     So the sibling that contains the child's centre and is the largest of those
     that do is the holder, and the group is the fallback for a component with
     no such shape -- two icons side by side, a bare label in a group.
+
+    AND THE HOLDER IS NOT ALWAYS A GROUP. A deck usually draws the same
+    component as two shapes at the top level -- a circle, and an icon on top of
+    it -- and `ai.designqa._holder_of` reads that relationship off the file
+    where no group states it. What arrives here is then the circle itself,
+    which has no `GroupItems` to look through and needs none: its own box is
+    the box to centre on, which is the fallback below.
     """
     centre_x = child_box[0] + child_box[2] / 2
     centre_y = child_box[1] + child_box[3] / 2
@@ -597,7 +636,12 @@ def _holder_of(
     except Exception:
         own_id = None
 
-    for sibling in _com_each(group.GroupItems):
+    try:
+        items = group.GroupItems if int(group.Type) == _MSO_GROUP else None
+    except Exception:
+        items = None
+
+    for sibling in (_com_each(items) if items is not None else ()):
         try:
             if own_id is not None and int(sibling.Id) == own_id:
                 continue
@@ -623,6 +667,69 @@ def _holder_of(
         )
     except Exception:
         return _name_of(group), None
+
+
+# -- z-order ---------------------------------------------------------------- #
+
+# msoSendToBack. The only z-order constant used here: nothing is brought
+# forward, because "this should be in front" is a composition somebody chose
+# and "this photograph is covering the slide" is not.
+_MSO_SEND_TO_BACK = 1
+
+
+def _send_to_back(slide: Any, shape: Any, step: Step, result: QaFixResult) -> None:
+    """Put a shape behind everything else on its slide.
+
+    THE ONE CORRECTION HERE THAT MOVES NOTHING. A full-bleed photograph drawn
+    over the cards it was meant to sit under is an overlap in the render and
+    nothing at all in the geometry -- both shapes are exactly where the layout
+    puts them, and the only thing wrong is which of them was added last. Every
+    other answer to it is worse: nudging the picture clear of the cards walks
+    a full-bleed image off the slide, and shrinking either one makes a
+    composition nobody drew.
+
+    ALL THE WAY BACK RATHER THAN ONE STEP. A step behind is a guess about how
+    many things this should be behind, and the slide cannot settle it; the back
+    of the deck is where a background belongs and is the only position that
+    needs no such guess.
+
+    Top-level shapes only. Inside a group, z-order is the group's internal
+    stacking and sending a child to the back of it does not put it behind
+    anything a reader can see -- the group as a whole is still wherever it was.
+    """
+    if len(step.path) > 1:
+        result.skipped.append(_refused(
+            step,
+            "this shape is inside a group, where the stacking order is the "
+            "group's own; the group is what sits in front of the slide",
+        ))
+        return
+
+    try:
+        if int(shape.ZOrderPosition) == 1:
+            result.skipped.append(
+                _refused(step, "it is already at the back of the slide")
+            )
+            return
+    except Exception:
+        pass
+
+    try:
+        shape.ZOrder(_MSO_SEND_TO_BACK)
+    except Exception as exc:
+        result.skipped.append(
+            _refused(step, f"PowerPoint refused to restack it: {exc}")
+        )
+        return
+
+    result.applied.append(Change(
+        op=step.op,
+        slide=step.slide,
+        shape_id=step.shape_id,
+        shape=step.shape,
+        detail="sent it behind everything else on the slide",
+        task_id=step.task_id,
+    ))
 
 
 # -- widening --------------------------------------------------------------- #
@@ -743,6 +850,143 @@ def _room_to_the_right(presentation: Any, slide: Any, shape: Any) -> float:
     return max(0.0, limit - _CLEARANCE_PT - right)
 
 
+# -- narrowing -------------------------------------------------------------- #
+
+# How much narrower each attempt makes the box, and the floor on the total. A
+# box cut to half its width is not a box that was running behind something, it
+# is a column somebody has to redraw, and taking it that far would leave the
+# copy in a gutter.
+_NARROW_STEP = 0.92
+_NARROW_TRIES = 6
+_NARROW_FLOOR = 0.55
+
+
+def _narrow(presentation, slide, shape, step: Step, result: QaFixResult) -> None:
+    """Pull a text box in until its copy stops running behind what is beside it.
+
+    THE MIRROR OF `_widen`, AND THE CASE IT COULD NOT ANSWER. Widening fixes a
+    box too narrow for a word; this fixes a box too WIDE for the space it was
+    drawn in -- a paragraph set at full width with an image sitting over its
+    right-hand end, so the last words of every line are behind the picture. The
+    box and the picture are both where the layout puts them and neither is in
+    the wrong place; the measure is simply longer than the room.
+
+    IT STOPS AT THE THING IT IS CLEARING rather than at a width computed from
+    the copy, for the reason `_widen` gives in full: how wide a word draws
+    depends on the typeface, the size, the kerning and the language, and every
+    attempt to derive it from the characters is a guess that is wrong for
+    Arabic. So the box is pulled in a little at a time and PowerPoint is asked
+    again where the text now ends.
+
+    AND IT IS PUT BACK IF THE COPY STOPS FITTING. Narrowing a box makes its
+    text taller, so a paragraph that fitted at full width can overflow the
+    bottom at three-quarters of it -- trading a collision a reader can still
+    read around for one they cannot. Measured after each step, the same way a
+    type step is.
+    """
+    try:
+        text_range = shape.TextFrame.TextRange
+        if not str(text_range.Text).strip():
+            result.skipped.append(_refused(step, "there is no text on this shape"))
+            return
+        original = float(shape.Width)
+        left = float(shape.Left)
+    except Exception:
+        result.skipped.append(
+            _refused(step, "PowerPoint would not say what this shape holds")
+        )
+        return
+
+    blocker = _blocking_right(slide, shape)
+    if blocker is None:
+        result.skipped.append(_refused(
+            step,
+            "nothing is sitting over the right-hand end of this box, so "
+            "narrowing it would only make the measure shorter",
+        ))
+        return
+
+    # Where the box has to end to clear it. Computed once: this is a fact about
+    # the two rectangles, and it is the only number this correction needs.
+    wanted = max(blocker - _CLEARANCE_PT - left, original * _NARROW_FLOOR)
+    if wanted >= original - 1:
+        result.skipped.append(
+            _refused(step, "this box already clears what is beside it")
+        )
+        return
+
+    width = original
+    for _attempt in range(_NARROW_TRIES):
+        width = max(width * _NARROW_STEP, wanted)
+        try:
+            shape.Width = width
+        except Exception as exc:
+            _restore_width(shape, original)
+            result.skipped.append(
+                _refused(step, f"PowerPoint refused the width: {exc}")
+            )
+            return
+        spilled = _spilled(shape)
+        if spilled:
+            _restore_width(shape, original)
+            result.skipped.append(_refused(
+                step,
+                f"narrowing it to clear what is beside it {spilled}, so the "
+                "copy has to be shortened or the block moved instead",
+            ))
+            return
+        if width <= wanted:
+            result.applied.append(_made(
+                step,
+                f"narrowed the box from {original / _POINTS_PER_INCH:.2f}in to "
+                f"{width / _POINTS_PER_INCH:.2f}in, so its copy wraps before "
+                "what is beside it",
+            ))
+            return
+
+    _restore_width(shape, original)
+    result.skipped.append(_refused(
+        step, "this box would have to lose more than its width allows to "
+              "clear what is beside it",
+    ))
+
+
+def _blocking_right(slide: Any, shape: Any) -> Optional[float]:
+    """The left edge of the nearest shape sitting OVER this box's right end.
+
+    Not `_room_to_the_right`, which measures to the nearest thing the box could
+    grow into. This is the opposite question: what is already inside the box's
+    own rectangle, on its right, and drawn after it. A shape that merely sits
+    beside the box is not in the way -- the copy is not running behind it.
+    """
+    try:
+        left, top = float(shape.Left), float(shape.Top)
+        right, bottom = left + float(shape.Width), top + float(shape.Height)
+        own = int(shape.Id)
+    except Exception:
+        return None
+
+    found = None
+    for other in _com_each(slide.Shapes):
+        try:
+            if int(other.Id) == own:
+                continue
+            o_left, o_top = float(other.Left), float(other.Top)
+            o_right = o_left + float(other.Width)
+            o_bottom = o_top + float(other.Height)
+        except Exception:
+            continue
+        # Overlapping this box vertically, starting inside it, and reaching at
+        # least as far right as it does: a thing the copy runs under, rather
+        # than one the box happens to touch a corner of.
+        if o_top >= bottom or o_bottom <= top:
+            continue
+        if not (left < o_left < right) or o_right < right - _CLEARANCE_PT:
+            continue
+        found = o_left if found is None else min(found, o_left)
+    return found
+
+
 # -- aligning --------------------------------------------------------------- #
 
 def _align(
@@ -842,6 +1086,131 @@ def _align(
         moves.append(f"{(top - was_top) / _POINTS_PER_INCH:+.2f}in down")
     result.applied.append(_made(
         step, f"moved it to {step.measured_off} ({', '.join(moves)})"))
+
+
+def _set_size(shape: Any, step: Step, result: QaFixResult) -> None:
+    """Set a shape's type to the size the rest of its set is at.
+
+    NOT A STEP, WHICH IS WHY IT IS NOT `grow` OR `shrink`. Those move type one
+    notch because the model can see that something is too big without being
+    able to say how big it should be. Here the set says: four headings at one
+    level of the hierarchy, three of them at 22pt, and the number is counted
+    rather than judged.
+
+    Rolled back if the copy stops fitting, the same as a step. A heading set
+    larger to match its row can overflow the card it sits in, and a row that
+    agrees about type with one heading spilling out of its box is not the
+    tidier of the two outcomes.
+    """
+    if step.size_pt is None:
+        result.skipped.append(_refused(step, "there is no size named to set"))
+        return
+    try:
+        text_range = shape.TextFrame.TextRange
+        if not str(text_range.Text).strip():
+            result.skipped.append(_refused(step, "there is no text on this shape"))
+            return
+        current = float(text_range.Font.Size)
+    except Exception:
+        result.skipped.append(
+            _refused(step, "PowerPoint would not say what size this text is")
+        )
+        return
+
+    if current == _MIXED:
+        result.skipped.append(_refused(
+            step, "this shape is set at more than one size, so there is no "
+                  "one size to change",
+        ))
+        return
+    if abs(current - step.size_pt) < _STEP_PT:
+        result.skipped.append(_refused(step, f"it is already {step.measured_off}"))
+        return
+
+    try:
+        text_range.Font.Size = step.size_pt
+    except Exception as exc:
+        result.skipped.append(_refused(step, f"PowerPoint refused the size: {exc}"))
+        return
+
+    spilled = _spilled(shape)
+    if spilled:
+        powerpoint.quietly(lambda: setattr(text_range.Font, "Size", current))
+        result.skipped.append(_refused(
+            step, f"setting it to {step.size_pt:g}pt {spilled}, so the box or "
+                  "the copy has to give first",
+        ))
+        return
+
+    result.applied.append(_made(
+        step,
+        f"set the type from {current:g}pt to {step.size_pt:g}pt, "
+        f"to match {step.measured_off}",
+    ))
+
+
+def _resize(shape: Any, step: Step, result: QaFixResult) -> None:
+    """Give a shape the size the rest of its set already is.
+
+    THE ONE CORRECTION HERE THAT CHANGES A SIZE. Everything else moves things,
+    and the difference matters: a move can be looked at and undone by eye,
+    while a resize changes how much copy fits and can push text out of a box
+    that held it. So the target is computed off the set before this runs
+    (`designqa._resize_steps`), bounded there to a third, and the result is
+    measured here.
+
+    FROM THE TOP LEFT, which is what PowerPoint does and what the arrangement
+    means: a card that grows grows to the right. The row's left edges are
+    usually its one good alignment and are the thing this must not disturb.
+
+    PUT BACK IF THE COPY STOPS FITTING, like a type step and a narrowing. A
+    card made narrower to match its set can no longer hold its heading, and a
+    row that matches with one card's text spilling out of it is not the tidier
+    of the two outcomes.
+    """
+    if step.width_in is None and step.height_in is None:
+        result.skipped.append(_refused(step, "there is no size named to give it"))
+        return
+    try:
+        was_width, was_height = float(shape.Width), float(shape.Height)
+    except Exception:
+        result.skipped.append(
+            _refused(step, "PowerPoint would not say how big this shape is")
+        )
+        return
+
+    width = was_width if step.width_in is None else step.width_in * _POINTS_PER_INCH
+    height = was_height if step.height_in is None else step.height_in * _POINTS_PER_INCH
+    if (abs(width - was_width) < 1.0) and (abs(height - was_height) < 1.0):
+        result.skipped.append(
+            _refused(step, f"it is already {step.measured_off}")
+        )
+        return
+
+    try:
+        shape.Width, shape.Height = width, height
+    except Exception as exc:
+        result.skipped.append(_refused(step, f"PowerPoint refused the size: {exc}"))
+        return
+
+    spilled = _spilled(shape)
+    if spilled:
+        powerpoint.quietly(lambda: setattr(shape, "Width", was_width))
+        powerpoint.quietly(lambda: setattr(shape, "Height", was_height))
+        result.skipped.append(_refused(
+            step, f"matching the rest of its set {spilled}, so the copy has to "
+                  "be shortened before the shapes can agree",
+        ))
+        return
+
+    axis = "wide" if step.width_in is not None else "tall"
+    before = was_width if step.width_in is not None else was_height
+    after = width if step.width_in is not None else height
+    result.applied.append(_made(
+        step,
+        f"made it {after / _POINTS_PER_INCH:.2f}in {axis}, from "
+        f"{before / _POINTS_PER_INCH:.2f}in, to match {step.measured_off}",
+    ))
 
 
 # -- shared ----------------------------------------------------------------- #

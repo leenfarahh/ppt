@@ -203,10 +203,10 @@ class _QaSession:
     """One design check, kept so its steps can be applied to the same deck.
 
     Smaller than `_Session` because the design check has less to remember:
-    there is no master, no brand file, no undo. What it does have to keep is
-    the report -- the refs the page ticks are the refs that review handed out,
-    and re-deriving them would mean asking the model again and getting a
-    different reading of the same slides.
+    there is no master and no brand file. What it does have to keep is the
+    report -- the refs the page ticks are the refs that review handed out, and
+    re-deriving them would mean asking the model again and getting a different
+    reading of the same slides.
     """
 
     id: str
@@ -241,6 +241,28 @@ class _QaSession:
     # so, because "before" meaning the output of another pipeline is exactly
     # the sort of thing a page must not leave a designer to infer.
     handed_over: str = ""
+    # The master this deck was restyled onto, when it came from the deck check.
+    # None for an upload, and then the report derives a reference from the deck
+    # itself and the brand rules stay off the list. See `designqa.review_deck`.
+    spec: Any = None
+    # THE LAST ROUND, KEPT SO ONE CHANGE OUT OF IT CAN BE TAKEN BACK.
+    #
+    # Undo here is a REPLAY, exactly as it is on the deck check: every round
+    # already starts from the deck this session is about and applies the ticks
+    # as they stand, so a round run again without one of them produces the file
+    # that round would have produced had it never been ticked. Nothing is
+    # reversed, which is the only way this could be right -- a type step that
+    # was rolled back for spilling and a move a guard refused have no inverse
+    # to apply, and a deck edited twice is not the deck edited once.
+    #
+    # `ticked` is what the last round was asked for, `undone` accumulates what
+    # has since been taken back, and `notes` is whether that round also wrote
+    # the rest into the deck as comments -- a replay that quietly dropped them
+    # would take a designer's list away as the price of undoing one colour.
+    ticked: list[str] = field(default_factory=list)
+    undone: list[str] = field(default_factory=list)
+    notes: bool = True
+    applied_once: bool = False
 
     def __post_init__(self) -> None:
         self.name = self.name or self.deck.name
@@ -413,6 +435,8 @@ class _Handler(BaseHTTPRequestHandler):
             code, payload = self._guarded(self._run_qa_handoff)
         elif route == "/api/qa/recheck":
             code, payload = self._guarded(self._run_qa_recheck)
+        elif route == "/api/qa/undo":
+            code, payload = self._guarded(self._run_qa_undo)
         elif route == "/api/qa/apply":
             code, payload = self._guarded(self._run_qa_apply)
         elif route == "/api/qa/render":
@@ -770,12 +794,20 @@ class _Handler(BaseHTTPRequestHandler):
                      for n, name in rendered.items()],
                     ai=ai,
                     profile=profile,
+                    # THE MASTER THE DECK CHECK RESTYLED THIS DECK ONTO. Without
+                    # it this page infers a reference from the file it is
+                    # auditing and can only ask whether the deck agrees with
+                    # itself; with it, it can ask whether the colours are the
+                    # brand's -- which is the question somebody looking at a
+                    # freshly restyled deck is actually asking. See
+                    # `designqa.WITH_MASTER_RULES`.
+                    spec=source.spec,
                 )
                 elapsed = time.perf_counter() - started
 
             session = _QaSession(
                 id=secrets.token_hex(8), directory=workdir, deck=deck, report=report,
-                handed_over=source.deck.name,
+                handed_over=source.deck.name, spec=source.spec,
             )
             _remember(session, _QA_SESSIONS)
             keep = True
@@ -852,6 +884,11 @@ class _Handler(BaseHTTPRequestHandler):
                 [(n, session.before_dir / name) for n, name in rendered.items()],
                 ai=ai,
                 profile=profile,
+                # A re-check looks at what this session produced, so it is the
+                # same deck on the same master. Dropping it here would make the
+                # second pass quieter than the first for no reason a designer
+                # could see.
+                spec=session.spec,
             )
             session.report = report
             elapsed = time.perf_counter() - started
@@ -864,12 +901,11 @@ class _Handler(BaseHTTPRequestHandler):
     def _run_qa_apply(self) -> dict[str, Any]:
         """Step the type on the ticked shapes, and render what it did.
 
-        Every round starts from the ORIGINAL upload and applies the ticks as
-        they now stand. That is what makes un-ticking something work without
-        an undo of its own: the page re-sends the list, and the deck it gets
-        back is the one it would have got had the dropped step never been
-        ticked. One round, no re-check -- see `apply.qafix` for why a loop
-        that steps until the model is happy is the wrong shape.
+        Every round starts from the deck this session is about and applies the
+        ticks as they now stand, which is also what makes undo a replay rather
+        than a reverse -- see `_run_qa_undo`. One round, no re-check: see
+        `apply.qafix` for why a loop that steps until the model is happy is the
+        wrong shape.
         """
         body = self._json_body()
         session = _session(str(body.get("session", "")), _QA_SESSIONS)
@@ -878,9 +914,61 @@ class _Handler(BaseHTTPRequestHandler):
         # corrections that can be made are made, and everything else is
         # written into the deck as a comment so it is work somebody can pick
         # up rather than a list on a page they will close.
-        file_the_rest = body.get("notes", True)
+        file_the_rest = bool(body.get("notes", True))
         if not chosen and not file_the_rest:
             raise _BadRequest("nothing was ticked")
+
+        # WHAT THIS ROUND WAS ASKED FOR, kept for the undo to replay, and the
+        # undo list cleared: a fresh set of ticks is a new decision about the
+        # whole deck, and carrying yesterday's undo into it would silently drop
+        # a fix somebody has just asked for.
+        session.ticked = list(chosen)
+        session.undone = []
+        session.notes = file_the_rest
+        return self._qa_apply(session, chosen, file_the_rest)
+
+    def _run_qa_undo(self) -> dict[str, Any]:
+        """Take one applied change back, or put one back.
+
+        A REPLAY, NOT A REVERSE, for the reason `_QaSession.undone` gives: the
+        corrections this page makes have no inverses. A type step that was
+        rolled back for spilling, a move a guard refused, a widening that
+        stopped at a neighbour -- none of those is a delta that can be
+        subtracted, and a deck edited twice is not the deck edited once. So the
+        round is run again without the change, from the same starting file, and
+        what comes back is the deck that round would have produced had the
+        change never been ticked.
+
+        Cumulative and reversible: `undo` adds rows to the list, `redo` takes
+        them off, and either may name several at once. The answer is the same
+        shape as `/api/qa/apply` because it is the same act.
+        """
+        body = self._json_body()
+        session = _session(str(body.get("session", "")), _QA_SESSIONS)
+        if not session.applied_once:
+            raise _BadRequest("nothing has been applied to this deck yet")
+
+        undo = [str(key) for key in body.get("undo", [])]
+        redo = {str(key) for key in body.get("redo", [])}
+        if not undo and not redo:
+            raise _BadRequest("no change was named to undo")
+
+        held = [key for key in (*session.undone, *undo) if key not in redo]
+        session.undone = list(dict.fromkeys(held))
+        chosen = [key for key in session.ticked if key not in session.undone]
+        return self._qa_apply(session, chosen, session.notes, strict=False)
+
+    def _qa_apply(
+        self, session: "_QaSession", chosen: list, file_the_rest: bool,
+        strict: bool = True,
+    ) -> dict[str, Any]:
+        """One round of the corrections on this session, as it now stands.
+
+        `strict` is off for a replay. Taking back the last change a round made
+        leaves nothing to apply, and that is the correct end of an undo rather
+        than a request nobody can carry out: what comes back is the deck this
+        session started from, which is exactly what was asked for.
+        """
 
         # Two kinds of correction, applied by two halves of the tool. The
         # proposals go through `apply.apply_fixes`, which is where the brand
@@ -889,7 +977,7 @@ class _Handler(BaseHTTPRequestHandler):
         # is shown one list.
         issues = issues_for(session.report, chosen)
         steps = steps_for(session.report, chosen)
-        if not steps and not issues and not file_the_rest:
+        if strict and not steps and not issues and not file_the_rest:
             raise _BadRequest(
                 "none of those are corrections this check can make; they are "
                 "tasks for a designer, and ticking the box beside Apply writes "
@@ -913,6 +1001,7 @@ class _Handler(BaseHTTPRequestHandler):
             if file_the_rest and result.output is not None:
                 written = add_comments(result.output, comments_for(session.report, left))
             elapsed = time.perf_counter() - started
+        session.applied_once = True
         _qa_sweep(session)
 
         # Real slide numbers only. A correction about the deck rather than
@@ -929,6 +1018,11 @@ class _Handler(BaseHTTPRequestHandler):
         return {
             "session": session.id,
             **result.to_dict(),
+            # The rows that have been taken back, so a reload or a second undo
+            # does not have to be told again. The page reads this rather than
+            # keeping its own copy: the replay is the server's and the list it
+            # replayed from is the only one that is true.
+            "undone": list(session.undone),
             # What is left to do by hand, and how much of it is now in the
             # deck. Reported rather than assumed: writing a comment needs
             # PowerPoint, and a page that says "filed" when nothing was filed
@@ -1450,10 +1544,25 @@ def _qa_propose(session: "_QaSession", issues: list) -> Any:
             return QaFixResult(reason=f"could not copy the deck: {exc}")
         return result
 
+    # WHAT THE DECK ALREADY HAD GOES IN BESIDE WHAT WAS TICKED, and only the
+    # ticked half is selected. `apply_fixes` runs a second round over the
+    # findings its own work INTRODUCED, and it works out which those are by
+    # asking what the deck had before -- which is the list it was handed. Given
+    # only the ticked rows, every other deterministic finding on the deck reads
+    # as newly introduced and is corrected without anyone asking for it.
+    #
+    # Measured on the test deck before this line existed: 56 rows ticked, and a
+    # second round of 121 corrections nobody chose -- 72 margin moves and 27
+    # recolours, the recolours measured against a spec derived from the deck's
+    # own theme. That is the design check applying a brand it inferred from the
+    # file it was auditing, which is the one thing this page must never do.
+    baseline = list(session.report.rule_issues)
+    known = {issue.id for issue in baseline}
+    everything = baseline + [i for i in issues if i.id not in known]
     try:
         applied = apply_fixes(
             deck=session.deck,
-            issues=issues,
+            issues=everything,
             out=session.fixed,
             selected=[issue.id for issue in issues],
             spec=session.report.spec,

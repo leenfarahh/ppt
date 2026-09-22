@@ -756,3 +756,91 @@ def test_the_pictures_of_a_round_outlive_the_answer_that_named_them(
     for url in _urls_in(payload):
         code, _ctype, _body = _get(base, url)
         assert code == 200, f"{url} came back {code}"
+
+
+# --------------------------------------------------------------------------- #
+# Undo
+#
+# A REPLAY, NOT A REVERSE. None of the corrections this page makes has an
+# inverse -- a type step rolled back for spilling and a move a guard refused
+# are not deltas anybody can subtract -- so the round is run again from the
+# same starting file without the row named, and what comes back is the deck
+# that round would have produced had the row never been ticked.
+# --------------------------------------------------------------------------- #
+
+def test_nothing_can_be_undone_before_anything_is_applied(wired) -> None:
+    base, _session = wired
+    code, payload = _post(base, "/api/qa/undo",
+                          {"session": "qa-test-session", "undo": ["1:s1"]})
+
+    assert code == 400
+    assert "nothing has been applied" in payload["error"]
+
+
+def test_an_undo_has_to_name_something(wired) -> None:
+    base, session = wired
+    session.applied_once = True
+    code, payload = _post(base, "/api/qa/undo", {"session": "qa-test-session"})
+
+    assert code == 400
+    assert "no change was named" in payload["error"]
+
+
+def test_a_row_taken_back_is_replayed_without_it(wired, monkeypatch) -> None:
+    """The round is re-run with the ticks as they now stand, so the server is
+    asked for the deck it would have produced rather than for a reversal."""
+    from formatting_tool.web import server as web
+
+    base, session = wired
+    session.applied_once = True
+    session.ticked = ["1:s1", "1:s2"]
+    session.notes = False
+
+    seen: list[list] = []
+
+    def _watch(self, sess, chosen, file_the_rest, strict=True):
+        seen.append(list(chosen))
+        return {"session": sess.id, "undone": list(sess.undone), "applied": []}
+
+    monkeypatch.setattr(web._Handler, "_qa_apply", _watch, raising=True)
+
+    code, payload = _post(base, "/api/qa/undo",
+                          {"session": "qa-test-session", "undo": ["1:s1"]})
+    assert code == 200
+    assert seen[-1] == ["1:s2"]                  # replayed without the row
+    assert payload["undone"] == ["1:s1"]
+    assert session.ticked == ["1:s1", "1:s2"]    # the tick itself is untouched
+
+    # Cumulative, and reversible from the same list.
+    code, payload = _post(base, "/api/qa/undo",
+                          {"session": "qa-test-session", "undo": ["1:s2"]})
+    assert seen[-1] == []                        # and an empty round is legal
+    assert payload["undone"] == ["1:s1", "1:s2"]
+
+    code, payload = _post(base, "/api/qa/undo",
+                          {"session": "qa-test-session", "redo": ["1:s1"]})
+    assert seen[-1] == ["1:s1"]
+    assert payload["undone"] == ["1:s2"]
+
+
+def test_a_fresh_apply_forgets_what_was_undone(wired, monkeypatch) -> None:
+    """A new set of ticks is a new decision about the whole deck. Carrying the
+    old undo list into it would silently drop a fix just asked for."""
+    from formatting_tool.web import server as web
+
+    base, session = wired
+    session.applied_once = True
+    session.ticked = ["1:s1"]
+    session.undone = ["1:s1"]
+
+    monkeypatch.setattr(
+        web._Handler, "_qa_apply",
+        lambda self, sess, chosen, notes, strict=True: {"chosen": list(chosen)},
+        raising=True,
+    )
+    code, payload = _post(base, "/api/qa/apply",
+                          {"session": "qa-test-session", "fix": ["1:s1"],
+                           "notes": False})
+
+    assert code == 200 and payload["chosen"] == ["1:s1"]
+    assert session.undone == []

@@ -70,6 +70,7 @@ from .models import (
     Severity,
     ShapeProfile,
     Source,
+    walk_shapes,
 )
 
 log = logging.getLogger(__name__)
@@ -108,6 +109,119 @@ _ALIGN_QUORUM = 3
 # Nothing is gained by going below what `qafix._align` already treats as no
 # movement at all, so this is that number.
 _ARRANGE_FLOOR_IN = 0.01
+
+# How far centring a set across the slide may carry it, mirroring the limit
+# `qafix._align` puts on any one move for the same reason the floor above
+# mirrors its floor: a target computed here that the applier will refuse is a
+# tick box that does nothing. A set that has to travel further than this is
+# not sitting slightly off centre, it is sitting in a different part of the
+# slide, and moving it there is a composition decision.
+_CENTER_LIMIT_IN = 2.0
+
+# The deterministic rules this check runs beside the model, and the list is
+# short for one reason: THESE ARE THE ONES THAT NEED NO MASTER.
+#
+# The design check takes a deck on its own and asks whether it holds together,
+# so its reference is derived from the deck itself (`_own_spec`). That is the
+# right authority for "does this agree with itself" and the wrong one for "is
+# this on brand": run the palette rules against it and every colour is on the
+# palette by construction, or off it by an accident of what the theme happens
+# to hold. On the test deck that is 156 `color.text.unused_by_master` and 135
+# `color.text.off_palette` findings, none of which mean anything, drowning the
+# ones that do.
+#
+# Everything here measures the deck against itself or against arithmetic: a
+# contrast ratio, two boxes that overlap, copy that does not fit its box, a row
+# whose members disagree with each other. Each one is provable from the file
+# and each one already has a fixer, which is the other half of why they are
+# worth running here -- see `_rule_tasks`.
+#
+# WHY THEY WERE NOT RUN BEFORE. Not a decision, an absence: this check was
+# built as the model's half of the tool and never asked the rule layer
+# anything. The cost was the whole of it. On a deck built to demonstrate
+# contrast failures, the page reported one finding on the contrast slide -- a
+# clipped caption -- while these rules find nine there, including all four of
+# the pairings the slide was drawn to show.
+#
+# `space.overlap` IS HERE ON A CONDITION, and it is the only rule on this list
+# that has one. It reports two RECTANGLES that overlap, and this page's standard
+# is the opposite: the model is told, in as many words, that "two boxes whose
+# rectangles overlap is not a collision; type touching type is". Offered
+# unconditionally it is six rows on the test deck about captions whose boxes
+# clip the next label by six hundredths of an inch and whose type never touches.
+#
+# But refusing it outright threw away the move. A badge sitting over the words
+# of the button it belongs to is a real collision, the model sees it and says
+# so, and `fix_overlap` knows exactly how far to nudge it -- the shortest way
+# out along one axis, measured off the two rectangles. The model has the
+# standard and the rule has the arithmetic, and neither is any use alone.
+#
+# So it is offered only where the model reported a collision on the same shape:
+# the render supplies the judgement, the file supplies the number. See
+# `_conditional_rules`.
+MASTER_FREE_RULES = frozenset({
+    "color.text.contrast",
+    "space.text_collision",
+    "space.text_overflow",
+    "space.off_canvas",
+    "space.repeat_out_of_line",
+    "space.row_out_of_line",
+    "space.series_crowded",
+    "space.series_uneven",
+    "space.matrix_gutter",
+    "space.band_width",
+    "space.satellite_offset",
+    "typography.whitespace",
+    "typography.orphan_widow",
+    "typography.heading_balance",
+    "typography.terminal_punctuation",
+    "typography.anchor_blocks_fit",
+    "size.autofit_scale",
+    "space.text_insets",
+})
+
+# The brand rules, offered only when this check was handed a real master.
+#
+# THE OBJECTION TO THEM WAS NEVER THE RULES, IT WAS THE REFERENCE. Measured
+# against a spec derived from the deck itself they are noise: every colour is
+# on the palette by construction, or off it by an accident of what the theme
+# happens to hold, and on one test deck that was 156 findings about colours the
+# master never writes text in and 135 about colours off a palette inferred from
+# the file being audited.
+#
+# Handed the master the deck was restyled onto, they are the question somebody
+# looking at that deck is actually asking: are these the brand's colours. The
+# deck check knows that master, and hands this page the deck it made with it.
+#
+# `color.shape.off_palette` IS THE ONE THAT REACHES THE ICONS. An icon from
+# PowerPoint's library is a picture, and what the ribbon calls a Graphics Fill
+# is not `a:solidFill` on the shape -- the colour lives inside the SVG the
+# picture draws from, which `svgicon` reads and `fixers._recolor_icon` writes.
+# Nothing else in this tool recolours an icon, and on a deck of twelve
+# attribute cards the icons are most of what a reader sees.
+WITH_MASTER_RULES = frozenset({
+    "color.text.off_palette",
+    "color.shape.off_palette",
+})
+
+# Rules offered only where the model saw the same defect on the same shape.
+# The value is the verdict kinds that count as having seen it.
+_CONDITIONAL_RULES = {"space.overlap": {"overlap"}}
+
+# Which rule finding says the same thing as which verdict from the model, for
+# the de-duplication in `DesignQaReport.tasks`. Both layers look at the same
+# slide and they overlap in exactly three places; everywhere else they are
+# complementary, which is the point of running both.
+#
+# THE RULE WINS EVERY TIE, and not because it is cleverer. It carries a number
+# nobody has to be trusted for and a fixer that can act on it, and the model's
+# version of the same finding carries a sentence. Two rows about one defect,
+# one of them tickable, is a page asking a designer to work out which is which.
+_SAME_DEFECT = {
+    "low_contrast": {"color.text.contrast"},
+    "overlap": {"space.text_collision", "space.overlap"},
+    "cut_off": {"space.text_overflow"},
+}
 
 
 @dataclass(frozen=True)
@@ -175,6 +289,17 @@ class DesignQaReport:
     # after the check and re-reading the deck then would risk describing a
     # different file.
     profile: Optional[DeckProfile] = None
+    # What the deterministic rules found on the same deck, filtered to the ones
+    # that need no master (`MASTER_FREE_RULES`). Kept off the dict for now the
+    # way `profile` is: the page reads them as tasks, which is the only shape
+    # this list has ever needed to take.
+    rule_issues: list[Issue] = field(default_factory=list)
+    # Whether `spec` is a real master's or one derived from the deck. It
+    # decides whether the brand rules mean anything here -- see
+    # `WITH_MASTER_RULES` -- and it is carried rather than inferred from the
+    # spec, because a spec derived from a deck and a spec read off a master are
+    # the same type and tell the same story about themselves.
+    has_master: bool = False
     # THE DECK AS ITS OWN AUTHORITY. Every proposal the model makes is checked
     # against a brand reference before it is written, and refused outright
     # when there is none -- `apply.fixers.fix_ai_action` is explicit that an
@@ -196,6 +321,51 @@ class DesignQaReport:
         return [v for review in self.reviews for v in review.verdicts]
 
     @property
+    def offered_rule_issues(self) -> list[Issue]:
+        """The deterministic findings this page puts in front of a designer.
+
+        `rule_issues` is everything the rule layer found, because that is what
+        `apply_fixes` needs as a baseline to tell its own damage from the
+        deck's. This is the half that is offered as work: `MASTER_FREE_RULES`
+        always, and `WITH_MASTER_RULES` on top of it when this check was handed
+        the master the deck was restyled onto rather than left to infer one.
+        """
+        seen = self._collisions_seen()
+        offered = MASTER_FREE_RULES | (
+            WITH_MASTER_RULES if self.has_master else frozenset()
+        )
+        out = []
+        for issue in self.rule_issues:
+            rule = issue.rule_id or ""
+            if rule in offered:
+                out.append(issue)
+            elif rule in _CONDITIONAL_RULES and (
+                (issue.slide, issue.shape_id) in seen.get(rule, set())
+            ):
+                out.append(issue)
+        return out
+
+    def _collisions_seen(self) -> dict:
+        """Where the model agreed there is a defect, per conditional rule.
+
+        `space.overlap` measures rectangles and this page judges renders, so
+        the rule's arithmetic is offered only where the model looking at the
+        picture said the same thing about the same shape. Neither half is any
+        use alone: the model cannot say how far to nudge, and the rectangles
+        cannot say whether the type actually touches.
+        """
+        found: dict = {}
+        for rule, kinds in _CONDITIONAL_RULES.items():
+            where = {
+                (verdict.slide, verdict.shape_id)
+                for review in self.reviews
+                for verdict in review.verdicts
+                if verdict.issue in kinds and verdict.shape_id is not None
+            }
+            found[rule] = where
+        return found
+
+    @property
     def tasks(self) -> list[Task]:
         """Every finding, as a piece of work. Nothing is left as an observation.
 
@@ -208,13 +378,23 @@ class DesignQaReport:
         statement about this tool, not about the finding: "the right half of
         the slide is empty" is no less real for having no arithmetic, and it
         appears in this list beside the ones that do.
+
+        TWO LAYERS, ONE LIST. The rules' findings go in beside the model's and
+        are not marked as coming from somewhere else, because which half of the
+        tool noticed a defect is this tool's bookkeeping and not a designer's
+        problem. Where the two describe the same defect on the same shape the
+        rule's is kept -- see `_SAME_DEFECT` -- since it carries the number and
+        the fix and the model's carries a sentence.
         """
         out: list[Task] = []
         for index, issue in enumerate(self.deck_issues):
             out.append(self._deck_task(index, issue))
+        covered = self._covered_by_rules()
         for review in self.reviews:
             for verdict in review.verdicts:
                 if verdict.status != "issue":
+                    continue
+                if (verdict.slide, verdict.shape_id, verdict.issue) in covered:
                     continue
                 out.append(Task(
                     id=f"{verdict.slide}:{verdict.ref}",
@@ -243,9 +423,99 @@ class DesignQaReport:
                     slide=review.slide,
                     issue=issue.arrangement if steps else "",
                     fixable=bool(steps),
-                    op="align" if steps else "",
+                    op=(steps[0].op if steps else ""),
                 ))
+        out.extend(self._rule_tasks())
         return out
+
+    def _rule_tasks(self) -> list[Task]:
+        """The deterministic findings as work, in slide order.
+
+        Last on the list rather than first, and that is about reading rather
+        than about importance. A designer works down this page with the slide
+        open; the model's findings are the ones that arrived from looking at
+        it, and these are the ones that arrived from measuring it. Either order
+        is defensible and mixing them by slide would be worse than both.
+
+        `fixable` is asked of the applier rather than assumed. Every rule in
+        `MASTER_FREE_RULES` has a fixer registered, and a fixer still declines
+        a particular finding -- a shape it cannot find, a move with nowhere to
+        go -- which is exactly what `fixer_for` answers.
+        """
+        from .apply import fixer_for  # noqa: PLC0415 - pulls in python-pptx
+
+        out: list[Task] = []
+        for issue in sorted(self.offered_rule_issues, key=lambda i: (i.slide or 0)):
+            out.append(Task(
+                id=f"rule:{issue.id}",
+                kind="shape",
+                what=issue.suggestion or issue.message,
+                why=issue.message if issue.suggestion else "",
+                slide=issue.slide,
+                shape=issue.shape or "",
+                shape_id=issue.shape_id,
+                issue=issue.rule_id or "",
+                fixable=fixer_for(issue) is not None,
+                op=issue.rule_id or "",
+                box=self._box_of(issue),
+            ))
+        return out
+
+    def _box_of(self, issue: Issue) -> Optional[tuple]:
+        """Where a rule finding sits, as fractions of the slide.
+
+        The model's verdicts carry this already -- it is the rectangle the
+        model was given -- and a rule finding carries a slide and a shape id
+        instead, so the page would have nothing to draw on the render and
+        nothing to anchor a comment to. Looked up rather than left out: half
+        the value of the page is that a finding points at the thing it is
+        about.
+        """
+        if self.profile is None or not issue.slide or issue.shape_id is None:
+            return None
+        if self.width_in <= 0 or self.height_in <= 0:
+            return None
+        for slide in self.profile.slides:
+            if slide.number != issue.slide:
+                continue
+            for shape in walk_shapes(slide.shapes):
+                if shape.shape_id != issue.shape_id or shape.geometry is None:
+                    continue
+                box = shape.geometry
+                return (
+                    round(box.left_in / self.width_in, 5),
+                    round(box.top_in / self.height_in, 5),
+                    round(box.width_in / self.width_in, 5),
+                    round(box.height_in / self.height_in, 5),
+                )
+        return None
+
+    def _covered_by_rules(self) -> set:
+        """The model's verdicts a rule finding already says, keyed by shape.
+
+        Both layers look at the same slide and they overlap in three places --
+        see `_SAME_DEFECT`. Everywhere else they are complementary, which is
+        the point of running both: on one slide of a test deck the model
+        reported seven collisions of rendered type where `space.overlap`
+        reported three overlapping boxes, and neither list is the other.
+        """
+        by_shape: dict[tuple, set] = {}
+        for issue in self.offered_rule_issues:
+            if issue.slide is None or issue.shape_id is None:
+                continue
+            by_shape.setdefault(
+                (issue.slide, issue.shape_id), set()
+            ).add(issue.rule_id or "")
+
+        covered = set()
+        for review in self.reviews:
+            for verdict in review.verdicts:
+                rules = _SAME_DEFECT.get(verdict.issue)
+                if not rules or verdict.shape_id is None:
+                    continue
+                if rules & by_shape.get((verdict.slide, verdict.shape_id), set()):
+                    covered.add((verdict.slide, verdict.shape_id, verdict.issue))
+        return covered
 
     def _deck_task(self, index: int, issue: DeckIssue) -> Task:
         """One cross-slide mismatch as work, fixable where the deck itself can
@@ -370,6 +640,7 @@ def review_deck(
     ai: Optional[AIConfig] = None,
     profile: Optional[DeckProfile] = None,
     concurrency: int = 6,
+    spec: Optional[Any] = None,
 ) -> DesignQaReport:
     """Review the slides that rendered, and say so when none did.
 
@@ -382,6 +653,20 @@ def review_deck(
     `profile` is the deck as `read_deck` gives it. Passed in where the caller
     already has one -- reading a 25MB deck twice for one page is most of the
     wait.
+
+    `spec` IS THE MASTER, WHERE THERE IS ONE, and it changes what this check is
+    allowed to say. Handed nothing, it derives a reference from the deck itself
+    and can only ask whether the deck agrees with itself -- which is why the
+    brand rules are kept off `MASTER_FREE_RULES`: measured against a theme
+    inferred from the file being audited, every colour is on the palette by
+    construction or off it by accident.
+
+    Handed a master's spec, that objection disappears. The deck check hands
+    this page the deck it has just restyled, and it knows the master it
+    restyled onto; passing that through is the difference between "these
+    colours are consistent with themselves" and "these colours are the brand's"
+    -- which is the question somebody looking at a restyled deck is actually
+    asking. See `WITH_MASTER_RULES`.
     """
     ai = ai or AIConfig()
     report = DesignQaReport(
@@ -394,7 +679,9 @@ def review_deck(
         profile = read_deck(deck)
     report.profile = profile
     report.width_in, report.height_in = profile.width_in, profile.height_in
-    report.spec = _own_spec(profile)
+    report.spec = spec if spec is not None else _own_spec(profile)
+    report.has_master = spec is not None
+    report.rule_issues = _rule_findings(deck, profile, report.spec)
 
     if not images:
         report.reason = (
@@ -434,6 +721,72 @@ def review_deck(
         api_key_env=ai.api_key_env,
     )
     return report
+
+
+def _rule_findings(
+    deck: Path, profile: DeckProfile, spec: Optional[Any]
+) -> list[Issue]:
+    """The deterministic findings this check is entitled to make.
+
+    THE SAME DECK, MEASURED TWICE AND ON DIFFERENT EVIDENCE. The model reads a
+    picture and answers questions a file cannot: whether type actually touches
+    type, whether a caption disappears into a photograph, whether the hierarchy
+    reads in the right order. The rules read the file and answer questions a
+    picture cannot: the exact ratio of a pairing, the exact overlap of two
+    boxes. Running one and not the other was never a decision -- this check was
+    built as the model's half and never asked the rule layer anything -- and
+    what it cost was every finding that already had arithmetic and a fix
+    behind it.
+
+    EVERY RULE RUNS AND ONLY `MASTER_FREE_RULES` IS OFFERED, and the gap
+    between those two is not waste. What is offered has to be narrow, because
+    the spec here is derived from the deck itself and the brand rules would be
+    measuring the deck against its own theme -- hundreds of findings that mean
+    nothing, drowning the ones that do.
+
+    What is MEASURED has to be complete, because this list is also the
+    baseline `apply_fixes` compares its own work against. That applier runs a
+    second round over the findings its corrections introduced, and it works
+    out which those are by asking what the deck had beforehand -- the list it
+    was handed. Handed only the narrow set, it read every palette and margin
+    finding on the deck as newly introduced and corrected them unasked: on the
+    test deck, 56 rows ticked and a second round of 121 corrections nobody
+    chose, 27 of them recolours measured against a theme inferred from the
+    file being audited. Which is the one thing this page must never do.
+
+    A METRICS PROVIDER, because this check has a renderer by definition -- it
+    cannot run without one -- and four of these rules are silent without one.
+    Whether copy fits its box and where its lines break is not in a .pptx, and
+    PowerPoint is already open.
+
+    Never fatal. A rule layer that cannot run costs its half of the report and
+    not the run: the model's findings are worth having on their own, and that
+    is what this page was until now.
+    """
+    if spec is None:
+        return []
+    try:
+        from .linemetrics import default_provider  # noqa: PLC0415
+        from .rules import (  # noqa: PLC0415
+            RuleContext,
+            build_default_rules,
+            run_rules,
+        )
+
+        found = run_rules(
+            RuleContext(deck=profile, spec=spec),
+            build_default_rules(default_provider(deck)),
+        )
+    except Exception:
+        log.warning("could not run the deterministic rules on %s; the design "
+                    "check is the model's findings alone", profile.path,
+                    exc_info=True)
+        return []
+
+    for issue in found:
+        issue.deck = Path(deck).name
+        issue.id = issue.fingerprint()
+    return found
 
 
 def issues_for(
@@ -491,6 +844,16 @@ def issues_for(
             continue
         _steps, proposals = _deck_fixes(report, index, mismatch)
         out.extend(proposals)
+
+    # The deterministic findings, handed over exactly as the rule layer made
+    # them. They are already `Source.RULE` with a `rule_id`, which is what
+    # routes each one to its own fixer in `apply.fixers.FIXERS` rather than
+    # through `fix_ai_action` -- so nothing here has to know what any of them
+    # do. The id is prefixed for the page and unprefixed for the applier,
+    # because `apply_fixes` selects on the id the issue carries.
+    for issue in report.offered_rule_issues:
+        if wanted is None or f"rule:{issue.id}" in wanted:
+            out.append(issue)
     return out
 
 
@@ -535,7 +898,16 @@ def outstanding(
             continue
         if task.id in by_id:
             continue
-        if task.kind in ("slide", "deck"):
+        if task.id.startswith("rule:"):
+            # A deterministic finding is applied by `apply_fixes` and reported
+            # under the id the ISSUE carries, which is this task's id without
+            # the prefix the page addresses it by. Matched on that rather than
+            # on shape and op: a rule issue has no `fix`, so the op the applier
+            # reports for it is empty and the shape-and-op match every other
+            # row here uses would call every one of them outstanding.
+            if task.id[len("rule:"):] not in by_id:
+                left.append(task)
+        elif task.kind in ("slide", "deck"):
             # Both are several corrections filed under one id, and any of them
             # landing is the row having been acted on -- which the check
             # against `by_id` above has already settled. A proposal made on a
@@ -636,6 +1008,13 @@ def steps_for(report: DesignQaReport, chosen: Optional[Sequence[str]] = None) ->
     return steps
 
 
+# The two words the consistency pass has for one defect: a shape that sits
+# somewhere else on one slide than on the rest. `position` describes it as a
+# drift and `alignment` as a grid line, the model picks whichever suits the
+# sentence, and both are answered by the same median. See `_deck_fixes`.
+_POSITION_KINDS = frozenset({"position", "alignment"})
+
+
 def _deck_fixes(
     report: DesignQaReport, index: int, issue: DeckIssue
 ) -> tuple[list, list[Issue]]:
@@ -647,16 +1026,24 @@ def _deck_fixes(
     match the rest" has a number behind it, and the number is one nobody has
     to be trusted for -- it is counted off the other slides.
 
-    Three kinds of mismatch have an answer that can be counted:
+    Four kinds of mismatch have an answer that can be counted:
 
       position    the shape belongs where most slides put it -- a move, taken
                   through PowerPoint because `align` is measured (`_align_steps`)
+      alignment   the same measurement under the other word the consistency
+                  pass has for it. "The title sits 4% lower on slide 7" and
+                  "slide 7 starts on a different grid line from the rest" are
+                  one deck and one answer: where the majority puts the shape.
+                  Splitting them was a vocabulary accident -- both words are
+                  offered to the model, it picks whichever fits the sentence it
+                  is writing, and only one of them reached any arithmetic.
       type_scale  the text belongs at the size most slides set for its role
       color       the text belongs in the colour most slides give that role
 
     The rest come back empty and stay tasks. `spacing` has no single number to
-    count, `content` is a missing element rather than a wrong value, and
-    `other` is by definition not a category with an answer in it.
+    count, `size` names a repeated element without saying which shape it is,
+    `content` is a missing element rather than a wrong value, and `other` is by
+    definition not a category with an answer in it.
 
     What comes back for the last two is `Issue` objects carrying a `FixAction`,
     so they go through `apply.fixers.fix_ai_action` and its checks: a size has
@@ -666,13 +1053,74 @@ def _deck_fixes(
     """
     if report.profile is None:
         return [], []
-    if issue.kind == "position":
+    if issue.kind in _POSITION_KINDS:
         return _align_steps(report, index, issue), []
     if issue.kind == "type_scale":
-        return [], _size_fixes(report, index, issue)
+        return [], _capped(report, issue, _size_fixes(report, index, issue))
     if issue.kind == "color":
-        return [], _color_fixes(report, index, issue)
+        return [], _capped(report, issue, _color_fixes(report, index, issue))
     return [], []
+
+
+# How much of the text on the slides a mismatch names it may rewrite before the
+# correction stops being the finding the model made.
+#
+# A CROSS-SLIDE MISMATCH IS ABOUT A REPEATED ELEMENT. "The body copy on slide 3
+# is smaller than on slides 1 and 2" is a sentence about one kind of text in one
+# place, and the correction for it touches that text. What `_by_role` actually
+# produces is every text-bearing shape on every named slide, grouped by role and
+# corrected towards a majority counted over the whole deck -- which is the same
+# answer when a deck is regular and a very different one when it is not.
+#
+# Measured on a deck built to demonstrate mismatched type: ONE `type_scale`
+# finding produced 107 proposals, every one setting text to 12pt, and one
+# `color` finding produced 96, every one to the same navy. Applied, four
+# headings drawn at 22, 26, 18 and 20pt all became 12pt, three button labels
+# became the colour of the buttons they sat on, and the deck came back flatter
+# than it went in. Nothing about any one of those proposals was wrong; the set
+# was.
+#
+# So a correction that would rewrite more than this share of the text on the
+# slides it names is refused as a set, and the finding stays a task carrying
+# the model's own sentence. A deck really is sometimes wrong throughout -- and
+# that is the deck check's job, which has a master to measure against, rather
+# than this page's, which infers its reference from the file it is auditing.
+_REWRITE_SHARE = 0.34
+
+# And a floor under it, so a slide with four text shapes on it is not exempt
+# from the rule by arithmetic: a third of three is one.
+_REWRITE_FLOOR = 4
+
+
+def _capped(
+    report: DesignQaReport, issue: DeckIssue, proposals: list[Issue]
+) -> list[Issue]:
+    """The proposals, or none of them when there are too many to be the finding.
+
+    ALL OR NOTHING, and deliberately. Taking the first few would correct an
+    arbitrary subset of a set the model described as one thing, which is worse
+    than correcting none: the deck comes back half rewritten and the finding
+    reads as done.
+    """
+    if not proposals:
+        return []
+    total = sum(
+        1
+        for slide in (report.profile.slides if report.profile else ())
+        if slide.number in set(issue.slides)
+        for shape in slide.shapes
+        if shape.text.strip()
+    )
+    allowed = max(_REWRITE_FLOOR, round(total * _REWRITE_SHARE))
+    if len(proposals) <= allowed:
+        return proposals
+    log.info(
+        "%s: the %s mismatch on slide(s) %s would rewrite %d of the %d text "
+        "shapes there, which is not one repeated element; left as a task",
+        report.deck, issue.kind,
+        ", ".join(str(n) for n in issue.slides), len(proposals), total,
+    )
+    return []
 
 
 def _size_fixes(
@@ -861,7 +1309,7 @@ def _align_steps(report: DesignQaReport, index: int, issue: DeckIssue) -> list:
     """
     from .apply.qafix import Step  # noqa: PLC0415 - COM-side module
 
-    if issue.kind != "position" or report.profile is None:
+    if issue.kind not in _POSITION_KINDS or report.profile is None:
         return []
 
     titles = {
@@ -908,6 +1356,9 @@ _ARRANGE_WORDS = {
     "align_right": "in line with the others, on their right edge",
     "distribute_h": "an equal gap from the shapes either side of it",
     "distribute_v": "an equal gap from the shapes above and below it",
+    "center_h": "centred across the width of the slide with the rest of its set",
+    "same_width": "the width most of its set already is",
+    "same_height": "the height most of its set already is",
 }
 
 
@@ -954,15 +1405,31 @@ def _arrange_steps(
 
     # Each row on its own terms. See `_lines` for why the set is split here
     # rather than taken as one.
+    # A SIZE IS NOT A POSITION, so it is not split into rows first. Six cards
+    # in two rows of three should all be one width; taking each row's own
+    # median would answer a question nobody asked and leave the two rows
+    # disagreeing with each other.
+    if issue.arrangement == "same_type_size":
+        return _type_steps(report, number, index, issue)
+    if issue.arrangement in _SIZE_ARRANGEMENTS:
+        return _resize_steps(report, number, index, issue, placed)
+
     targets = []
     for line in _lines(issue.arrangement, placed):
         if len(line) < _ARRANGE_MIN[issue.arrangement]:
             continue
-        targets.extend(
-            _aligned(issue.arrangement, line)
-            if issue.arrangement.startswith("align_")
-            else _distributed(issue.arrangement, line)
-        )
+        if _shares_the_other_edge(issue.arrangement, line):
+            continue
+        if issue.arrangement.startswith("align_"):
+            targets.extend(_aligned(issue.arrangement, line))
+        elif issue.arrangement == "center_h":
+            # The profile's width rather than the report's: they are the same
+            # number, and this function already refuses to run without the
+            # profile, so taking it from there cannot be reached with one set
+            # and not the other.
+            targets.extend(_centered(line, report.profile.width_in))
+        else:
+            targets.extend(_distributed(issue.arrangement, line))
 
     steps = []
     for member, box, left, top in targets:
@@ -991,7 +1458,7 @@ def _arrange_steps(
 
 # The arrangements whose set runs ACROSS the slide. The rest run down it, and
 # the only thing that changes between the two is which axis is which.
-_ROW_ARRANGEMENTS = {"align_top", "align_bottom", "distribute_h"}
+_ROW_ARRANGEMENTS = {"align_top", "align_bottom", "distribute_h", "center_h"}
 
 
 def _lines(kind: str, placed: Sequence[tuple]) -> list[list[tuple]]:
@@ -1049,6 +1516,59 @@ def _lines(kind: str, placed: Sequence[tuple]) -> list[list[tuple]]:
     return lines
 
 
+# The edge OPPOSITE the one each alignment asks for. Used to refuse an
+# arrangement, never to make one: see `_shares_the_other_edge`.
+_OTHER_EDGE = {
+    "align_top": lambda b: b.top_in + b.height_in,
+    "align_bottom": lambda b: b.top_in,
+    "align_left": lambda b: b.left_in + b.width_in,
+    "align_right": lambda b: b.left_in,
+}
+
+# How close two edges have to be before a set counts as already sharing one.
+# A row drawn once and copied across a slide agrees to the thousandth of an
+# inch; a set that merely looks close does not. Loose enough to survive the
+# rounding a deck carries, tight enough that it never describes a row anybody
+# would call ragged.
+_SHARED_EDGE_IN = 0.02
+
+
+def _shares_the_other_edge(kind: str, placed: Sequence[tuple]) -> bool:
+    """Whether the set already lines up on the edge opposite the one asked for.
+
+    A SET CANNOT SHARE BOTH EDGES OF AN AXIS UNLESS ITS SHAPES ARE THE SAME
+    SIZE ALONG IT. So a row that already agrees on its tops and is asked to
+    agree on its bottoms can only be granted by pulling every box off the top
+    line it is on, and what comes back is a row out of line in the other
+    direction. The shapes differ in HEIGHT, and no move changes a height.
+
+    Which is what a real row of four column headings did. Four text boxes at
+    the same top and the same width, one of them 0.28in taller because its
+    heading wraps to a second line where the other three sit on one. The model
+    read the render, saw three headings sharing a baseline and the fourth not,
+    and asked for `align_bottom` -- a fair reading of a picture, and the only
+    reading available to something that cannot see the boxes. Applied, it
+    lifted the two-line box 0.28in clear of the row's top edge and up over the
+    icon above it, breaking the one alignment the row actually had.
+
+    THE RULE LAYER ALREADY HAS THE ANSWER FOR THAT ROW AND IT IS NOT A MOVE.
+    `typography.heading_balance` squares a row of parallel headings up by
+    breaking the short ones across as many lines as the longest takes: the
+    raggedness is in the copy, so the copy is where it is corrected, and every
+    box stays exactly where it was drawn. A check that answers the same slide
+    with a move is undoing the layout to chase the symptom.
+
+    So the line is refused here rather than corrected. It stays on the list as
+    work, which is the honest place for it while nothing on this side counts
+    lines.
+    """
+    other = _OTHER_EDGE.get(kind)
+    if other is None:
+        return False
+    edges = [other(box) for _, box in placed]
+    return max(edges) - min(edges) <= _SHARED_EDGE_IN
+
+
 def _aligned(kind: str, placed: Sequence[tuple]) -> list[tuple]:
     """Where each shape goes to share an edge with the rest of its set.
 
@@ -1091,6 +1611,192 @@ def _aligned(kind: str, placed: Sequence[tuple]) -> list[tuple]:
         return [(m, b, edge, None) for m, b in placed]
     edge = _median(sorted(box.left_in + box.width_in for _, box in placed))
     return [(m, b, edge - b.width_in, None) for m, b in placed]
+
+
+# The arrangements that change a shape's SIZE rather than its position, and
+# the only ones here that do. Everything else moves things.
+_SIZE_ARRANGEMENTS = frozenset({"same_width", "same_height"})
+
+# How far a shape may be resized to join its set. A copy of a component that
+# drifted is within a few per cent of its siblings; something a third out is
+# not a copy that drifted, it is a different element, and making it match would
+# be redrawing the slide rather than tidying it.
+_RESIZE_LIMIT = 0.34
+
+# And the floor under it, in inches, so a set of small shapes is not resized on
+# a rounding difference nobody can see.
+_RESIZE_FLOOR_IN = 0.02
+
+
+def _type_steps(
+    report: DesignQaReport, number: int, index: int, issue: SlideIssue
+) -> list:
+    """Set a named group of headings to the size most of them already are.
+
+    THE SAME ARITHMETIC AS THE CROSS-SLIDE `type_scale` FIX AND A DIFFERENT
+    BLAST RADIUS, which is the whole reason this exists separately. That one
+    takes every text shape on the slides a mismatch names, grouped by role, and
+    moves them towards a majority counted over the deck -- and on a deck that
+    disagrees with itself it rewrites the deck, which is why `_capped` now
+    refuses it past a share. This one corrects the shapes the model POINTED AT
+    and takes the majority from those shapes alone. The set is named, so the
+    blast radius is what somebody looked at.
+
+    THE MOST COMMON SIZE, not the median. A size is a chosen value rather than
+    a measurement: four headings at 22, 26, 18 and 20pt have no majority and
+    their median is 21, which is a size nobody typed and no other heading on
+    the deck uses. Where there is a majority it is the answer; where there is
+    not, the set is left alone and a designer picks.
+    """
+    from .apply.qafix import Step  # noqa: PLC0415 - COM-side module
+
+    sizes: dict = {}
+    for member in issue.members:
+        if member.shape_id is None:
+            continue
+        shape = _shape_at(report.profile, number, member.path)
+        if shape is None:
+            continue
+        found = _sizes_of(shape)
+        # One size per shape. A heading whose runs disagree with each other is
+        # a different defect and not one a majority across the set can settle.
+        if len(set(found)) == 1:
+            sizes[member.shape_id] = (member, found[0])
+
+    if len(sizes) < _ARRANGE_MIN["same_type_size"]:
+        return []
+    target = _most_common([size for _member, size in sizes.values()])
+    if target is None:
+        return []
+    # A majority, not a plurality. Four sizes on four headings has a "most
+    # common" only by tie-break, and setting a row to a size one of them
+    # happens to be is a coin toss somebody has to look at anyway.
+    agreed = sum(1 for _m, size in sizes.values() if abs(size - target) < 0.51)
+    if agreed * 2 <= len(sizes):
+        return []
+
+    steps = []
+    for member, size in sizes.values():
+        if abs(size - target) < 0.51:
+            continue
+        steps.append(Step(
+            op="set_size",
+            slide=number,
+            shape_id=member.shape_id,
+            shape=member.shape,
+            path=member.path,
+            size_pt=target,
+            measured_off=f"the {target:g}pt most of its set is set at",
+            task_id=f"slide:{number}:{index}",
+            note=issue.note,
+        ))
+    return steps
+
+
+def _resize_steps(
+    report: DesignQaReport,
+    number: int,
+    index: int,
+    issue: SlideIssue,
+    placed: Sequence[tuple],
+) -> list:
+    """The resizes that would make a set of shapes one size.
+
+    THE MEDIAN, for the reason every other arrangement here takes one: the
+    shapes that agree are what says what the size should be, and a mean lets
+    the odd one drag the answer towards itself. Six cards at 3.6, 3.6, 3.4,
+    3.6, 3.75 and 3.4 are a set of 3.6in cards with three that drifted, and the
+    median says so where the mean says 3.55 and resizes all six.
+
+    ONLY THE AXIS THE ARRANGEMENT NAMES. `same_width` does not touch a height,
+    because a row of cards holding different amounts of copy is allowed to be
+    different heights and usually should be.
+
+    THE SHAPE'S POSITION IS ITS LEFT AND TOP, which is what resizing from the
+    top-left means and is what PowerPoint does. A card that grows grows to the
+    right; the row's left edges, which were its one good alignment, are the
+    thing this must not disturb.
+    """
+    from .apply.qafix import Step  # noqa: PLC0415 - COM-side module
+
+    wide = issue.arrangement == "same_width"
+    sizes = sorted(
+        (box.width_in if wide else box.height_in) for _member, box in placed
+    )
+    target = _median(sizes)
+    if target <= 0:
+        return []
+
+    steps = []
+    for member, box in placed:
+        was = box.width_in if wide else box.height_in
+        if was <= 0 or abs(was - target) < _RESIZE_FLOOR_IN:
+            continue
+        if abs(was - target) > target * _RESIZE_LIMIT:
+            # Not a copy that drifted. Refused for the SET rather than for this
+            # shape alone: a row corrected with one member left out is a row
+            # that still does not match, reported as done.
+            return []
+        steps.append(Step(
+            op="resize",
+            slide=number,
+            shape_id=member.shape_id,
+            shape=member.shape,
+            path=member.path,
+            width_in=round(target, 3) if wide else None,
+            height_in=None if wide else round(target, 3),
+            measured_off=(
+                f"the {'width' if wide else 'height'} most of its set already "
+                "is"
+            ),
+            task_id=f"slide:{number}:{index}",
+            note=issue.note,
+        ))
+    return steps
+
+
+def _centered(placed: Sequence[tuple], width_in: float) -> list[tuple]:
+    """The set moved as one piece until it sits centred across the slide.
+
+    THE ONLY ARRANGEMENT MEASURED OFF THE SLIDE RATHER THAN OFF THE SET, and
+    the only one where every member moves by the same amount. That is what
+    makes it a different thing from `_distributed` rather than a variation on
+    it: distributing rearranges the inside of a row and leaves its ends where
+    they are, and this leaves the inside of the row exactly as drawn and moves
+    the whole of it. Three cards with a designed gap between them stay three
+    cards with that gap.
+
+    Which is the case it exists for. A row built on a four-column grid and
+    filled with three cards sits left, with an empty column beside it that
+    reads as a mistake rather than as space. Nothing about the three cards is
+    wrong -- their sizes, their gaps and their alignment are all as drawn --
+    so no relation between them describes the defect, and it arrived as prose
+    until there was a word for it.
+
+    Nothing moves where the slide has no width to centre in, which is a deck
+    that could not be read, and nothing moves where centring would carry the
+    set further than `qafix._align` will take a shape. That guard is a move
+    this tool declines to make on its own, and running into it here rather
+    than there is what keeps the refusal honest: the sentence `_align` gives
+    is about a shape measured against the wrong neighbours, which is not what
+    happened. Stopped here, the finding stays a task and a designer reads the
+    model's own instruction, which said to centre them.
+    """
+    if width_in <= 0:
+        return []
+    order = sorted(placed, key=lambda pair: pair[1].left_in)
+    first, last = order[0][1], order[-1][1]
+    span = (last.left_in + last.width_in) - first.left_in
+    if span <= 0 or span > width_in:
+        return []
+
+    shift = (width_in - span) / 2 - first.left_in
+    if abs(shift) > _CENTER_LIMIT_IN:
+        return []
+    # The cross axis is None, as everywhere else here: centring a row across
+    # the slide says nothing about how far down the slide it sits. See
+    # `_aligned` for the round that distinction cost.
+    return [(member, box, box.left_in + shift, None) for member, box in order]
 
 
 def _distributed(kind: str, placed: Sequence[tuple]) -> list[tuple]:

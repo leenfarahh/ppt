@@ -92,7 +92,9 @@ def read_deck(path: str | Path) -> DeckProfile:
     )
 
     for index, slide in enumerate(prs.slides, start=1):
-        deck.slides.append(_read_slide(slide, index))
+        profile = _read_slide(slide, index)
+        profile.background_hex = _background_hex(slide, theme_colors)
+        deck.slides.append(profile)
     return deck
 
 
@@ -214,6 +216,7 @@ def _read_shape(shape: Any, frame: Optional[_Frame] = None) -> ShapeProfile:
         role=_role_for(placeholder_type, _safe(lambda: shape.name) or ""),
         fill_hex=fill_hex,
         fill_theme=fill_theme,
+        fill_kind=_fill_kind(shape),
         line_hex=line_hex,
         line_theme=line_theme,
         graphic_colors=graphic_colors,
@@ -230,6 +233,9 @@ def _read_shape(shape: Any, frame: Optional[_Frame] = None) -> ShapeProfile:
         profile.text = _safe(lambda: frame.text) or ""
         profile.word_wrap = _safe(lambda: frame.word_wrap)
         profile.autofit = _stringify(_safe(lambda: frame.auto_size))
+        profile.autofit_scale = _autofit_scale(frame)
+        profile.vertical_anchor = _anchor(frame)
+        profile.text_margins = _margins(frame)
         for paragraph in frame.paragraphs:
             profile.paragraphs.append(_read_paragraph(paragraph))
 
@@ -304,6 +310,7 @@ def _read_cell(
         ),
         fill_hex=fill_hex,
         fill_theme=fill_theme,
+        fill_kind=_fill_kind(cell),
         row_span=int(_safe(lambda: cell.span_height) or 1),
         column_span=int(_safe(lambda: cell.span_width) or 1),
         spanned=bool(_safe(lambda: cell.is_spanned)),
@@ -527,8 +534,40 @@ def _theme_slot(theme_color: Any) -> Optional[str]:
     return _SLOTS.get(head)
 
 
+# What python-pptx calls each fill, as one word. The enum renders as
+# "GRADIENT (3)"; the number is the OOXML one and the name is the only part
+# worth carrying. A fill this does not recognise reads as `inherit`, which is
+# the same answer as a fill nobody stated: something is drawn there and this
+# cannot say what.
+_FILL_KINDS = {
+    "SOLID": "solid",
+    "BACKGROUND": "background",
+    "GRADIENT": "gradient",
+    "PICTURE": "picture",
+    "TEXTURED": "textured",
+    "PATTERNED": "pattern",
+}
+
+
+def _fill_kind(shape: Any) -> str:
+    """Which kind of fill a shape carries. See `ShapeProfile.fill_kind`."""
+    fill = _safe(lambda: shape.fill)
+    if fill is None:
+        return "inherit"
+    name = str(_safe(lambda: fill.type) or "").split(" ")[0].upper()
+    return _FILL_KINDS.get(name, "inherit")
+
+
 def _fill_hex(shape: Any) -> tuple[Optional[str], Optional[str]]:
-    """A shape's fill as (hex, theme slot). Both None when it has no fill."""
+    """A shape's fill as (hex, theme slot). Both None when it has no fill.
+
+    WHAT KIND OF FILL IT WAS IS NOT IN THE ANSWER, deliberately: this is read
+    by the palette rules, which ask whether a colour is on the palette, and
+    for a gradient or a picture there is no colour to ask about. Anything that
+    needs to tell "no fill" from "a fill with no single colour" reads
+    `fill_kind` beside it -- see `ShapeProfile.fill_kind` for the pairing this
+    distinction got wrong.
+    """
     fill = _safe(lambda: shape.fill)
     if fill is None:
         return None, None
@@ -551,6 +590,178 @@ def _line_hex(shape: Any) -> tuple[Optional[str], Optional[str]]:
     if rgb is not None:
         return str(rgb).upper(), None
     return None, _theme_slot(_safe(lambda: color.theme_color))
+
+
+# --------------------------------------------------------------------------- #
+# Backgrounds
+# --------------------------------------------------------------------------- #
+#
+# READ FROM THE XML RATHER THAN THROUGH python-pptx, and not for speed.
+# `slide.background.fill` calls `get_or_add_bgPr()`, which WRITES a `<p:bgPr>`
+# into a slide that had none -- a reader that changes the file it is reading,
+# on every slide in the deck. Nothing here saves, so nothing has been lost yet,
+# but a profile pass that mutates is a trap for whoever wires it into a path
+# that does.
+#
+# The chain is PowerPoint's own: the slide states a background or it does not,
+# and where it does not the layout answers, and where the layout does not the
+# master does. The first one that states anything wins, INCLUDING when what it
+# states is not a colour -- a slide with a photograph behind it is not a slide
+# whose background is the master's white.
+
+# `<p:bgRef idx>` at 1001 is the first entry of the theme's background fill
+# list, which is a solid fill in every theme PowerPoint writes; the colour is
+# the one carried on the bgRef itself. Higher indices are the gradient and
+# textured variants, and those have no single colour to report.
+_SOLID_BG_REF = "1001"
+
+
+def _background_hex(slide: Any, theme_colors: dict[str, str]) -> Optional[str]:
+    """The colour drawn behind one slide, or None when it is not a colour."""
+    layout = _safe(lambda: slide.slide_layout)
+    master = _safe(lambda: layout.slide_master) if layout is not None else None
+    color_map = _color_map(master)
+
+    for source in (slide, layout, master):
+        if source is None:
+            continue
+        element = _safe(lambda: source.element)
+        if element is None:
+            continue
+        background = element.find(f"{_P_NS}cSld/{_P_NS}bg")
+        if background is None:
+            continue
+        return _background_color(background, color_map, theme_colors)
+
+    # Nothing anywhere states one, which is a deck whose slides are drawn on
+    # the theme's first background colour -- white, on all but a handful.
+    return _scheme_hex("bg1", color_map, theme_colors)
+
+
+def _background_color(
+    background: Any, color_map: dict[str, str], theme_colors: dict[str, str]
+) -> Optional[str]:
+    """One `<p:bg>` as a colour, or None when it does not describe one."""
+    reference = background.find(f"{_P_NS}bgRef")
+    if reference is not None:
+        if reference.get("idx") != _SOLID_BG_REF:
+            return None
+        return _color_of(reference, color_map, theme_colors)
+
+    properties = background.find(f"{_P_NS}bgPr")
+    if properties is None:
+        return None
+    solid = properties.find(f"{_A_NS}solidFill")
+    # A gradient, a picture or a pattern, all of which are real backgrounds
+    # and none of which is a value. See `SlideProfile.background_hex`.
+    return _color_of(solid, color_map, theme_colors) if solid is not None else None
+
+
+def _color_of(
+    parent: Any, color_map: dict[str, str], theme_colors: dict[str, str]
+) -> Optional[str]:
+    """The colour a `<a:solidFill>` or `<p:bgRef>` names, undecorated.
+
+    A colour carrying `lumMod`, `tint`, `shade` or any other transform is not
+    the colour that gets drawn, and working out what is means reimplementing
+    DrawingML's colour model. This reports None for those rather than a value
+    it has not earned: a contrast check measured against the wrong background
+    is worse than one that says nothing about that slide.
+    """
+    literal = parent.find(f"{_A_NS}srgbClr")
+    if literal is not None:
+        return None if len(literal) else (literal.get("val") or "").upper() or None
+
+    scheme = parent.find(f"{_A_NS}schemeClr")
+    if scheme is None or len(scheme):
+        return None
+    return _scheme_hex(scheme.get("val") or "", color_map, theme_colors)
+
+
+def _scheme_hex(
+    name: str, color_map: dict[str, str], theme_colors: dict[str, str]
+) -> Optional[str]:
+    """A scheme colour name as a hex value, through the master's colour map.
+
+    THE MAP IS NOT AN ALIAS TABLE TO SKIP. `bg1` is not a colour in the theme;
+    it is a slot the master points at one of `lt1`, `dk1`, `lt2` or `dk2`, and
+    a master that points `bg1` at `dk1` is how a dark deck is built. Reading
+    the theme directly for `bg1` finds nothing on a well-formed file and finds
+    the wrong thing on that one.
+    """
+    if not name:
+        return None
+    return theme_colors.get(color_map.get(name, name))
+
+
+def _color_map(master: Any) -> dict[str, str]:
+    """`<p:clrMap>` on the master: which theme slot each scheme name reads."""
+    element = _safe(lambda: master.element) if master is not None else None
+    if element is None:
+        return {}
+    mapping = element.find(f"{_P_NS}clrMap")
+    return dict(mapping.attrib) if mapping is not None else {}
+
+
+def _anchor(frame: Any) -> Optional[str]:
+    """Where the text sits in its box, as one word.
+
+    None where the shape states nothing, which is not the same as "top" even
+    though PowerPoint draws it that way: a caller deciding whether growing the
+    box is safe wants to know the difference between a stated top and a shape
+    that never said. See `apply.fixers._anchor_of`, which reads the same value
+    off the live shape and is the reason this is here.
+    """
+    name = _stringify(_safe(lambda: frame.vertical_anchor))
+    if not name:
+        return None
+    name = name.upper()
+    if "MIDDLE" in name or "CENTER" in name or "CENTRE" in name:
+        return "middle"
+    if "BOTTOM" in name:
+        return "bottom"
+    return "top" if "TOP" in name else None
+
+
+def _autofit_scale(frame: Any) -> Optional[float]:
+    """How much PowerPoint is shrinking this box's text, as a fraction.
+
+    READ OFF `a:normAutofit/@fontScale`, WHICH IS THE ONLY PLACE IT EXISTS.
+    python-pptx reports the auto_size SETTING -- whether the box shrinks its
+    text -- and not the amount, and the amount is the whole defect: "this box
+    shrinks its text" is a preference, and "this box is drawing 14pt copy at
+    8.75pt" is why every size rule in this tool reads a number no reader ever
+    sees.
+
+    PowerPoint writes the attribute only once it has had to shrink something,
+    so a box set to shrink but not yet shrinking reports 1.0 rather than None:
+    the setting is there, armed, and the next edit to the copy fires it.
+    """
+    element = _safe(lambda: frame._txBody)
+    if element is None:
+        return None
+    node = element.find(f"{_A_NS}bodyPr/{_A_NS}normAutofit")
+    if node is None:
+        return None
+    raw = node.get("fontScale")
+    if raw is None:
+        return 1.0
+    try:
+        # Written in thousandths of a per cent: 62500 is 62.5%.
+        return round(int(raw) / 100000.0, 4)
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def _margins(frame: Any) -> Optional[tuple]:
+    """The text frame's internal insets in inches: left, top, right, bottom."""
+    values = []
+    for side in ("margin_left", "margin_top", "margin_right", "margin_bottom"):
+        found = _safe(lambda side=side: getattr(frame, side))
+        if found is None:
+            return None
+        values.append(_inches(found))
+    return tuple(values)
 
 
 def _image_sha1(shape: Any) -> Optional[str]:

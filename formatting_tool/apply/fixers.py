@@ -21,6 +21,7 @@ import logging
 import re
 from typing import Any, Callable, Optional
 
+from .. import arrange
 from ..colorutil import TEXT_CONTRAST_FLOOR, contrast_ratio
 from ..models import Issue
 from ..rules.colors import MASTER_SETS_IT
@@ -229,18 +230,17 @@ def fix_alignment_grid(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[
             "a design call. Mark the master's presentation space to enable this"
         )
     side, target = _edge(issue.expected)
-    if target is None or shape.left is None:
+    if target is None:
         return None
 
-    # The edge the deck aligns on, which is the right one in a deck that reads
-    # right to left. Snapping the left edge of a right-aligned shape moves it
-    # by its own width off the column it belongs to.
-    width = shape.width or 0
-    new_left = int(round(target * EMU_PER_INCH)) - (width if side == "right" else 0)
-    if new_left == shape.left:
+    # Through `arrange.align_edge`, which is where "the right edge" is
+    # defined: snapping the LEFT edge of a right-aligned shape moves it by its
+    # own width off the column it belongs to, and an Arabic deck is a deck of
+    # right-aligned shapes. One definition, shared with every other fix here
+    # that puts an edge somewhere.
+    moved = arrange.align_edge(shape, side or "left", target)
+    if moved is None:
         return None
-    moved = (new_left - shape.left) / EMU_PER_INCH
-    shape.left = new_left
     return f"snapped the {side or 'left'} edge {moved:+.2f}in to {target:.2f}in"
 
 
@@ -256,18 +256,9 @@ def fix_repeat_out_of_line(shape: Any, issue: Issue, ctx: "FixContext") -> Optio
     if side is None or target is None:
         return None
 
-    current = shape.left if side == "left" else shape.top
-    if current is None:
+    moved = arrange.align_edge(shape, side, target)
+    if moved is None:
         return None
-    wanted = int(round(target * EMU_PER_INCH))
-    if wanted == current:
-        return None
-
-    moved = (wanted - current) / EMU_PER_INCH
-    if side == "left":
-        shape.left = wanted
-    else:
-        shape.top = wanted
     return f"aligned the {side} edge {moved:+.2f}in onto the set at {target:.2f}in"
 
 
@@ -360,12 +351,10 @@ def _move_onto(
     if target is None or shape.left is None or shape.top is None:
         return None
 
-    wanted_left, wanted_top = _emu(target[0]), _emu(target[1])
-    if (wanted_left, wanted_top) == (shape.left, shape.top):
-        return None
-
-    dx = (wanted_left - shape.left) / EMU_PER_INCH
-    dy = (wanted_top - shape.top) / EMU_PER_INCH
+    # The drift is measured before anything moves, because the ceiling below
+    # is a decision about whether to move at all.
+    dx = target[0] - shape.left / EMU_PER_INCH
+    dy = target[1] - shape.top / EMU_PER_INCH
     if max(abs(dx), abs(dy)) > ctx.max_drift_in:
         raise LeaveAlone(
             f"it sits {max(abs(dx), abs(dy)):.2f}in away, too far to be drift; "
@@ -373,7 +362,10 @@ def _move_onto(
             "purpose"
         )
 
-    shape.left, shape.top = wanted_left, wanted_top
+    moved = arrange.move_to(shape, target[0], target[1])
+    if moved is None:
+        return None
+    dx, dy = moved
     return (
         f"moved {what} {dx:+.2f}, {dy:+.2f}in onto the position {whose} holds"
     )
@@ -829,16 +821,27 @@ def fix_series_crowded(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[
     if len(row) < 2:
         return None
 
-    cursor = _emu(start)
-    moved = 0
-    for member in row:
-        if member.left != cursor:
-            member.left = cursor
-            moved += 1
-        cursor += (member.width or 0) + _emu(gap)
+    # Across the span the FINDING names rather than the one the row happens to
+    # occupy, which is the one case `arrange.distribute` takes a span for: the
+    # rule measured the row against the space it is meant to fill, and letting
+    # the shapes' own bounds decide would re-spread them inside the collapse
+    # that was being reported.
+    #
+    # `allow_overlap` because the refusal above already made that call, off
+    # the gap the designer was shown. Two places deciding it would mean a fix
+    # that refused for a reason the report never mentioned.
+    outcome = arrange.distribute(
+        row,
+        arrange.DistributeAction.HORIZONTAL,
+        span_in=(start, span),
+        gap_in=gap,
+        allow_overlap=True,
+    )
+    if not outcome.success:
+        return None
     return (
         f"spread {len(row)} shapes evenly across {start:.2f}-{span:.2f}in "
-        f"with a {gap:.2f}in gap, moving {moved} of them"
+        f"with a {gap:.2f}in gap, moving {outcome.changed} of them"
     )
 
 
@@ -893,17 +896,9 @@ def fix_row_out_of_line(shape: Any, issue: Issue, ctx: "FixContext") -> Optional
     if axis is None or target is None:
         return None
 
-    side = "left" if axis == "x" else "top"
-    extent = shape.width if axis == "x" else shape.height
-    current = getattr(shape, side)
-    if current is None or extent is None:
+    moved = arrange.align_centre(shape, axis, target)
+    if moved is None:
         return None
-
-    wanted = int(round(target * EMU_PER_INCH - extent / 2))
-    if wanted == current:
-        return None
-    moved = (wanted - current) / EMU_PER_INCH
-    setattr(shape, side, wanted)
     return (
         f"moved {moved:+.2f}in onto the centre {axis} of {target:.2f}in "
         "the rest of the set shares"
@@ -961,6 +956,150 @@ def fix_table_header_alignment(
         f"set the header row {side} aligned, changing {changed} heading "
         f"line(s); the column a heading names starts at that edge"
     )
+
+
+def fix_anchor_blocks_fit(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[str]:
+    """Anchor a box's text to the top so the overflow on it can be corrected.
+
+    THE CORRECTION THE OVERFLOW FIX ASKED FOR AND NOBODY COULD MAKE.
+    `fix_text_overflow` refuses a middle- or bottom-anchored box because
+    growing one moves the copy instead of giving it room, and its refusal ends
+    "shorten the copy or anchor the text to the top first". This is that.
+
+    IT MOVES THE COPY, and says so. Anchoring to the top lifts text that was
+    centred, which is a visible change to a box that is already failing --
+    every one of these is a box whose copy does not fit. The alternative is a
+    box nobody can correct at all, and the designer sees both pictures.
+
+    `space.text_overflow` runs after this in `FIX_ORDER`, so a round that ticks
+    both anchors the box and then grows it. Ticking this one alone leaves a box
+    whose copy starts at the top and still overflows, which is the same defect
+    more honestly drawn.
+    """
+    if not _has_text(shape):
+        return None
+
+    was = _anchor_of(shape)
+    if was in ("top", None):
+        raise LeaveAlone(
+            "this box is already top-anchored, so its overflow is not the "
+            "anchor's doing"
+        )
+    if not arrange.set_anchor(shape, "top"):
+        return None
+    return (
+        f"anchored the text to the top, from {was}, so the box can be grown "
+        "to the size its copy needs"
+    )
+
+
+def fix_autofit_scale(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[str]:
+    """Write down the size the text is actually drawn at, and stop the shrinking.
+
+    NOTHING ABOUT THE SLIDE CHANGES, which is the whole reason this is safe to
+    do without a designer. PowerPoint is already drawing this copy at a
+    fraction of its stored size; setting the runs to that fraction and removing
+    the shrink leaves a slide that renders exactly as it did and a file that
+    finally admits what it renders as.
+
+    WHAT IT BUYS is every other rule in the tool. A heading stored at 14pt and
+    drawn at 8.75pt passes every size check here, because they all read the
+    file; once the 8.75 is written down, the same checks see a heading three
+    steps below the deck's scale and say so. The defect was never the autofit
+    setting, it was that the setting made the deck unreadable to its own
+    report.
+
+    The scale comes off the finding rather than being re-read, so the number
+    applied is the number the designer was shown.
+    """
+    scale = _scale_of(issue.found)
+    if scale is None or not _has_text(shape):
+        return None
+
+    from pptx.oxml.ns import qn  # noqa: PLC0415 - lazy, oxml internals
+    from pptx.util import Pt  # noqa: PLC0415 - lazy heavy dependency
+
+    changed = 0
+    for paragraph in shape.text_frame.paragraphs:
+        for run in paragraph.runs:
+            size = _safely(lambda run=run: run.font.size)
+            if size is None:
+                continue
+            run.font.size = Pt(round(size.pt * scale, 1))
+            changed += 1
+    if not changed:
+        raise LeaveAlone(
+            "the type in this box is inherited rather than stated, so there "
+            "is no size here to write the drawn one over; set the size on the "
+            "box or on the layout first"
+        )
+
+    # The shrinking last, so a failure above leaves the box as it was rather
+    # than unshrunk at the size it could not fit.
+    element = _safely(lambda: shape.text_frame._txBody)
+    body = element.find(qn("a:bodyPr")) if element is not None else None
+    if body is not None:
+        for node in body.findall(qn("a:normAutofit")):
+            body.remove(node)
+    return (
+        f"set {changed} run(s) to the {scale * 100:.0f}% size they were "
+        "already being drawn at, and took the shrink-to-fit off"
+    )
+
+
+def _scale_of(found: Optional[str]) -> Optional[float]:
+    """"62% of 14pt" -> 0.62."""
+    if not found:
+        return None
+    match = _PERCENT.search(found)
+    if not match:
+        return None
+    value = int(match.group(1)) / 100.0
+    return value if 0 < value < 1 else None
+
+
+_PERCENT = re.compile(r"(\d{1,3})%")
+
+
+def fix_text_insets(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[str]:
+    """Set a shape's text insets to the ones the rest of its row uses."""
+    wanted = _insets_of(issue.expected)
+    if wanted is None or not _has_text(shape):
+        return None
+
+    # Through `arrange.set_insets`, which writes a table's insets onto its
+    # CELLS. A table's padding lives on `a:tcPr/@marL` and friends; the
+    # graphic frame has a `a:bodyPr` that accepts the same values and that
+    # PowerPoint ignores, so writing it reported a correction that had not
+    # happened.
+    if not arrange.set_insets(shape, wanted):
+        return None
+    return f"set its text insets to {issue.expected}"
+
+
+def _insets_of(expected: Optional[str]) -> Optional[tuple]:
+    """The four insets a finding names, in the two shapes it writes them.
+
+    `_inset_words` collapses a symmetrical set into words and writes the four
+    numbers otherwise, so both spellings are read back here. Parsed rather than
+    carried on the finding because every rule fixer in this module takes its
+    target out of `expected`, and one that did not would be the odd one out
+    for no gain.
+    """
+    if not expected:
+        return None
+    sides = _SIDES.search(expected)
+    if sides:
+        across, down = float(sides.group(1)), float(sides.group(2))
+        return (across, down, across, down)
+    four = _FOUR.search(expected)
+    if four:
+        return tuple(float(four.group(i)) for i in range(1, 5))
+    return None
+
+
+_SIDES = re.compile(r"([\d.]+)in at the sides and ([\d.]+)in top and bottom")
+_FOUR = re.compile(r"([\d.]+)/([\d.]+)/([\d.]+)/([\d.]+)in")
 
 
 def _live_table(shape: Any) -> Any:
@@ -1230,19 +1369,116 @@ def fix_off_palette_text(shape: Any, issue: Issue, ctx: "FixContext") -> Optiona
 
     from pptx.dml.color import RGBColor  # noqa: PLC0415 - lazy heavy dependency
 
+    # A TABLE'S RUNS ARE IN HERE TOO. Its copy lives on its cells, so a fixer
+    # reaching for `shape.text_frame` on a graphic frame found nothing and
+    # quietly corrected nothing -- which is what this did to every table in
+    # every deck, for as long as the rule could not see them either.
     changed = 0
-    for paragraph in shape.text_frame.paragraphs:
-        for run in paragraph.runs:
-            if _run_hex(run) != current:
-                continue
-            run.font.color.rgb = RGBColor.from_string(target)
-            changed += 1
+    for frame in _text_frames_of(shape):
+        for paragraph in frame.paragraphs:
+            for run in paragraph.runs:
+                if _run_hex(run) != current:
+                    continue
+                run.font.color.rgb = RGBColor.from_string(target)
+                changed += 1
     if not changed:
         return None
     return (
         f"recoloured {changed} run(s) from #{current} to "
         f"{_target_phrase(issue, target, note)}"
     )
+
+
+def fix_text_contrast(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[str]:
+    """Recolour text that cannot be read off what it sits on.
+
+    THE TARGET IS THE RULE'S, NOT THIS FUNCTION'S. `rules.contrast` measured
+    the background, so it is the only thing in a position to say which colour
+    clears the floor on it -- and it prefers the one the master already states
+    for the placeholder over any choice of its own. A finding whose `expected`
+    names no colour is one where nothing on the palette could be read on that
+    background, and the answer to that is to move the text off the fill, which
+    is a designer's call and not a recolour.
+
+    Matched on the colour the finding measured, like the off-palette fix and
+    for the same reason: a shape holding a legible heading and an illegible
+    label underneath it is one defect about the second, and recolouring both
+    would take a correct colour away.
+
+    INHERITED TEXT IS LEFT ALONE, and that is the case this most often meets.
+    The rule reads the colour a placeholder inherits from the master so it can
+    MEASURE the pairing, which is right -- the reader sees a colour whether or
+    not the file states one. Writing that colour back onto the runs is a
+    different act: it turns a placeholder that follows its master into one that
+    no longer does, so the next master swap moves everything except this shape.
+    The finding stands and says what to do.
+    """
+    colors = _HEX.findall(issue.expected or "")
+    target = colors[0].upper() if colors else None
+    background = colors[1].upper() if len(colors) > 1 else None
+    current = _hex_of(issue.found)
+    frames = _text_frames_of(shape)
+    if not target or not current or not frames:
+        return None
+
+    # MEASURED AGAIN HERE, against the background the finding carries. The
+    # rule chose a colour that clears the floor on the fill IT read, and a
+    # recolour earlier in the same round may have changed that fill -- the
+    # order in FIX_ORDER puts this after the palette fixes for exactly that
+    # reason. Rechecking costs one division and is the difference between a
+    # correction and a second defect written over the first.
+    ratio = contrast_ratio(target, background) if background else None
+    if ratio is not None and ratio < TEXT_CONTRAST_FLOOR:
+        raise LeaveAlone(
+            f"#{target} reads at only {ratio:.1f}:1 on #{background}, so "
+            "setting the text to it would leave the same defect in a "
+            "different colour"
+        )
+
+    from pptx.dml.color import RGBColor  # noqa: PLC0415 - lazy heavy dependency
+
+    changed = 0
+    for frame in frames:
+        for paragraph in frame.paragraphs:
+            for run in paragraph.runs:
+                if _run_hex(run) != current:
+                    continue
+                run.font.color.rgb = RGBColor.from_string(target)
+                changed += 1
+    if not changed:
+        raise LeaveAlone(
+            "this text takes its colour from the master rather than stating "
+            "one, so the pairing can be measured but not corrected here; "
+            "recolour the fill under it, or set the master's colour for it"
+        )
+    return f"recoloured {changed} run(s) from #{current} to #{target}"
+
+
+def _text_frames_of(shape: Any) -> list:
+    """Every text frame on a shape: its own, or one per cell of a table.
+
+    A TABLE IS NOT A SHAPE WITH A TEXT FRAME. Its copy lives on its cells, and
+    a fixer reaching for `shape.text_frame` on a graphic frame finds nothing
+    and quietly corrects nothing -- which is what the contrast fix did to a
+    header row set in white on a mid-tone brand colour, the one place this
+    defect is commonest.
+
+    Every cell rather than a named one, because the finding is about a pairing
+    and the pairing is matched by colour: the runs carrying the colour the
+    finding measured are the runs it is about, wherever in the table they sit.
+    """
+    if _has_text(shape):
+        return [shape.text_frame]
+    table = _live_table(shape)
+    if table is None:
+        return []
+    frames = []
+    for row in _safely(lambda: list(table.rows)) or []:
+        for cell in _safely(lambda: list(row.cells)) or []:
+            frame = _safely(lambda: cell.text_frame)
+            if frame is not None:
+                frames.append(frame)
+    return frames
 
 
 def fix_off_palette_shape(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[str]:
@@ -1266,11 +1502,53 @@ def fix_off_palette_shape(shape: Any, issue: Issue, ctx: "FixContext") -> Option
         return f"recoloured the outline to {_target_phrase(issue, target, note)}"
     if not _plan_accepted_the_risk(issue):
         _refuse_illegible(shape, target, issue)
+
+    # A table has no fill of its own: the colour is on its cells, and the ones
+    # to recolour are the ones carrying the colour the finding measured. Matched
+    # on the value rather than on an address for the same reason every other
+    # colour fix here is: one shade across six cells is one decision.
+    table = _live_table(shape)
+    if table is not None:
+        current = _hex_of(issue.found)
+        cells = [
+            cell for cell in _live_cells(table)
+            if current and _cell_hex(cell) == current
+        ]
+        if not cells:
+            return None
+        for cell in cells:
+            cell.fill.solid()
+            cell.fill.fore_color.rgb = colour
+        return (
+            f"recoloured {len(cells)} cell(s) from #{current} to "
+            f"{_target_phrase(issue, target, note)}"
+        )
+
     # solid() first: a shape whose fill is inherited or themed has no fore
     # colour to set until it has been made a solid fill of its own.
     shape.fill.solid()
     shape.fill.fore_color.rgb = colour
     return f"recoloured the fill to {_target_phrase(issue, target, note)}"
+
+
+def _live_cells(table: Any) -> list:
+    """Every cell of a live table, merged-away ones left out."""
+    cells = []
+    for row in _safely(lambda: list(table.rows)) or []:
+        for cell in _safely(lambda: list(row.cells)) or []:
+            if not _safely(lambda cell=cell: cell.is_spanned):
+                cells.append(cell)
+    return cells
+
+
+def _cell_hex(cell: Any) -> Optional[str]:
+    """A cell's solid fill as six hex digits, or None for anything else."""
+    try:
+        if not str(cell.fill.type).startswith("SOLID"):
+            return None
+        return str(cell.fill.fore_color.rgb).upper()
+    except Exception:
+        return None
 
 
 def _recolor_icon(
@@ -2068,6 +2346,7 @@ def _ai_recolor_text(shape: Any, action: Any, ctx: "FixContext") -> Optional[str
     label = _palette_entry(action.hex, ctx)
     if not _has_text(shape):
         return None
+    _refuse_unreadable_ink(shape, action.hex, ctx)
     from pptx.dml.color import RGBColor  # noqa: PLC0415 - lazy heavy dependency
 
     colour = RGBColor.from_string(action.hex)
@@ -2081,6 +2360,97 @@ def _ai_recolor_text(shape: Any, action: Any, ctx: "FixContext") -> Optional[str
     if not changed:
         return None
     return f"recoloured {changed} run(s) to {label} #{action.hex}"
+
+
+def _refuse_unreadable_ink(shape: Any, target: str, ctx: "FixContext") -> None:
+    """Stand down on a text colour the words could not be read in.
+
+    THE MIRROR OF `_refuse_illegible`, AND IT SHOULD HAVE BEEN WRITTEN AT THE
+    SAME TIME. That one stops a FILL recolour leaving the text on it
+    unreadable; nothing stopped a TEXT recolour doing the same thing from the
+    other side, and a text colour is the easier of the two to get wrong,
+    because the colour it has to be read against is usually not on the shape
+    being recoloured at all.
+
+    Which is exactly how it went wrong. A cross-slide colour mismatch set every
+    label on a slide to the deck's majority navy, and three of those labels sat
+    on buttons -- one of them navy. The label and the button became the same
+    colour, 1.0:1, and the word disappeared. The round removed one contrast
+    defect from that slide and created a worse one.
+
+    WHAT THE TEXT SITS ON, not what the shape is filled with. A label is
+    usually a text box of its own on top of a filled shape, so its own fill is
+    nothing and the colour a reader sees is the shape behind it: the nearest
+    one that contains it, which is the same order `rules.contrast._behind`
+    reads and for the same reason.
+
+    Silent where the answer is not a colour. A caption over a photograph has no
+    background to measure against, and refusing every recolour that cannot be
+    checked would decline the corrections this is here to allow.
+    """
+    background = _under(shape, ctx)
+    if not background:
+        return
+    ratio = contrast_ratio(target, background)
+    if ratio is None or ratio >= TEXT_CONTRAST_FLOOR:
+        return
+    raise LeaveAlone(
+        f"setting this text to #{target} would leave it at {ratio:.1f}:1 on "
+        f"the #{background} behind it, under the {TEXT_CONTRAST_FLOOR:g}:1 "
+        "floor -- the words would not be readable"
+    )
+
+
+def _under(shape: Any, ctx: "FixContext") -> Optional[str]:
+    """The solid colour drawn behind a shape's text, or None.
+
+    The shape's own fill first, then the nearest shape behind it that contains
+    it. `ctx.neighbours` is in document order, which is z-order, so the last
+    container before this shape is the one the words land on.
+    """
+    own = _fill_hex_of(shape)
+    if own:
+        return own
+    try:
+        left, top = int(shape.left), int(shape.top)
+        right, bottom = left + int(shape.width), top + int(shape.height)
+    except Exception:
+        return None
+
+    found = None
+    for other in ctx.neighbours or ():
+        if other is shape:
+            break                       # anything after this is drawn on top
+        try:
+            if not (
+                int(other.left) <= left and int(other.top) <= top
+                and int(other.left) + int(other.width) >= right
+                and int(other.top) + int(other.height) >= bottom
+            ):
+                continue
+        except Exception:
+            continue
+        fill = _fill_hex_of(other)
+        if fill:
+            found = fill
+    return found
+
+
+def _fill_hex_of(shape: Any) -> Optional[str]:
+    """A shape's solid fill as six hex digits, or None for anything else.
+
+    None for a gradient, a picture fill and no fill alike: none of those is one
+    colour, and a guard that read a gradient as transparent would measure the
+    text against whatever is further back and pass a pairing nobody can read.
+    """
+    try:
+        # "SOLID (1)" is how python-pptx renders the enum; anything else --
+        # BACKGROUND, GRADIENT, PICTURE, PATTERNED -- is not one colour.
+        if not str(shape.fill.type).startswith("SOLID"):
+            return None
+        return str(shape.fill.fore_color.rgb).upper()
+    except Exception:
+        return None
 
 
 def _ai_set_font(shape: Any, action: Any, ctx: "FixContext") -> Optional[str]:
@@ -2442,6 +2812,7 @@ Fixer = Callable[[Any, Issue, "FixContext"], Optional[str]]
 FIXERS: dict[str, Fixer] = {
     "space.alignment_grid": fix_alignment_grid,
     "color.text.off_palette": fix_off_palette_text,
+    "color.text.contrast": fix_text_contrast,
     "color.shape.off_palette": fix_off_palette_shape,
     "space.off_canvas": fix_off_canvas,
     "space.safe_margin": fix_safe_margin,
@@ -2466,6 +2837,9 @@ FIXERS: dict[str, Fixer] = {
     "typography.terminal_punctuation": fix_terminal_punctuation,
     "typography.orphan_widow": fix_orphan_widow,
     "typography.heading_balance": fix_heading_balance,
+    "typography.anchor_blocks_fit": fix_anchor_blocks_fit,
+    "size.autofit_scale": fix_autofit_scale,
+    "space.text_insets": fix_text_insets,
     "font.family.theme_drift": fix_theme_font_drift,
     "font.family.arabic": fix_arabic_font,
     "typography.rtl_not_set": fix_rtl_not_set,
@@ -2487,10 +2861,22 @@ FIX_ORDER: dict[str, int] = {
     # Before the orphan fix, which measures a last line: squaring the row up
     # changes where every line of the heading falls.
     "typography.heading_balance": 8,
+    # Before the overflow fix, which refuses a box this one un-refuses: a round
+    # that ticks both anchors the box and then grows it.
+    "typography.anchor_blocks_fit": 30,
+    # Before every size rule, because it is what makes the size in the file the
+    # size on the slide -- and after nothing, because it changes no geometry.
+    "size.autofit_scale": 6,
+    "space.text_insets": 10,
     "font.family.theme_drift": 10,
     "font.family.arabic": 10,
     "typography.rtl_not_set": 10,
     "typography.rtl_alignment": 10,
+    # With the other recolours, and after them: a contrast finding measured the
+    # fill as it was read, and a fill recoloured in the same round changes the
+    # answer. The second pass re-measures, which is where a pairing this round
+    # created gets picked up.
+    "color.text.contrast": 11,
     # First of the moves, and deliberately: turning a shape round to the side
     # the deck reads from is the largest change any of these make, and every
     # smaller one below -- the series alignments, the collision nudges, the

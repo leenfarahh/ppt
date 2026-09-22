@@ -20,6 +20,12 @@ from .colors import (
     OffPaletteTextRule,
     TextColorUnusedByMasterRule,
 )
+from .contrast import TextContrastRule
+from .textframe import (
+    AnchorBlocksFitRule,
+    AutofitScaleRule,
+    TextInsetRule,
+)
 from .direction import (
     RightToLeftRule,
     RtlAlignmentRule,
@@ -150,6 +156,17 @@ def build_first_pass_rules(
         OffPaletteTextRule(),
         TextColorUnusedByMasterRule(),
         OffPaletteShapeRule(),
+        # After the palette rules and reading the result of them: every colour
+        # on a slide can be on the palette and the slide still be unreadable,
+        # because a palette says which colours are allowed and never which
+        # pairs of them may be stacked.
+        TextContrastRule(),
+        # What a shape does with the text INSIDE its box, as opposed to where
+        # the box sits: three settings that each defeat something the tool
+        # otherwise does well. See `rules.textframe`.
+        AutofitScaleRule(),
+        AnchorBlocksFitRule(metrics=metrics),
+        TextInsetRule(),
         RoleFontSizeRule(),
         LogoGeometryRule(),
         # Within one slide: a series, a row, a mirrored pair. Deck-wide

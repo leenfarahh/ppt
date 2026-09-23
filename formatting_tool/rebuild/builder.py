@@ -26,9 +26,12 @@ What crosses, and what does not:
                         before it moves and it stops being a placeholder.
                         See `rebuild.pictures` -- without it a circular
                         portrait arrives square and at the origin
-    charts, SmartArt,   left behind and reported by name, because their content
-    media, embedded     lives in parts this cannot rebuild, and a silently
-    objects             broken chart is worse than a missing one
+    charts              copied as one element, chart part, workbook and all,
+                        at their own position -- never claimed, never cut
+                        into pieces, never re-placed. See `rebuild.charts`
+    SmartArt, media,    left behind and reported by name, because their content
+    embedded objects    lives in parts this cannot rebuild, and a silently
+                        broken diagram is worse than a missing one
 
 Nothing is dropped quietly. Every slide, every shape and every omission ends up
 in the RebuildResult.
@@ -53,14 +56,16 @@ from ..models import (
     RuleTuning,
     SlideProfile,
 )
+from . import charts as chartparts
 from . import master_apply
 from . import rtl
 from .matcher import FAMILIES, LATENT, LayoutMatch, choose_layout
-from .pictures import freeze_slide
+from .pictures import freeze_slide, reads_as_a_note
 
 log = logging.getLogger(__name__)
 
 _R_NS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+_P_NS = "{http://schemas.openxmlformats.org/presentationml/2006/main}"
 
 
 class RebuildError(RuntimeError):
@@ -168,6 +173,7 @@ def rebuild(
     master_profile: Optional[DeckProfile] = None,
     deck_profile: Optional[DeckProfile] = None,
     mirror: Optional[bool] = None,
+    roles: Optional[Any] = None,
 ) -> RebuildResult:
     """Rebuild `deck` onto `master` and write the result to `out`.
 
@@ -177,6 +183,14 @@ def rebuild(
     `seen` is what the AI layer read off the rendered slides: which layout
     each one belongs on. It outranks the structural fit and not a layout-name
     match; see `matcher.choose_layout`.
+
+    `roles` is what the same layer read off the same renders about the SHAPES:
+    which box is the subtitle, which is a source line, which shapes are a
+    chart, which are drawn furniture. It decides what may be claimed into a
+    layout region and what has to survive the move untouched -- see
+    `fill_runs`. Without it both routes fill by geometry alone, which is how a
+    footnote ends up under the title and a chevron banner is deleted with the
+    words it carried.
 
     `route` is "auto" to let PowerPoint do it where it can and fall back to
     rebuilding the file where it cannot, "powerpoint" to require PowerPoint, or
@@ -227,7 +241,7 @@ def rebuild(
             doubtful = {n for n, match in plans.items() if not match.confident}
             applied = master_apply.apply_master(
                 deck, master, out, {n: m.name for n, m in plans.items()},
-                mirror=mirror, doubtful=doubtful,
+                mirror=mirror, doubtful=doubtful, roles=roles,
             )
             if applied.fatal is None:
                 result = _result_from_powerpoint(master, deck, out, plans, applied)
@@ -244,7 +258,9 @@ def rebuild(
                 # take it.
                 spared = {record.number for record in result.quarantined}
                 try:
-                    _record_filled(result, *fill_runs(out, skip=spared))
+                    _record_filled(
+                        result, *fill_runs(out, skip=spared, roles=roles)
+                    )
                 except Exception:
                     log.warning(
                         "could not fill the layouts' repeated regions from the "
@@ -273,10 +289,13 @@ def rebuild(
     result.sample_slides_removed = _drop_slides(base)
     result.size_note = _size_note(base, source)
 
+    canvas_in = (deck_profile.width_in, deck_profile.height_in)
     for profile, src_slide in zip(deck_profile.slides, source.slides):
         result.slides.append(
             _rebuild_slide(
                 profile, src_slide, base, plans[profile.number],
+                here=roles.for_slide(profile.number) if roles else None,
+                canvas_in=canvas_in,
             )
         )
 
@@ -449,6 +468,8 @@ def _rebuild_slide(
     src_slide: Any,
     base: Any,
     match: Optional[LayoutMatch],
+    here: Optional[Any] = None,
+    canvas_in: tuple[float, float] = (0.0, 0.0),
 ) -> SlideRecord:
     # The match arrives decided. Both routes read the same plan, so a report
     # from one is comparable with a report from the other, and re-deciding
@@ -489,23 +510,33 @@ def _rebuild_slide(
     # across two walks the claims match nothing, silently: the file is written
     # unchanged and the log still says what was decided.
     shapes = list(src_slide.shapes)
+    charts_here = chartparts.chart_boxes(shapes)
 
     claims: dict[int, Any] = {}
     for shape in shapes:
-        if not _is_placeholder(shape):
+        if not _is_placeholder(shape) or chartparts.is_chart(shape):
+            # A chart in a content placeholder is still a chart. Claimed, it
+            # would take the region and then fail to copy into it.
             continue
         target = _claim(pool, shape, canvas)
         if target is not None:
             claims[id(shape)] = target
 
+    # A source line, a chart's parts and drawn furniture are never claimed:
+    # see `fill_runs`, which makes the same exclusion on the other route.
     loose = [
         shape for shape in shapes
         if not _is_placeholder(shape) and _has_copy(shape)
+        and not _leave_alone(shape, here, canvas_in, charts_here)
     ]
     run_claims, furniture, moves = claim_runs(loose, pool, shapes)
     claims.update(run_claims)
+    subtitle = _subtitle_text(here)
     claims.update(claim_drawn_over(
-        [s for s in loose if id(s) not in claims], pool
+        [s for s in loose if id(s) not in claims], pool, subtitle=subtitle,
+    ))
+    claims.update(claim_subtitle(
+        [s for s in loose if id(s) not in claims], pool, subtitle,
     ))
     spare = {id(shape) for shape in furniture}
     written = layout_writes(new_slide.slide_layout)
@@ -526,6 +557,15 @@ def _rebuild_slide(
                 "is carried over at its own position instead",
                 profile.number, _name_of(shape), _name_of(target),
             )
+        # NOTHING PROTECTED IS DROPPED BY ANY ROUTE. Keeping it out of `loose`
+        # stops it being claimed into a region; it does not stop
+        # `furniture_of` sweeping it up as the run's own drawing, or
+        # `echoes_layout` reading it as a title the layout already writes.
+        # Both drop the shape, and a chevron banner dropped as a run's drawing
+        # is exactly as gone as one dropped with its copy.
+        if _leave_alone(shape, here, canvas_in, charts_here):
+            _transplant(shape, src_slide, new_slide, record)
+            continue
         if id(shape) in spare:
             record.dropped.append(
                 DroppedShape(
@@ -746,7 +786,65 @@ def claim_runs(
     return claims, spare, moves
 
 
-def claim_drawn_over(loose: Sequence[Any], pool: list[Any]) -> dict[int, Any]:
+def _text_of(shape: Any) -> str:
+    """A shape's copy, or "" for anything that will not say.
+
+    Here as well as in `pictures` because the two modules read it for
+    different questions and neither should import the other for one line.
+    """
+    try:
+        return str(shape.text_frame.text) if shape.has_text_frame else ""
+    except Exception:
+        return ""
+
+
+def _leave_alone(
+    shape: Any, here: Optional[Any], canvas: tuple[float, float],
+    charts: Sequence[Any] = (),
+) -> bool:
+    """Whether this box must stay exactly where the designer drew it.
+
+    A CHART FIRST, AND ALL OF IT. A native chart, anything drawn inside one's
+    frame (`charts`, from `rebuild.charts.chart_boxes`), and anything inside a
+    region the model called a chart -- asked by POSITION, because the bars, the
+    gridlines and the axis of a chart drawn as shapes carry no copy, and the
+    copy test below was the only protection they had. It gave them none, and
+    they were deleted as the drawing of the run their data labels made.
+
+    Then the model's word, because it read the picture; the file's own
+    reading of small print behind it, because the model is optional. Either
+    one saying so is enough -- they answer the same question from different
+    evidence and neither is entitled to overrule the other into silence.
+    """
+    if chartparts.part_of_a_chart(shape, charts, here):
+        return True
+    if here is not None and here.reviewed:
+        from ..ai.roles import normalize_copy  # noqa: PLC0415 - optional dep
+
+        if normalize_copy(_text_of(shape)) in here.protected_texts:
+            return True
+    return reads_as_a_note(shape, canvas)
+
+
+def _subtitle_text(here: Optional[Any]) -> Optional[str]:
+    """The copy of the one box the model called the subtitle.
+
+    None when there are no roles -- `claim_drawn_over` then behaves as it did,
+    filling a subtitle region from whatever is drawn over it. An EMPTY STRING
+    when the slide was read and no subtitle was named, which is a different
+    answer and has to be: it means somebody looked and there is no standfirst
+    on this slide, so the subtitle region is left empty rather than filled
+    with a chart's caption.
+    """
+    if here is None or not here.reviewed:
+        return None
+    found = here.subtitle
+    return found.text if found is not None else ""
+
+
+def claim_drawn_over(
+    loose: Sequence[Any], pool: list[Any], subtitle: Optional[str] = None,
+) -> dict[int, Any]:
     """Fill a region from the single box drawn on top of it.
 
     THE GAP THIS CLOSES. `claim_runs` above fills from RUNS, and a run is three
@@ -765,6 +863,17 @@ def claim_drawn_over(loose: Sequence[Any], pool: list[Any]) -> dict[int, Any]:
 
     Runs get first refusal, because a run is the stronger statement: it says
     what a group of boxes IS, where this says only where one of them sits.
+
+    `subtitle` IS THE ONE CASE GEOMETRY GETS WRONG EVERY TIME, and it is the
+    case this function was written for. The subtitle region runs the width of
+    the page, so EVERY full-width box on the slide is "drawn over" it: the
+    standfirst, the chart's caption, the source line at the foot. Which of
+    them is the subtitle is not in the file. Handed the copy of the box the
+    model called the subtitle, only that box may take a subtitle region.
+    Handed an empty string -- the slide was read and there is no standfirst on
+    it -- no box may, and the region is left for the designer rather than
+    filled with a footnote. Handed None nothing is read and this behaves as it
+    always did.
     """
     if not loose or not pool:
         return {}
@@ -780,12 +889,84 @@ def claim_drawn_over(loose: Sequence[Any], pool: list[Any]) -> dict[int, Any]:
 
     claims: dict[int, Any] = {}
     for shape, region in pair_over(loose, free):
+        if not _may_take(shape, region, subtitle):
+            continue
         claims[id(shape)] = region
         pool.remove(region)
         log.info(
             "filled %r from the box drawn over it", _name_of(region),
         )
     return claims
+
+
+def claim_subtitle(
+    loose: Sequence[Any], pool: list[Any], subtitle: Optional[str]
+) -> dict[int, Any]:
+    """Put the box the model called the subtitle into the subtitle region.
+
+    WHY GEOMETRY IS NOT ENOUGH ON ITS OWN. `claim_drawn_over` fills a region
+    from the box drawn on top of it, and on a tidy deck the subtitle IS drawn
+    over the subtitle region -- that is the case it was written for. On a
+    messy one it is not: the old master put its standfirst two inches lower,
+    or in a narrower measure, or the slide has no standfirst region at all and
+    somebody typed the line into a loose box halfway down the page. The words
+    are unmistakably a standfirst to anybody looking at the slide and there is
+    nothing in the file that says so.
+
+    So where the model has named one, it is claimed by NAME rather than by
+    position, and the region it goes into is the master's subtitle region --
+    which is where a standfirst belongs on the page it is being moved onto.
+
+    Runs and drawn-over boxes get first refusal, as they do everywhere else
+    here: this only ever fills a region nothing else claimed, and only ever
+    from a box nothing else claimed.
+
+    Empty whenever there is nothing to decide -- no roles, no subtitle named,
+    no free subtitle region, or no loose box carrying that copy.
+    """
+    if not subtitle or not loose or not pool:
+        return {}
+    free = [
+        shape for shape in pool
+        if _family_of(shape) == "subtitle" and not _has_copy(shape)
+    ]
+    if not free:
+        return {}
+
+    from ..ai.roles import normalize_copy  # noqa: PLC0415 - optional dep
+
+    for shape in loose:
+        if normalize_copy(_text_of(shape)) != subtitle:
+            continue
+        region = free[0]
+        pool.remove(region)
+        log.info(
+            "filled %r from %r, the box that reads as the subtitle",
+            _name_of(region), _name_of(shape),
+        )
+        return {id(shape): region}
+    return {}
+
+
+def _may_take(shape: Any, region: Any, subtitle: Optional[str]) -> bool:
+    """Whether this box is allowed to fill this region. See `claim_drawn_over`."""
+    if subtitle is None or _family_of(region) != "subtitle":
+        return True
+    from ..ai.roles import normalize_copy  # noqa: PLC0415 - optional dep
+
+    if not subtitle:
+        log.info(
+            "leaving %r empty: nothing on this slide reads as a subtitle",
+            _name_of(region),
+        )
+        return False
+    if normalize_copy(_text_of(shape)) == subtitle:
+        return True
+    log.info(
+        "not filling %r from %r: it is not the box that reads as the subtitle",
+        _name_of(region), _name_of(shape),
+    )
+    return False
 
 
 def _is_imagery(shape: Any) -> bool:
@@ -1167,7 +1348,7 @@ LAYOUT_ECHO = "says only what the layout already writes on the page"
 
 
 def fill_runs(
-    path: Path, skip: Collection[int] = (),
+    path: Path, skip: Collection[int] = (), roles: Optional[Any] = None,
 ) -> tuple[dict[int, list[str]], dict[int, list[tuple[str, str]]]]:
     """Fill a written deck's repeated regions from its own loose runs.
 
@@ -1179,6 +1360,21 @@ def fill_runs(
     empty, and left the five agenda items sitting at their old inches on top of
     the layout's photograph. The XML route does this inline in `_rebuild_slide`;
     here it has to be a second pass over the file PowerPoint wrote.
+
+    `roles` is `ai.roles.RolesResult`: what the model said each shape on the
+    original slide IS. WITHOUT IT THIS FILLS BY GEOMETRY ALONE, which is how
+    the source line ends up under the title. A footnote is a full-width box,
+    so it measures exactly like a subtitle, and `claim_drawn_over` cannot tell
+    the two apart from the file -- nothing in a .pptx says "this is small
+    print". A chevron banner reads the same way: a box with words in it,
+    claimed into a body region, and the chevron deleted with the box its copy
+    came out of. Both are visible in a picture and in nothing else.
+
+    So a shape the model called a source, a chart part or decoration is never
+    a candidate here, and the subtitle region is filled from the one box the
+    model called the subtitle or from nothing at all. Handed no roles, the
+    deterministic reading in `reads_as_a_note` holds the worst of it back and
+    everything else behaves as it did.
 
     The file IS re-serialised by this, which the PowerPoint route otherwise
     avoids on purpose. It is a narrow re-serialisation -- text set into
@@ -1212,14 +1408,24 @@ def fill_runs(
             # One list, for the reason `_rebuild_slide` gives: a fresh proxy
             # per access makes `id()` meaningless across two walks.
             shapes = list(slide.shapes)
-            pool = list(slide.placeholders)
+            charts_here = chartparts.chart_boxes(shapes)
+            pool = [
+                p for p in slide.placeholders if not chartparts.is_chart(p)
+            ]
+            here = roles.for_slide(number) if roles is not None else None
             loose = [
                 shape for shape in shapes
                 if not _is_placeholder(shape) and _has_copy(shape)
+                and not _leave_alone(shape, here, canvas, charts_here)
             ]
             claims, furniture, moves = claim_runs(loose, pool, shapes, rtl=rtl)
+            subtitle = _subtitle_text(here)
             claims.update(claim_drawn_over(
-                [s for s in loose if id(s) not in claims], pool
+                [s for s in loose if id(s) not in claims], pool,
+                subtitle=subtitle,
+            ))
+            claims.update(claim_subtitle(
+                [s for s in loose if id(s) not in claims], pool, subtitle,
             ))
             written = layout_writes(slide.slide_layout)
         except Exception:
@@ -1255,6 +1461,14 @@ def fill_runs(
                         "deleted",
                         number, _name_of(shape), _name_of(target),
                     )
+            elif _leave_alone(shape, here, canvas, charts_here):
+                # NOTHING PROTECTED IS DELETED BY ANY ROUTE. Keeping it out of
+                # `loose` stops it being claimed into a region; it does not
+                # stop `furniture_of` sweeping it up as the run's own drawing,
+                # or `echoes_layout` reading it as a title the layout already
+                # writes. Both delete, and a chevron banner deleted as a run's
+                # drawing is exactly as gone as one deleted with its copy.
+                pass
             elif id(shape) in drawing:
                 # The run's own drawing goes for the same reason: the new
                 # layout draws its own. See `series.furniture_of`.
@@ -1499,6 +1713,12 @@ def _transplant(
     """
     name = _name_of(shape)
     element = copy.deepcopy(shape._element)
+    if chartparts.is_chart(element):
+        # Floating on the new slide at its own frame, not a slot of a layout
+        # that never drew it. See `charts.unpin`.
+        ph = element.find(f".//{_P_NS}nvPr/{_P_NS}ph")
+        if ph is not None:
+            ph.getparent().remove(ph)
 
     unsupported = _remap_relationships(element, src_slide.part, new_slide.part)
     if unsupported:
@@ -1522,8 +1742,9 @@ def _remap_relationships(element: Any, src_part: Any, tgt_part: Any) -> set[str]
     re-related to the same image part, which the target package pulls in when
     it is saved. External references (hyperlinks, linked images) are recreated
     from their URL. Anything else points at a part with its own internal
-    structure -- a chart, a diagram, an embedded workbook -- and is reported
-    rather than copied.
+    structure -- a diagram, an embedded object -- and is reported rather than
+    copied. A chart is the exception: its parts are cloned as a set, so the
+    chart crosses as the one element it is.
     """
     unsupported: set[str] = set()
 
@@ -1557,6 +1778,9 @@ def _remap_relationships(element: Any, src_part: Any, tgt_part: Any) -> set[str]
                     )
                 elif _kind(rel.reltype) in _IMAGE_KINDS:
                     new_rid = _reimport_image(rel, tgt_part)
+                elif _kind(rel.reltype) in chartparts.CHART_KINDS:
+                    # Copied whole, workbook and all -- see `charts.clone_chart`.
+                    new_rid = chartparts.clone_chart(rel, tgt_part)
                 else:
                     unsupported.add(_kind(rel.reltype))
                     continue

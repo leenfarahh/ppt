@@ -363,7 +363,31 @@ def _report_apply(result) -> None:
     if result.rebuilt is not None:
         print("", file=out)
         _report_rebuild(result.rebuilt)
+    _report_finishing(result, out)
     _report_recheck(result, out)
+
+
+def _report_finishing(result, out) -> None:
+    """The two passes that run after everything and have no findings behind them.
+
+    Not in the fix list because nothing in that list can hold them: a gradient
+    stop, a shadow and a chart's series have no finding and no id. They still
+    change what the deck looks like, so a designer has to be told by something
+    other than the file. See `apply.applier._finish_the_colors`.
+    """
+    for stage in (result.palette_sweep, result.contrast_pass):
+        if stage is not None and getattr(stage, "applied", False):
+            print(f"\n  {stage.line()}", file=out)
+    open_pairings = list(getattr(result.contrast_pass, "unresolved", []) or [])
+    if open_pairings:
+        print(
+            f"\n  {len(open_pairings)} pairing(s) no colour this master "
+            "writes text in can fix -- a designer has to move the copy or "
+            "recolour what it sits on:",
+            file=out,
+        )
+        for line in open_pairings:
+            print(f"    {line}", file=out)
 
 
 def _report_recheck(result, out) -> None:

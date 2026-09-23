@@ -433,9 +433,9 @@ def _apply_all(
     second a fix, and a deck opened and saved eleven times is eleven chances
     for PowerPoint to hold a lock on the file the page is about to serve.
     """
-    presentation = app.Presentations.Open(
+    presentation = powerpoint.retry(lambda: app.Presentations.Open(
         str(deck.resolve()), ReadOnly=False, WithWindow=False
-    )
+    ))
     try:
         count = int(presentation.Slides.Count)
         # Which (shape, axis) pairs a correction has already settled this
@@ -458,10 +458,10 @@ def _apply_all(
                 ))
                 continue
             _apply_one(presentation, slide, shape, step, result, settled)
-        presentation.Save()
-        presentation.Close()
+        powerpoint.retry(lambda: presentation.Save())
+        powerpoint.retry(lambda: presentation.Close())
     except Exception:
-        powerpoint.quietly(presentation.Close)
+        powerpoint.close(presentation)
         raise
 
 
@@ -480,7 +480,8 @@ def _apply_one(
     elif step.op == "send_to_back":
         _send_to_back(slide, shape, step, result)
     elif step.op == "align":
-        _align(shape, step, result, settled if settled is not None else set())
+        _align(slide, shape, step, result,
+               settled if settled is not None else set())
     elif step.op == "resize":
         _resize(shape, step, result)
     elif step.op == "set_size":
@@ -990,7 +991,7 @@ def _blocking_right(slide: Any, shape: Any) -> Optional[float]:
 # -- aligning --------------------------------------------------------------- #
 
 def _align(
-    shape: Any, step: Step, result: QaFixResult, settled: set,
+    slide: Any, shape: Any, step: Step, result: QaFixResult, settled: set,
 ) -> None:
     """Move a shape to where the shapes it belongs with put it.
 
@@ -1065,6 +1066,16 @@ def _align(
         )
         return
 
+    landed_on = _would_land_on(slide, shape, left, top)
+    if landed_on:
+        result.skipped.append(_refused(
+            step,
+            f"that would move it onto {landed_on}, which it is clear of "
+            f"where it is: an alignment that buries a neighbour is not the "
+            f"tidier of the two slides",
+        ))
+        return
+
     try:
         shape.Left, shape.Top = left, top
     except Exception as exc:
@@ -1086,6 +1097,103 @@ def _align(
         moves.append(f"{(top - was_top) / _POINTS_PER_INCH:+.2f}in down")
     result.applied.append(_made(
         step, f"moved it to {step.measured_off} ({', '.join(moves)})"))
+
+
+# How much of the moving shape has to end up over a neighbour before the move
+# counts as burying it. A hair of overlap between two boxes is routine on a
+# real slide -- a heading's box runs a few hundredths into the rule under it
+# and nothing touches -- and refusing on that would refuse most alignments.
+# A twelfth of the shape is not a hair.
+_LANDS_ON_SHARE = 0.08
+
+# And the same question asked of what was already true. A shape that arrived
+# overlapping its neighbour must not be refused for the overlap it came with;
+# the question this guard asks is only whether the move makes a NEW one.
+_ALREADY_ON_SHARE = 0.02
+
+
+def _would_land_on(
+    slide: Any, shape: Any, left: float, top: float
+) -> str:
+    """The neighbour this move would bury, named, or "" when it buries none.
+
+    THE ALIGNMENT THAT WALKED A COLUMN INTO THE TITLE. A set is levelled
+    against its own members and nothing in that arithmetic knows what else is
+    on the slide, so a row of column headings brought onto the line of the
+    first of them is free to arrive on top of the title above it -- which is
+    what happened on a real deck, and it is not a defect in the arithmetic. It
+    is a question the arithmetic was never asked.
+
+    So it is asked here, where both positions are knowable: the shape's
+    rectangle where it is, its rectangle where it would go, and every other
+    shape on the slide. A neighbour it is already over stays allowed -- a
+    label on a band is over the band by design, and refusing that would refuse
+    every alignment inside a component. What is refused is arriving on top of
+    something it is currently clear of.
+
+    Top-level shapes only. Inside a group the members overlap each other by
+    construction, and a child being centred in its parent is exactly the
+    correction this must not stand in the way of.
+
+    A slide that will not answer comes back "" and the move goes ahead, on the
+    same terms as every other guard here: a check that cannot run must not
+    become a check that refuses everything.
+    """
+    here = _rect_of(shape)
+    if here is None:
+        return ""
+    width, height = here[2] - here[0], here[3] - here[1]
+    if width <= 0 or height <= 0:
+        return ""
+    there = (left, top, left + width, top + height)
+    if _rects_equal(here, there):
+        return ""
+
+    area = width * height
+    try:
+        me = int(shape.Id)
+    except Exception:
+        me = None
+
+    for other in _com_each(slide.Shapes):
+        try:
+            if me is not None and int(other.Id) == me:
+                continue
+        except Exception:
+            continue
+        box = _rect_of(other)
+        if box is None:
+            continue
+        after = _overlap_area(there, box)
+        if after / area < _LANDS_ON_SHARE:
+            continue
+        before = _overlap_area(here, box)
+        if before / area >= _ALREADY_ON_SHARE:
+            continue        # it was already over this one; not this move's doing
+        return _name_of(other)
+    return ""
+
+
+def _rect_of(shape: Any) -> Optional[tuple[float, float, float, float]]:
+    """(left, top, right, bottom) in points, or None where COM will not say."""
+    try:
+        left, top = float(shape.Left), float(shape.Top)
+        width, height = float(shape.Width), float(shape.Height)
+    except Exception:
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return (left, top, left + width, top + height)
+
+
+def _rects_equal(one: tuple, other: tuple) -> bool:
+    return all(abs(a - b) < 0.5 for a, b in zip(one, other))
+
+
+def _overlap_area(one: tuple, other: tuple) -> float:
+    across = min(one[2], other[2]) - max(one[0], other[0])
+    down = min(one[3], other[3]) - max(one[1], other[1])
+    return max(0.0, across) * max(0.0, down)
 
 
 def _set_size(shape: Any, step: Step, result: QaFixResult) -> None:

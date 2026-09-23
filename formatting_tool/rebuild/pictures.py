@@ -60,7 +60,7 @@ _IMAGE_REL = (
 )
 
 
-def freeze_file(path: Path) -> int:
+def freeze_file(path: Path, roles: Optional[Any] = None) -> int:
     """Freeze every slide in the file at `path`, in place. Best effort.
 
     Returns the number of shapes changed, and 0 both when there was nothing to
@@ -84,7 +84,8 @@ def freeze_file(path: Path) -> int:
         # inherits from the layout it is about to stop pointing at -- and a
         # deck needing neither still reaches PowerPoint byte for byte.
         carried = inherit_artwork(presentation)
-        if not frozen and not carried:
+        pinned = pin_by_role(presentation, roles)
+        if not frozen and not carried and not pinned:
             return 0
         presentation.save(str(path))
     except Exception:
@@ -103,7 +104,97 @@ def freeze_file(path: Path) -> int:
             "inherit them, so the rebuild does not leave them behind: %s",
             len(carried), ", ".join(carried),
         )
-    return len(frozen) + len(carried)
+    if pinned:
+        log.info(
+            "pinned %d placeholder(s) where they were drawn, so applying the "
+            "master does not move them into a region meant for something "
+            "else: %s", len(pinned), ", ".join(pinned),
+        )
+    return len(frozen) + len(carried) + len(pinned)
+
+
+# --------------------------------------------------------------------------- #
+# Placeholders that must not be re-placed
+# --------------------------------------------------------------------------- #
+
+def pin_by_role(presentation: Any, roles: Optional[Any] = None) -> list[str]:
+    """Un-placeholder the boxes the new layout has no right to move.
+
+    THE DEFECT. Assigning a `CustomLayout` runs PowerPoint's own placeholder
+    matching, and that matching reads a `p:ph` and nothing else: it knows a
+    shape is "body placeholder 3" and has no idea whether the words in it are
+    a paragraph or the source line under a chart. On a real deck it took
+    "Source: Oxford Economics, Team analysis" out of the foot of the page and
+    printed it under the title, on top of the subtitle, because the old
+    master had tagged the footnote as a placeholder and the new one puts its
+    third slot at the top.
+
+    A shape with no `p:ph` is not a placeholder, so nothing matches it and it
+    stays exactly where the designer drew it -- which is the whole correction.
+    The frame and the look are baked in first, on the same terms and for the
+    same reason as `freeze_slide`: while the `p:ph` is there the shape may be
+    inheriting its position and its fill from a layout it is about to stop
+    pointing at, and stripping the tag without baking those would drop it at
+    the origin with no fill.
+
+    WHICH SHAPES. The model's reading first -- a source, a chart's parts, a
+    piece of drawn furniture -- because it looked at the picture and that is
+    the only place the answer is written. The file's own reading of small
+    print behind it, so a run with no model still holds back the case a
+    designer notices first. Never a title and never body copy: moving those
+    into the master's regions is what applying a master IS.
+
+    Returns a line per shape pinned. Mutates the presentation.
+    """
+    pinned: list[str] = []
+    canvas = (
+        (presentation.slide_width or 0) / 914400,
+        (presentation.slide_height or 0) / 914400,
+    )
+    from .charts import unpin  # noqa: PLC0415 - sibling, kept off import time
+
+    for index, slide in enumerate(presentation.slides, start=1):
+        protected = _protected_texts(roles, index)
+        for shape in list(slide.shapes):
+            if not _is_placeholder(shape):
+                continue
+            # A chart keeps its own frame, whatever slot it was dropped into.
+            # See `charts.unpin`.
+            if unpin(shape):
+                pinned.append(f"slide {index}: {_name_of(shape)}")
+                continue
+            if not _text_of(shape).strip():
+                # An empty placeholder is a slot, and a slot is the new
+                # layout's business. Pinning one would leave the deck showing
+                # the OLD master's empty prompt box forever.
+                continue
+            if not _pin_worthy(shape, protected, canvas):
+                continue
+            if _freeze(shape, _layout_placeholder(shape, slide)):
+                pinned.append(f"slide {index}: {_name_of(shape)}")
+    return pinned
+
+
+def _protected_texts(roles: Optional[Any], number: int) -> set[str]:
+    """The copy on this slide the model said must not be re-placed."""
+    if roles is None:
+        return set()
+    try:
+        here = roles.for_slide(number)
+    except Exception:
+        return set()
+    return set(here.protected_texts) if here.reviewed else set()
+
+
+def _pin_worthy(
+    shape: Any, protected: set[str], canvas: tuple[float, float]
+) -> bool:
+    if protected:
+        from ..ai.roles import normalize_copy  # noqa: PLC0415 - optional dep
+
+        if normalize_copy(_text_of(shape)) in protected:
+            return True
+    return reads_as_a_note(shape, canvas)
 
 
 def _name_of(shape: Any) -> str:
@@ -119,6 +210,83 @@ def _is_placeholder(shape: Any) -> bool:
     except Exception:
         return False
 
+
+
+# Words that open a footnote, in the two languages this tool's decks are
+# written in. THE FALLBACK, NOT THE RULE. `ai.roles` reads the picture and
+# answers for every kind of small print, including the methodology line that
+# opens with no marker at all; this is what holds back the commonest half of
+# it on a run with no model, and it is deliberately a short list of things
+# that are never anything else.
+_NOTE_OPENERS = (
+    "source:", "sources:", "note:", "notes:", "footnote:", "n.b.",
+    "disclaimer:", "methodology:",
+    "المصدر",      # al-masdar, "source"
+    "ملاحظة",      # mulahaza, "note"
+)
+
+# The strip at the foot of the page where small print lives, as a share of the
+# canvas, and the size above which type is not small print however low it
+# sits. A 9pt line in the bottom eighth is a footnote; a 20pt line there is a
+# closing statement somebody set large on purpose.
+_FOOT_BAND = 0.86
+_SMALL_PT = 13.0
+
+
+def reads_as_a_note(shape: Any, canvas: tuple[float, float]) -> bool:
+    """Whether this box is small print, read off the file alone.
+
+    THE DETERMINISTIC HALF OF WHAT `ai.roles` DOES BETTER. It exists because
+    the model is optional -- no key, no renderer, a spent quota -- and the
+    defect it prevents is one a designer sees at a glance: a source line
+    filled into the subtitle region and printed under the title.
+
+    Two ways to qualify, and both are deliberately narrow, because a false
+    positive here costs a region left empty and a false negative costs the
+    footnote at the top of the page.
+
+      - it opens with a word that opens nothing else. "Source:" is not a
+        sentence anybody starts a body paragraph with.
+      - it is set small AND sits in the strip at the foot of the page. Either
+        on its own is ordinary: a caption is small and a closing line is low.
+
+    A shape that will not answer is not a note, which keeps this from
+    swallowing content on a file it cannot read.
+    """
+    text = _text_of(shape).strip()
+    if not text:
+        return False
+    if text.casefold().lstrip("*†‡ ").startswith(_NOTE_OPENERS):
+        return True
+
+    _width_in, height_in = canvas
+    if height_in <= 0:
+        return False
+    try:
+        top = float(shape.top or 0) / 914400
+    except Exception:
+        return False
+    if top / height_in < _FOOT_BAND:
+        return False
+    size = _largest_size(shape)
+    return size is not None and size <= _SMALL_PT
+
+
+def _largest_size(shape: Any) -> Optional[float]:
+    """The biggest type on the shape, in points, or None if it states none.
+
+    The biggest rather than the smallest: a footnote with a superscript marker
+    in it states two sizes, and the marker is not what the box is set at.
+    """
+    found: list[float] = []
+    try:
+        for paragraph in shape.text_frame.paragraphs:
+            for run in paragraph.runs:
+                if run.font.size is not None:
+                    found.append(run.font.size.pt)
+    except Exception:
+        return None
+    return max(found) if found else None
 
 
 def freeze_slide(src_slide: Any) -> list[str]:
@@ -148,8 +316,15 @@ def freeze_slide(src_slide: Any) -> list[str]:
     Returns the names of the shapes it changed. Mutates `src_slide`, which is
     a throwaway in-memory read of the source file and is never written back.
     """
+    from .charts import unpin  # noqa: PLC0415 - sibling, kept off import time
+
     frozen: list[str] = []
     for shape in list(src_slide.shapes):
+        if _is_placeholder(shape) and unpin(shape):
+            # A chart in a content placeholder: its own `p:xfrm` is its frame,
+            # and it crosses as one element. See `rebuild.charts`.
+            frozen.append(_name_of(shape))
+            continue
         if not _is_placeholder(shape) or not _carries_picture(shape):
             continue
         if _freeze(shape, _layout_placeholder(shape, src_slide)):

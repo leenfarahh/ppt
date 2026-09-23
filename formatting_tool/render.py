@@ -166,20 +166,20 @@ def _export(
 ) -> None:
     # A backslash path: PowerPoint reads a forward-slash path containing spaces
     # as a URL and cannot find it. `resolve` gives the native form.
-    presentation = app.Presentations.Open(
+    presentation = powerpoint.retry(lambda: app.Presentations.Open(
         str(deck.resolve()), ReadOnly=True, WithWindow=False
-    )
+    ))
     width, height = size or (DEFAULT_WIDTH, DEFAULT_HEIGHT)
     try:
         if not _export_some(presentation, out, slides, (width, height)):
             presentation.Export(str(out), "PNG", width, height)
     except Exception:
-        powerpoint.quietly(presentation.Close)  # the export failure is the interesting one
+        powerpoint.close(presentation)  # the export failure is the interesting one
         raise
     # Not housekeeping: a deck left open turns the next Open of the same path
     # into "PowerPoint could not open the file", so a close that fails means
     # the instance must not be reused, and the raise is what says so.
-    presentation.Close()
+    powerpoint.retry(lambda: presentation.Close())
 
 
 def _export_some(

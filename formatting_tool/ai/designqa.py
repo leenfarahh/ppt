@@ -420,6 +420,29 @@ it, and say whether it is right.
            those are the designer's, and a recolour that chases them makes
            white type on a pale sky.
 
+STEP 1a -- WHICH SHAPES ARE A CHART. Before anything else, put in `charts`
+the ref of every shape that is part of a data graphic: the plot, its bars or
+lines, its axis labels, its value labels, its legend, its gridlines. A chart on
+a consulting deck is usually drawn as dozens of ordinary shapes rather than as
+one object, so name all of them -- the numbers over the bars and the country
+names under them as readily as the bars themselves.
+
+NOTHING INSIDE A CHART IS EVER CORRECTED. A bar is a certain height because a
+number is a certain size, and a label sits where it sits because that is the
+bar it belongs to: levelling those, spacing them evenly or resizing them would
+make the picture state a different number. So a shape named here gets `ok` and
+no action, and it never appears in an arrangement's `shapes`. If a chart is
+genuinely too small or sits in the wrong half of the page, say so in
+`slide_issues` as a note for a designer.
+
+A DIAGRAM IS NOT A CHART, and this is the distinction that matters. A process
+flow, a matrix, a pyramid, a row of cards, a timeline, an org chart of boxes
+and connectors: those are drawn arrangements, they are not encoding
+quantities, and they are exactly what the corrections here are for. What makes
+something a chart is an axis, a scale, a legend keyed to series, or labels that
+are quantities. Leave `charts` empty on a slide that has none, which is most
+slides.
+
 STEP 2 -- WHAT IS WRONG WITH THE SLIDE. Anything the per-shape vocabulary
 cannot express goes in `slide_issues`: shapes that do not line up with each
 other, a row whose gaps are uneven, a timeline with a stop nothing uses, a
@@ -529,6 +552,8 @@ WHAT NOT TO DO.
 - Do not report the same defect twice, once on a group and once on its child.
   Name the shape that is actually wrong: the icon that sits low, not the
   circle it is in.
+- Do not tidy a chart. Nothing you listed in `charts`, and nothing drawn
+  inside one, gets an action or a place in an arrangement.
 """
 
 
@@ -589,6 +614,12 @@ a good one.
 # --------------------------------------------------------------------------- #
 # What comes back
 # --------------------------------------------------------------------------- #
+
+# How much of a shape has to sit inside a chart's region before it is taken to
+# be part of the chart, whatever the model said about it. A label half in and
+# half out is not inside anything; one almost wholly inside is.
+_INSIDE_A_CHART = 0.75
+
 
 @dataclass(frozen=True)
 class ShapeVerdict:
@@ -680,6 +711,38 @@ class SlideReview:
     slide_issues: list[SlideIssue] = field(default_factory=list)
     reviewed: bool = False
     reason: str = ""
+    # The rectangles the charts on this slide occupy, as fractions of the
+    # slide, taken from the shapes the model named as chart parts.
+    #
+    # KEPT AS REGIONS RATHER THAN AS A LIST OF SHAPES because a chart drawn as
+    # forty shapes does not come back as forty answers every time, and a chart
+    # with thirty-eight parts protected and two free to be levelled is a chart
+    # this tool is allowed to rewrite. Anything sitting inside one of these is
+    # part of the chart whether or not it was named. See `inside_a_chart`.
+    charts: list[tuple[float, float, float, float]] = field(default_factory=list)
+
+    def inside_a_chart(self, box: Optional[tuple]) -> bool:
+        """Whether a rectangle sits within one of this slide's charts.
+
+        `box` is the fractional rectangle a verdict or a member carries, in
+        the same units `charts` is in. None is not inside anything -- a shape
+        this could not place is one the guard has nothing to say about, and
+        refusing every such shape would be a guard that refuses the deck.
+        """
+        if not box or not self.charts:
+            return False
+        left, top, width, height = box
+        area = width * height
+        if area <= 0:
+            return False
+        for c_left, c_top, c_width, c_height in self.charts:
+            across = min(left + width, c_left + c_width) - max(left, c_left)
+            down = min(top + height, c_top + c_height) - max(top, c_top)
+            if across <= 0 or down <= 0:
+                continue
+            if (across * down) / area >= _INSIDE_A_CHART:
+                return True
+        return False
 
     @property
     def issues(self) -> list[ShapeVerdict]:
@@ -690,6 +753,7 @@ class SlideReview:
             "slide": self.slide,
             "shapes": [v.to_dict() for v in self.verdicts],
             "slide_issues": [issue.to_dict() for issue in self.slide_issues],
+            "charts": [list(box) for box in self.charts],
             "reviewed": self.reviewed,
             "reason": self.reason,
         }
@@ -1128,8 +1192,19 @@ def _schema(refs: Sequence[str]) -> dict[str, Any]:
                     "additionalProperties": False,
                 },
             },
+            "charts": {
+                "type": "array",
+                "items": {"type": "string", "enum": list(refs)},
+                "description": (
+                    "The ref of every shape that is part of a data graphic -- "
+                    "its plot, bars, lines, axis labels, value labels, legend "
+                    "and gridlines. Empty on a slide with no chart on it, "
+                    "which is most slides. A diagram, a process flow, a matrix "
+                    "or a row of cards is NOT a chart."
+                ),
+            },
         },
-        "required": ["shapes", "slide_issues"],
+        "required": ["shapes", "slide_issues", "charts"],
         "additionalProperties": False,
     }
 
@@ -1264,6 +1339,11 @@ def _ask(
         data = {
             "shapes": salvage_list(exc.text, "shapes"),
             "slide_issues": salvage_list(exc.text, "slide_issues"),
+            # Salvaged too, and it matters more than the rest: `charts` is
+            # what holds the corrections off a data graphic, so an answer cut
+            # off after it would otherwise keep every verdict and lose the one
+            # thing stopping them being applied to a bar chart.
+            "charts": salvage_list(exc.text, "charts"),
         }
         if not data["shapes"] and not data["slide_issues"]:
             raise
@@ -1578,6 +1658,16 @@ def review_from_response(
     review = SlideReview(slide=number, reviewed=True)
     seen: set[str] = set()
 
+    # Read FIRST, because every verdict below is measured against it: a shape
+    # inside a chart is left alone whatever the model said about it, and the
+    # regions have to exist before the first verdict is built.
+    review.charts = [
+        box
+        for ref in dict.fromkeys(payload.get("charts") or [])
+        if (listed := refs.get(str(ref or "").strip())) is not None
+        and (box := _box_of(listed.shape, size)) is not None
+    ]
+
     for raw in payload.get("shapes") or []:
         ref = str(raw.get("shape") or "").strip()
         listed = refs.get(ref)
@@ -1597,6 +1687,17 @@ def review_from_response(
         # it is a change nobody asked for.
         if status == "ok":
             action, issue = "none", ""
+
+        box = _box_of(shape, size)
+        # NOTHING INSIDE A CHART IS CORRECTED. A bar is a certain height
+        # because a number is a certain size, and a value label sits where it
+        # sits because that is the bar it belongs to -- so stepping its type,
+        # centring it or widening its box would make the picture state
+        # something other than the data. The finding is kept as a note, which
+        # is the honest place for "this chart's labels are too small": a
+        # designer changes it in the chart, not by dragging a shape.
+        if review.inside_a_chart(box) and action != "none":
+            action = "none"
 
         parent_ref = ref.rsplit(".", 1)[0] if "." in ref else ""
         parent = refs.get(parent_ref)
@@ -1618,8 +1719,12 @@ def review_from_response(
                 parent_id=parent.shape_id if parent is not None else None,
                 path=listed.path,
                 parent_path=parent.path if parent is not None else (),
-                fix=_proposal(raw.get("fix"), shape) if status == "issue" else None,
-                box=_box_of(shape, size),
+                fix=(
+                    _proposal(raw.get("fix"), shape)
+                    if status == "issue" and not review.inside_a_chart(box)
+                    else None
+                ),
+                box=box,
             )
         )
 
@@ -1634,7 +1739,7 @@ def review_from_response(
         else:
             note = str(entry.get("note") or "").strip()
             task = str(entry.get("task") or "").strip()
-            arrangement, members = _arrangement(entry, refs)
+            arrangement, members = _arrangement(entry, refs, review, size)
         if note or task:
             review.slide_issues.append(SlideIssue(
                 note=note or task, task=task,
@@ -1644,7 +1749,10 @@ def review_from_response(
 
 
 def _arrangement(
-    raw: dict[str, Any], refs: dict[str, "Listed"]
+    raw: dict[str, Any],
+    refs: dict[str, "Listed"],
+    review: Optional[SlideReview] = None,
+    size: tuple[float, float] = (0.0, 0.0),
 ) -> tuple[str, tuple[Member, ...]]:
     """The relation a slide-level finding names, and the shapes it is about.
 
@@ -1657,7 +1765,15 @@ def _arrangement(
 
     Duplicates are dropped too. A model that names the same circle twice in a
     row of five has described a set of four, and counting it twice would drag
-    a median towards it.
+    the line towards it.
+
+    SO IS ANYTHING INSIDE A CHART, and that one drops the whole finding rather
+    than trimming it. A chart's bars are like-sized boxes in a regular row, so
+    they are the single most inviting thing on a deck to level or space
+    evenly, and doing it would make the picture state different numbers. A set
+    with a chart's parts taken out of it is not a smaller version of the
+    finding, it is a different finding nobody made -- so the arrangement goes
+    and the sentence stays.
     """
     kind = str(raw.get("arrangement") or "").strip().lower()
     if kind not in ARRANGEMENTS:
@@ -1670,6 +1786,10 @@ def _arrangement(
         listed = refs.get(ref)
         if listed is None or ref in seen:
             continue
+        if review is not None and review.inside_a_chart(
+            _box_of(listed.shape, size)
+        ):
+            return "", ()
         seen.add(ref)
         members.append(Member(
             ref=ref, shape=listed.name,

@@ -204,6 +204,26 @@ WITH_MASTER_RULES = frozenset({
     "color.shape.off_palette",
 })
 
+# The rules whose corrections would rewrite a chart, and so are not offered
+# for a shape the model said is part of one. Every one of them moves or resizes
+# a shape to agree with a set, which is precisely what a bar must not do: its
+# height IS the number. A chart's labels being small or its plot sitting low is
+# still reported as a note -- see `MASTER_FREE_RULES` -- it just stops being a
+# tick box that drags a bar.
+_NOT_ON_A_CHART = frozenset({
+    "space.repeat_out_of_line",
+    "space.row_out_of_line",
+    "space.series_crowded",
+    "space.series_uneven",
+    "space.matrix_gutter",
+    "space.satellite_offset",
+    "space.band_width",
+    "space.text_collision",
+    "space.overlap",
+    "size.autofit_scale",
+    "typography.heading_balance",
+})
+
 # Rules offered only where the model saw the same defect on the same shape.
 # The value is the verdict kinds that count as having seen it.
 _CONDITIONAL_RULES = {"space.overlap": {"overlap"}}
@@ -337,6 +357,8 @@ class DesignQaReport:
         out = []
         for issue in self.rule_issues:
             rule = issue.rule_id or ""
+            if rule in _NOT_ON_A_CHART and self._on_a_chart(issue):
+                continue
             if rule in offered:
                 out.append(issue)
             elif rule in _CONDITIONAL_RULES and (
@@ -344,6 +366,27 @@ class DesignQaReport:
             ):
                 out.append(issue)
         return out
+
+    def _on_a_chart(self, issue: Issue) -> bool:
+        """Whether this finding is about a shape drawn inside a data graphic.
+
+        THE RULES THAT MOVE A SET ARE THE ONES A CHART MOST LOOKS LIKE. A bar
+        chart is a run of like-sized boxes on a regular grid with one of them
+        a different height, which is the literal definition `space.series_*`
+        and `space.repeat_out_of_line` match on -- and every correction they
+        would make to it changes what the picture says the numbers are. No
+        reading of the file can tell that run from a row of cards; the model
+        looking at the render can, and `SlideReview.charts` is where it said
+        so.
+        """
+        if issue.slide is None:
+            return False
+        review = next(
+            (r for r in self.reviews if r.slide == issue.slide), None
+        )
+        if review is None or not review.charts:
+            return False
+        return review.inside_a_chart(self._box_of(issue))
 
     def _collisions_seen(self) -> dict:
         """Where the model agreed there is a defect, per conditional rule.
@@ -1569,15 +1612,40 @@ def _shares_the_other_edge(kind: str, placed: Sequence[tuple]) -> bool:
     return max(edges) - min(edges) <= _SHARED_EDGE_IN
 
 
+def _anchor(kind: str, placed: Sequence[tuple]):
+    """The member the rest of the set is brought into line with.
+
+    THE FIRST BOX, READ THE WAY THE SET IS READ, and not the median the first
+    version took. The median is the better statistic and it was the wrong
+    answer, because the line it produces is a line NOBODY DREW: a row of three
+    column headings whose tops are 2.36, 2.36 and 2.35in has a median of
+    2.36in and a set of five whose tops straddle a title has a median
+    somewhere between them, and on a real deck that median sat above the
+    heading band and walked the whole left column up into the title. A set is
+    levelled against one of its own members or it is levelled against an
+    abstraction, and only the first of those can be checked by looking at the
+    slide.
+
+    FIRST MEANS FIRST ALONG THE LINE, which is the axis the arrangement does
+    NOT change: a row being levelled is read left to right, so its anchor is
+    its leftmost member; a column being lined up is read top to bottom, so its
+    anchor is its topmost. `_lines` has already split the set into the rows or
+    columns it really holds, so this is asked of one line at a time and a grid
+    anchors each of its rows on that row's own first card.
+    """
+    along = (lambda box: box.left_in) if kind in _ROW_ARRANGEMENTS else (
+        lambda box: box.top_in
+    )
+    return min(placed, key=lambda pair: along(pair[1]))[1]
+
+
 def _aligned(kind: str, placed: Sequence[tuple]) -> list[tuple]:
     """Where each shape goes to share an edge with the rest of its set.
 
-    THE MEDIAN OF THE EDGE THEY SHOULD SHARE, for the reason `_align_steps`
-    gives one level up: the shape being reported is the one that is out, and a
-    mean lets it drag the line it is supposed to be joining towards itself.
-    With four circles level and a fifth low, the median IS the line the four
-    are on, which is why the model is told to name the whole set and not just
-    the odd one out.
+    THE FIRST BOX'S EDGE, taken by `_anchor`, which explains why it is not the
+    median it used to be: a median is an edge no shape on the slide actually
+    has, and correcting a set onto one moves every member of it -- including
+    the ones that were right -- to a line the designer never drew.
 
     ONLY THE AXIS THE ARRANGEMENT IS ABOUT CARRIES A NUMBER. The other comes
     back None, and the applier leaves that axis exactly where it is.
@@ -1600,16 +1668,17 @@ def _aligned(kind: str, placed: Sequence[tuple]) -> list[tuple]:
     movement is zero. Nothing refused it because nothing was wrong with either
     step on its own.
     """
+    anchor = _anchor(kind, placed)
     if kind == "align_top":
-        edge = _median(sorted(box.top_in for _, box in placed))
+        edge = anchor.top_in
         return [(m, b, None, edge) for m, b in placed]
     if kind == "align_bottom":
-        edge = _median(sorted(box.top_in + box.height_in for _, box in placed))
+        edge = anchor.top_in + anchor.height_in
         return [(m, b, None, edge - b.height_in) for m, b in placed]
     if kind == "align_left":
-        edge = _median(sorted(box.left_in for _, box in placed))
+        edge = anchor.left_in
         return [(m, b, edge, None) for m, b in placed]
-    edge = _median(sorted(box.left_in + box.width_in for _, box in placed))
+    edge = anchor.left_in + anchor.width_in
     return [(m, b, edge - b.width_in, None) for m, b in placed]
 
 

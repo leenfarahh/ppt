@@ -319,8 +319,10 @@ def test_the_rebuild_is_given_the_model_s_layout_picks(wired, monkeypatch) -> No
 
     seen = {}
 
-    def fake_rebuild(master, target, tuning, layout_choices=None):
+    def fake_rebuild(master, target, tuning, layout_choices=None,
+                     shape_roles=None):
         seen["choices"] = layout_choices
+        seen["roles"] = shape_roles
         return None
 
     monkeypatch.setattr(applier, "_rebuild_in_place", fake_rebuild)

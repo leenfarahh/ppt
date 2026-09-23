@@ -147,6 +147,11 @@ class _Session:
     # whole run of the fixes, so charging for it again on every take-back would
     # make the cheapest correction the most expensive thing on the page.
     layout_picks: Optional[list] = None
+    # What the model said each shape on each slide IS, read off the same
+    # renders as `layout_picks` and kept for the same reason: an undo replays
+    # the run, and charging again for the same answer on every take-back would
+    # make the cheapest correction on the page the most expensive.
+    shape_roles: Optional[Any] = None
 
     @property
     def fixed(self) -> Path:
@@ -512,6 +517,7 @@ class _Handler(BaseHTTPRequestHandler):
                 spec=session.spec,
                 undone=session.undone,
                 layout_choices=_layout_picks(session) if session.rebuild else None,
+                shape_roles=_shape_roles(session) if session.rebuild else None,
                 color_intents=session.color_intents,
             )
             elapsed = time.perf_counter() - started
@@ -523,10 +529,23 @@ class _Handler(BaseHTTPRequestHandler):
 
         return {
             "session": session.id,
-            # Colour fixes left alone because the model read the colours as
-            # carrying meaning. Listed, not silent: a correction that did not
-            # happen has to be as visible as one that did, or the page is a
-            # list that lies by omission.
+            # The two passes that have no findings behind them, and so nothing
+            # else on this page to be reported under. A designer who is handed
+            # a deck whose gradients and chart series have moved has to be told
+            # that happened, and by what: see `applier._finish_the_colors`.
+            "palette_sweep": _pass_line(result.palette_sweep),
+            "contrast_pass": _pass_line(result.contrast_pass),
+            # What the contrast pass measured and could not answer: a pairing
+            # no colour the master writes text in can be read on. A designer's
+            # call, so it is said rather than guessed at.
+            "contrast_unresolved": list(
+                getattr(result.contrast_pass, "unresolved", []) or []
+            ),
+            # Colour findings the model read as an encoding. They ARE
+            # corrected -- being on the palette is the point -- and what the
+            # reading buys them is being held clearly apart from each other.
+            # Listed either way, so a designer can check that the legend they
+            # drew still reads as one.
             "kept_colors": [
                 {
                     "id": issue.id,
@@ -1400,6 +1419,21 @@ _workroot = workroot
 WORKDIR_ENV = _WORKDIR_ENV
 
 
+def _pass_line(result: Any) -> str:
+    """One sentence about a colour pass, or "" when it did not run.
+
+    The empty string rather than a sentence saying nothing happened: the page
+    shows this line only when there is one, and "no colours were swept" on
+    every apply is a row a designer learns to skip.
+    """
+    if result is None:
+        return ""
+    try:
+        return result.line() if result.applied else ""
+    except Exception:
+        return ""
+
+
 def _outcome_id(outcome: Any) -> str:
     """The id a change is addressed by, which every change has to have.
 
@@ -1457,20 +1491,50 @@ def _layout_picks(session: _Session) -> list:
     whole run -- charging again for the same answer on every take-back would
     make the cheapest correction on the page the most expensive.
     """
+    _read_the_render(session)
+    return session.layout_picks or []
+
+
+def _shape_roles(session: _Session) -> Optional[Any]:
+    """What each shape on each slide IS, as somebody looking would say.
+
+    The other half of `_read_the_render`, and the one the restyle needs to
+    stop moving a source line under the title and deleting a chevron banner
+    with the words it carried. See `ai.roles`.
+    """
+    _read_the_render(session)
+    return session.shape_roles
+
+
+def _read_the_render(session: _Session) -> None:
+    """Render the deck once and ask the model both questions about it.
+
+    TWO CALLS, ONE RENDER, ONE CACHE. Rendering a deck through PowerPoint is
+    most of the wait on this page, and the two questions -- which layout does
+    this slide belong on, and what are the boxes on it -- are asked of the
+    same pictures. Answered separately they would render the deck twice.
+
+    Silent and empty whenever it cannot help: the AI layer off, no renderer on
+    this machine, no API key, a model that declines. The structural matcher
+    and the file's own reading of the shapes then decide alone, which is what
+    happened before this was wired in, so the worst case is the behaviour that
+    was already there.
+    """
     if session.layout_picks is not None:
-        return session.layout_picks
+        return
     session.layout_picks = []           # so a failure is not retried per run
     if not session.use_ai or session.spec is None or session.ai is None:
-        return session.layout_picks
+        return
 
     try:
         from ..ai.layout import choose_layouts  # noqa: PLC0415 - lazy, optional
+        from ..ai.roles import read_roles  # noqa: PLC0415 - lazy, optional
 
         directory = session.directory / "before"
         rendered = _render_into(session.deck, directory)
         if not rendered:
             log.info("no layout pass: nothing rendered for %s", session.deck.name)
-            return session.layout_picks
+            return
 
         images = sorted(
             (number, directory / name) for number, name in rendered.items()
@@ -1487,12 +1551,22 @@ def _layout_picks(session: _Session) -> list:
             "the model chose a layout for %d of %d slide(s)",
             len(session.layout_picks), len(images),
         )
+        # Read here rather than carried on the session: the roles are keyed
+        # to the shapes of the deck as it arrived, and that is the file this
+        # path renders. A parse is seconds against a render that is minutes.
+        roles = read_roles(
+            read_deck(session.deck),
+            images,
+            model=session.ai.model,
+            thinking_budget=session.ai.thinking_budget,
+            api_key_env=session.ai.api_key_env,
+        )
+        session.shape_roles = roles if roles else None
     except Exception:
         log.warning(
             "could not ask the model which layouts these slides belong on; "
             "the structural matcher decides alone", exc_info=True,
         )
-    return session.layout_picks
 
 
 # What the static route will serve. A whitelist rather than a guess from the

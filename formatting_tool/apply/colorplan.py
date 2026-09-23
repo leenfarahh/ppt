@@ -100,6 +100,7 @@ def build_color_plan(
     tolerance: float,
     limit: float,
     inks: Optional[dict[str, set[str]]] = None,
+    schemes: Optional[Iterable[set[str]]] = None,
 ) -> ColorPlan:
     """Decide every selected colour's target at once.
 
@@ -115,11 +116,29 @@ def build_color_plan(
     `inks` maps a fill colour to the text colours found sitting on it, so an
     entry that would make that text unreadable is never chosen in the first
     place. Without it the plan can pick a colour the applier then refuses.
+
+    `schemes` is the sets of colours the model read as MEANING SOMETHING
+    TOGETHER -- a legend's three steps, a RAG column, a chart's series. Two
+    colours in one scheme are held `SCHEME_FLOOR` apart rather than the
+    ordinary `tolerance`, because "these are not the same colour" is a lower
+    bar than "a reader can see at a glance that these are three steps". It
+    changes nothing for colours nobody read as a system, which is most of
+    them, and it never leaves a colour off the palette: where the palette
+    cannot hold a scheme that far apart the ordinary floor applies again and
+    the plan says so.
     """
     sources = {_norm(s) for s in everything if _norm(s)}
     wanted = {_norm(s) for s in selected if _norm(s)} & sources
     if not wanted or not palette:
         return ColorPlan()
+
+    # Which colours have to be clearly distinct from which. Keyed per colour
+    # so the check is a lookup rather than a scan of every scheme.
+    kin: dict[str, set[str]] = {}
+    for scheme in schemes or ():
+        members = {_norm(value) for value in scheme if _norm(value)}
+        for member in members:
+            kin.setdefault(member, set()).update(members - {member})
 
     # Candidates per colour, nearest first. A colour with none defensible
     # falls back to its nearest entry however far off it is -- see
@@ -158,7 +177,7 @@ def build_color_plan(
             if not candidate or label in used:
                 blocker = blocker or _holder_of(label, used, choices)
                 continue
-            clash = _too_close(candidate, source, final, tolerance)
+            clash = _too_close(candidate, source, final, tolerance, kin)
             if clash is not None:
                 blocker = blocker or clash
                 continue
@@ -188,6 +207,7 @@ def build_color_plan(
                 used=used,
                 tolerance=tolerance,
                 inks=(inks or {}).get(source),
+                kin=kin,
             )
 
         choices[source] = chosen
@@ -220,6 +240,7 @@ def _by_contrast(
     used: set[str],
     tolerance: float,
     inks: Optional[set[str]] = None,
+    kin: Optional[dict[str, set[str]]] = None,
 ) -> ColorChoice:
     """The palette entry that keeps this colour's RELATIONSHIP to another.
 
@@ -253,7 +274,7 @@ def _by_contrast(
             candidate = _norm(entry)
             if not candidate or label in used:
                 continue
-            if _too_close(candidate, source, final, tolerance) is not None:
+            if _too_close(candidate, source, final, tolerance, kin) is not None:
                 continue
             if require_legible and not _keeps_text_legible(
                 candidate, source, inks
@@ -388,22 +409,42 @@ def _norm(value: Optional[str]) -> str:
     return (value or "").strip().lstrip("#").upper()
 
 
+# How far apart two colours of one ENCODING have to end up. The ordinary
+# tolerance answers "do these read as the same colour", which is the question
+# for a deck's colours at large. It is the wrong question for a legend: three
+# steps a reader has to tell apart at a glance, across a room, need more than
+# not-identical. Measured against a real three-step legend whose steps sit 14
+# to 22 delta-E apart, and set below the narrowest of those so a palette with
+# any range in it can still express one.
+SCHEME_FLOOR = 10.0
+
+
 def _too_close(
     candidate: str,
     source: str,
     final: dict[str, str],
     tolerance: float,
+    kin: Optional[dict[str, set[str]]] = None,
 ) -> Optional[str]:
     """The other colour this candidate would be confused with, if any.
 
     Measured against where the other colours END UP, not where they started,
     and skipping the colour being placed: a colour is allowed to land on the
     entry it is already nearly identical to, which is the ordinary case.
+
+    A colour that shares an ENCODING with another is held further away from
+    it -- `SCHEME_FLOOR` rather than `tolerance` -- because the two are doing
+    a job that needs them to be visibly different rather than merely not the
+    same. See `schemes` in `build_color_plan`.
     """
+    related = (kin or {}).get(source) or set()
     for other, other_final in final.items():
         if other == source:
             continue
         distance = delta_e(candidate, other_final)
-        if distance is not None and distance <= tolerance:
+        if distance is None:
+            continue
+        floor = SCHEME_FLOOR if other in related else tolerance
+        if distance <= floor:
             return other
     return None

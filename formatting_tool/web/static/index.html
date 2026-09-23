@@ -1125,8 +1125,35 @@ function appliedHTML() {
       <summary>${n} change${n === 1 ? "" : "s"} in detail</summary>
       <div class="clusters">${clusters}${skipped}</div>
     </details>
+    ${finishingHTML()}
     ${undoneHTML()}
   </section>`;
+}
+
+/* The two passes that run after every fix, and have no tick box behind them.
+ *
+ * They are not in the change list because nothing in the list can hold them:
+ * a gradient stop and a chart series have no finding, no id and no undo, and
+ * numbering them against a render would point at a shape nobody reported. But
+ * they change what the deck LOOKS like, and a designer handed a deck whose
+ * gradients have moved has to be told so by something other than the picture.
+ *
+ * Silent when neither did anything, which is the ordinary case on a deck that
+ * was already on the palette. */
+function finishingHTML() {
+  const r = state.applied;
+  if (!r) return "";
+  const lines = [r.palette_sweep, r.contrast_pass].filter(Boolean);
+  const open = (r.contrast_unresolved || []);
+  if (!lines.length && !open.length) return "";
+  return `<div class="finishing">
+    ${lines.map((line) => `<p class="meta">${esc(line)}</p>`).join("")}
+    ${open.length ? `<details class="runlog">
+      <summary>${open.length} pairing${open.length === 1 ? "" : "s"}
+        a designer has to settle</summary>
+      <ul>${open.map((line) => `<li>${esc(line)}</li>`).join("")}</ul>
+    </details>` : ""}
+  </div>`;
 }
 
 /* What has been taken back, and the way back to it.

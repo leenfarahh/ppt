@@ -339,14 +339,16 @@ def _apply_master_first(
         Path(tempfile.mkdtemp(prefix="formatting-tool-master-")) / deck_path.name
     )
 
-    # What the model reads off the picture, before anything is changed. Only
-    # what a layout should be; the review of the restyled deck comes later.
-    seen = _layout_picks(deck, spec, config)
+    # What the model reads off the picture, before anything is changed: which
+    # layout each slide belongs on, and what each shape on it IS. Both come
+    # from one render. The review of the restyled deck comes later.
+    seen, roles = _read_the_render(deck, spec, config)
 
     try:
         result = rebuild(
             config.master, deck_path, out, tuning=spec.guidelines.tuning,
             seen=seen, master_profile=master_profile, deck_profile=deck,
+            roles=roles,
         )
     except Exception as exc:
         log.error(
@@ -395,32 +397,55 @@ def _apply_master_first(
     }
 
 
-def _layout_picks(deck: DeckProfile, spec: MasterSpec, config: RunConfig):
-    """The model's reading of which layout each slide belongs on, or nothing.
+def _read_the_render(deck: DeckProfile, spec: MasterSpec, config: RunConfig):
+    """What the model reads off the slides before anything is changed.
+
+    TWO QUESTIONS AND ONE RENDER. Which layout a slide belongs on is about the
+    slide; what each of its shapes IS is about the boxes on it, and the
+    restyle needs both -- the first to choose the page, the second to decide
+    what may be moved onto it. Rendering a deck is most of the wait here, so
+    they share the one pass over it.
 
     Skipped without the AI layer or without a renderer, and the structural
-    matcher decides alone, which is what it did before this existed.
+    matcher decides alone with the file's own reading of the shapes, which is
+    what both did before this existed.
     """
     if not config.use_ai or config.ai_dry_run:
-        return []
+        return [], None
     images = _render(deck, config)
     if not images:
         log.info("no layout pass: %s", images.reason)
-        return []
+        return [], None
     try:
         from .ai.layout import choose_layouts  # noqa: PLC0415 - lazy
+        from .ai.roles import read_roles  # noqa: PLC0415 - lazy
 
-        return choose_layouts(
+        rendered = sorted(images.images.items())
+        picks = choose_layouts(
             spec,
-            sorted(images.images.items()),
+            rendered,
             model=config.ai.model,
             thinking_budget=config.ai.thinking_budget,
             api_key_env=config.ai.api_key_env,
             concurrency=config.ai_concurrency,
             master=config.master,
         )
+        roles = read_roles(
+            deck,
+            rendered,
+            model=config.ai.model,
+            thinking_budget=config.ai.thinking_budget,
+            api_key_env=config.ai.api_key_env,
+            concurrency=config.ai_concurrency,
+        )
+        return picks, (roles if roles else None)
     finally:
         images.cleanup()
+
+
+def _layout_picks(deck: DeckProfile, spec: MasterSpec, config: RunConfig):
+    """The layout half of `_read_the_render`, kept for callers that want it."""
+    return _read_the_render(deck, spec, config)[0]
 
 
 def _run_rule_layer(

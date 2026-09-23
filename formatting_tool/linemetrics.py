@@ -170,18 +170,21 @@ class PowerPointComMetrics:
 
         presentation = None
         try:
-            presentation = app.Presentations.Open(
+            presentation = powerpoint.retry(lambda: app.Presentations.Open(
                 str(self.deck_path.resolve()), True, False, False
-            )
+            ))
             for slide in _com_each(presentation.Slides):
                 number = int(slide.SlideNumber)
                 for shape in _com_each(slide.Shapes):
                     self._read(number, shape)
-            presentation.Close()
-            presentation = None
         finally:
+            # Closing is the only thing here with a consequence past this
+            # call, and it is not the metrics: the deck is open read-only and
+            # every line has already been read. Failing to close it would cost
+            # the next Open of the same path, so it is retried; failing to
+            # close it must not cost the reading, so it is not raised.
             if presentation is not None:
-                powerpoint.quietly(presentation.Close)
+                powerpoint.close(presentation)
 
     def _read(self, slide: int, shape: Any) -> None:
         """One shape's rendered lines, descending into groups.

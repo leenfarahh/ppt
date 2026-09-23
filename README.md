@@ -29,6 +29,12 @@ brand-book.pdf  OR  approved.pptx          [extract-guidelines, run once]
 master.pptx + messy.pptx                        [rebuild, when needed]
         |
         v
+  ai/layout.py      which layout each slide belongs on, read off its render
+  ai/roles.py       and what each shape on it IS: the subtitle, the source
+        |           line, the chart's parts, the drawn furniture. One render
+        |           answers both. A source or a chevron is never claimed into
+        |           a region, and never deleted with the copy it carried.
+        v
   rebuild/          open the master as the base file and recreate every slide
         |           on the layout it belongs to
         v
@@ -563,6 +569,71 @@ up here would apply something nobody asked for. One round, never a loop. On a re
 title overlapping the subtitle by 4 square inches. Only the rule layer runs:
 the AI layer costs money, and a second opinion on a file nobody has looked at
 yet is not worth it.
+
+**Nothing in the deck is left off the palette, whether or not a rule named
+it.** A rule reports what it can read, and a great deal of a deck's colour is
+in places no rule reads: a gradient's stops (`fill_hex` is None for a gradient,
+so no finding has ever named either colour), a drop shadow, a chart's series,
+a cell's borders, a bullet, a connector's line end. Each could be its own rule
+and the list would never be finished -- every version of the format adds
+another place a colour can sit. So `apply.palette` asks the only question with
+a complete answer: what does the file say, everywhere. Every `a:srgbClr` in
+every slide part, plus the chart and diagram parts the slides point at, plus
+the SVG parts the icons draw from.
+
+It runs LAST, after the fixes and after the rebuild, because a restyle
+re-resolves every theme-bound colour through the master's theme and a sweep
+run before it would be measuring colours that are about to be replaced. The
+colour plan decides wherever it has an opinion, so a colour the fixers moved to
+one entry does not land somewhere else here.
+
+Two things it will not touch. A colour already on the palette within tolerance,
+because rewriting a file for a change nobody can see is not a correction. And
+black and white, which are the two values a deck states for reasons that have
+nothing to do with a brand -- a shadow is black at 40% alpha, a table's default
+rules are black -- unless the palette itself holds a near-black or a near-white
+to stand in, which most brand palettes do. Snapping a drop shadow to the
+nearest accent is how it comes out maroon.
+
+**Colours that have to stay different from each other do.** A gradient's two
+stops are routinely nearest to one palette entry, and snapping each on its own
+turns a band into a flat rectangle -- visible at a glance, and the sweep's own
+doing. A chart's four series is the same problem one level up. So a `a:gsLst`
+and a `c:ser` are swept as SETS, assigned one to one nearest-first, the same
+way `apply.colorplan` assigns the deck's colours.
+
+**Then the copy is checked against what it ended up on.** `rules.contrast`
+measures the deck it was handed and `fix_text_contrast` corrects the pairings
+it named, and both are right about the file as it stood when the rules ran.
+What neither can see is the pairing the run itself created: a card snapped from
+a pale tint to a mid brand blue, with a white label on it that was fine before
+and is now at 2.1:1, and no finding for it because the colour it is measured
+against did not exist when anything was measured. The last thing to change a
+colour has to be the last thing to check one, so `apply.contrast` runs after
+the sweep.
+
+It changes the TEXT and never the fill. By then every colour in the deck is on
+the palette, and moving a fill would put it back to being a question about the
+brand; the text is the half with a free choice, and the choice is bounded the
+way `rules.contrast` bounds its own -- the colours the MASTER WRITES WORDS IN,
+and within those the one nearest what the text is already set in, so a pale
+grey caption becomes the darkest grey the master uses rather than black. A
+pairing no such colour can fix is reported rather than guessed at: a master
+that writes in three mid-tones has nothing readable on a mid-tone card, and the
+answer is to move the copy or recolour what it sits on. Both are a designer's.
+
+**A colour that means something is corrected too, and held apart while it
+is.** The model reads a slide's off-palette colours off the render and says
+whether they carry an encoding -- four cards each greyed except one ring, a RAG
+status column, a legend's three steps. That verdict used to hold the fix back,
+which answered the wrong question: what makes a legend a legend is not its
+particular greys, it is that its steps are DIFFERENT from each other, and
+leaving them alone left off-palette colour in a deck whose whole purpose is to
+be on the palette. So they are corrected like anything else, and the reading
+buys them DISTANCE -- the colours of one encoding are held `SCHEME_FLOOR` apart
+rather than merely at the tolerance, because "a reader can see at a glance that
+these are three steps" is a higher bar than "these are not the same colour".
+The finding is still never deleted; the schema has no way to dismiss one.
 
 **Which palette entry a colour becomes** is a different question from which is
 nearest, and treating them as one recoloured a red to an orange 33 delta-E
@@ -1144,6 +1215,51 @@ Two measurements this needs, and the second is not obvious:
   edge. Taken at its bounding box it covers everything, and every shape on
   every slide would read as sitting on artwork.
 
+**The model is asked what each shape IS, not only what each slide is.**
+`ai.layout` answers one question about the slide -- which layout it belongs on
+-- and `ai.roles` answers the one the restyle then runs into: of the boxes on
+this slide, which is the subtitle, which is the source line, which shapes are
+the chart, and which are drawn furniture. Both read the same render, so the
+roles cost no second pass over the deck.
+
+Three defects on one real consulting deck, each invisible in the file and
+obvious in a picture:
+
+  - **The source line printed under the title.** "Source: Oxford Economics,
+    Team analysis" is a full-width box, so it measures exactly like a
+    standfirst and was filled into the subtitle region at the top of the page.
+    Nothing in a `.pptx` says "this is small print".
+  - **The subtitle was whichever full-width box happened to be drawn over the
+    region**, which on a chart slide is the chart's own caption.
+  - **A chevron banner lost its chevron.** "1. What is the new ambition?" was
+    claimed into a body region and the shape it was drawn on was deleted with
+    the box the copy came out of. The words survived and the design did not.
+
+A shape the model calls `source`, `chart` or `decoration` is never a candidate
+for a region and is never deleted with one. A shape it calls `body` still is,
+because moving body copy into the master's regions is what applying a master
+IS. The subtitle region is filled from the one box named `subtitle` -- by name
+rather than by position, since on a messy deck the standfirst is nowhere near
+where the new master puts one -- or, where the slide was read and no standfirst
+was found, from nothing at all.
+
+**And the same words decide what PowerPoint's own matching may move.**
+Assigning a `CustomLayout` runs PowerPoint's placeholder matching, which reads
+a `p:ph` and nothing else: it knows a shape is "body placeholder 3" and has no
+idea the words in it are a footnote. So `pictures.pin_by_role` bakes the frame
+and the look of a protected placeholder into the shape and strips its `p:ph`
+before the swap -- a shape with no `p:ph` is not a placeholder, nothing matches
+it, and it stays where the designer drew it. Never a title and never body copy:
+those moving is the point of the exercise.
+
+**With no model, the file's own reading holds back the worst of it.**
+`pictures.reads_as_a_note` calls a box small print when it opens with a word
+that opens nothing else ("Source:", "Note:", and the Arabic equivalents), or
+when it is set small AND sits in the strip at the foot of the page. Either
+signal alone is ordinary -- a caption is small, a closing line is low -- so
+both are required, and a false positive costs an empty region where a false
+negative costs the footnote at the top of the page.
+
 **A single box drawn on top of a region is copied into it.** Runs need three or
 more boxes, and a subtitle is one. So a real deck's layout kept its subtitle
 region empty and showing its own prompt text, with the deck's subtitle drawn
@@ -1576,10 +1692,63 @@ broke the lines -- `breaks_mid_word` walks the copy alongside the lines the
 renderer produced, and a line that ends where the original has no space is a
 word broken in half.
 
+**A set is levelled against one of its own members, not against a
+statistic.** The first version took the median of the edge the set should
+share, on the reasoning that the shape being reported is the one that is out
+and a mean lets it drag the line towards itself. The reasoning is sound and the
+answer was wrong, because a median is an edge NO SHAPE ON THE SLIDE ACTUALLY
+HAS: three column headings at 2.36, 2.36 and 2.35in are levelled onto 2.36in,
+which is fine, and a set that straddles something is levelled onto a line
+between its halves, which is not. On a real deck that line sat above the
+heading band and walked the whole left column up into the title.
+
+So the anchor is the first box, read the way the set is read: the leftmost
+member of a row being levelled, the topmost of a column being lined up.
+`_lines` has already split the set into the rows or columns it really holds, so
+a grid anchors each of its rows on that row's own first card. The line a set is
+brought onto is now one a designer can point at.
+
+**And no alignment may bury a neighbour it was clear of.** A set is levelled
+against its own members and nothing in that arithmetic knows what else is on
+the slide, which is the other half of the same failure. `qafix._would_land_on`
+compares the shape's rectangle where it is, its rectangle where it would go,
+and every other top-level shape: arriving on top of something it is currently
+clear of refuses the move and names what it would have landed on. An overlap it
+ARRIVED with is left allowed -- a label on a band is over the band by design,
+and refusing that would refuse every alignment inside a component.
+
+**A chart is not a diagram, and the model says which is which.** A bar chart is
+a run of like-sized boxes on a regular grid with one of them a different
+height, which is the literal definition every arrangement here matches on --
+and every correction they would make to it changes what the picture says the
+numbers are. No reading of the file can tell that run from a row of cards.
+
+So the per-slide answer now carries `charts`: the ref of every shape that is
+part of a data graphic, its plot, bars, axis labels, value labels, legend and
+gridlines. Anything named there, and anything sitting inside one of their
+rectangles whether or not it was named, gets no action, no proposal and no
+place in an arrangement -- an arrangement that names one is dropped WHOLE
+rather than trimmed, because a set with a chart's parts taken out of it is a
+different finding nobody made. The deterministic rules that move a set
+(`space.repeat_out_of_line`, `space.series_*`, `space.matrix_gutter` and the
+rest) are held off the same shapes. The finding survives as a note: "this
+chart's labels are too small" is real, and a designer changes it in the chart
+rather than by dragging a shape.
+
+A process flow, a matrix, a pyramid, a row of cards, a timeline and an org
+chart are NOT charts -- they are drawn arrangements and they are exactly what
+these corrections are for. What makes something a chart is that its shapes
+encode values: an axis, a scale, a legend keyed to series, labels that are
+quantities.
+
 **`align` is the one correction the model does not ask for.** It says which
 slides disagree; arithmetic says where the shape belongs -- the median position
 of the title across the deck, median rather than mean so the slide being
-reported cannot drag the target towards itself. Titles only: a title is the one
+reported cannot drag the target towards itself. The median is right HERE and
+wrong within a slide, and the difference is what is being measured: across a
+deck the population is thirty titles and the median is where most of them sit,
+which is a real position; within a slide the population is three cards and the
+median is a line none of them is on. See the anchor note above. Titles only: a title is the one
 shape a deck has on nearly every slide in a role this tool can identify, so
 "where the rest of the deck puts it" means something. For a logo that drifts
 there is no such set, and the finding stays a task. A cross-slide mismatch

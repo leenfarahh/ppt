@@ -262,11 +262,17 @@ class ApplyResult:
     # One entry per deleted production note, saying whether its text made it
     # into a PowerPoint comment. See apply.notes.
     notes_copied: list[Any] = field(default_factory=list)
-    # Colour findings left alone because the model read the colours as
-    # deliberate: (issue, the ColorIntent that spared it). Reported, never
-    # silent -- a correction that does not happen has to be as visible as one
-    # that does, or the designer is reading a list that lies by omission.
+    # Colour findings the model read as carrying meaning: (issue, the
+    # ColorIntent that named them). They ARE corrected -- being on the palette
+    # is the point of the exercise -- and what the reading buys them is being
+    # held clearly apart from each other on the way. Reported either way: a
+    # designer who is told a legend was recoloured can check that it still
+    # reads as a legend.
     kept_colors: list = field(default_factory=list)
+    # The last two passes over the written deck, which have no findings behind
+    # them and so nothing else to be reported under. See `_finish_the_colors`.
+    palette_sweep: Optional[Any] = None
+    contrast_pass: Optional[Any] = None
 
     # The findings held back on this run, and the ids asked for that matched
     # nothing. See `apply_fixes(undone=...)`: undoing a fix is replaying the
@@ -328,6 +334,7 @@ def apply_fixes(
     spec: Optional[Any] = None,
     undone: Optional[Iterable[str]] = None,
     layout_choices: Optional[Sequence[Any]] = None,
+    shape_roles: Optional[Any] = None,
     color_intents: Optional[Sequence[Any]] = None,
 ) -> ApplyResult:
     """Apply the selected findings to `deck` and write the result to `out`.
@@ -384,11 +391,10 @@ def apply_fixes(
         raise ApplyError(f"deck not found: {deck}")
 
     wanted = _wanted(issues, selected)
-    # Colour fixes the model read as deliberate. Filtered out of `wanted`
-    # rather than added to `held`, because `held` means "the designer took
-    # this back" and drives the undo list in the page; these were never
-    # applied and there is nothing to take back.
-    kept, wanted = _keep_intentional_colors(wanted, color_intents)
+    # The colours the model read as a system. NO LONGER A REASON TO LEAVE ONE
+    # OFF THE PALETTE -- see `_meaningful_colors` -- so `wanted` comes back
+    # whole and what is kept is the DISTINCTION between them.
+    kept, schemes = _meaningful_colors(wanted, color_intents)
     held = list(dict.fromkeys(str(key) for key in (undone or ())))
     # The shapes a change has been taken back on. Held back BY SHAPE as well as
     # by id, because the second round would otherwise put the change straight
@@ -432,7 +438,7 @@ def apply_fixes(
         # Built from `wanted` and `issues` both: what to recolour, and what
         # stays as it is and therefore constrains the recolouring.
         color_plan=_color_plan_for(
-            wanted, issues, spec, tuning, tolerances, presentation
+            wanted, issues, spec, tuning, tolerances, presentation, schemes
         ),
     )
     result = ApplyResult(deck=deck.name, output=out)
@@ -474,7 +480,22 @@ def apply_fixes(
     )
 
     if master is not None:
-        result.rebuilt = _rebuild_in_place(master, out, tuning, layout_choices)
+        result.rebuilt = _rebuild_in_place(
+            master, out, tuning, layout_choices, shape_roles
+        )
+
+    # LAST, AND IN THIS ORDER. The palette sweep is what makes "nothing in
+    # this deck is off the palette" true rather than "nothing a rule reported
+    # is": a gradient stop, a shadow, a chart's series and a cell border are
+    # colours no finding has ever named. The contrast pass then measures the
+    # deck as it finally stands, because the sweep has just changed what the
+    # copy sits on and it is the only thing that can see the result.
+    #
+    # After the rebuild, not before it, for the same reason the pipeline puts
+    # the rebuild first: a restyle re-resolves every theme-bound colour in the
+    # file through the master's theme, so a sweep run before it would be
+    # measuring colours that are about to be replaced.
+    _finish_the_colors(out, spec, context.color_plan, tolerances, result)
 
     result.before = list(issues)
     _recheck(result, spec)
@@ -1051,6 +1072,7 @@ def _color_plan_for(
     tuning: Optional[RuleTuning],
     tolerances: Optional[Tolerances],
     presentation: Any = None,
+    schemes: Optional[Sequence[set[str]]] = None,
 ) -> Optional[Any]:
     """Plan every off-palette colour together, or None with no palette to plan.
 
@@ -1084,6 +1106,7 @@ def _color_plan_for(
         tolerance=tol,
         limit=tol * (tuning or RuleTuning()).suggestion_factor,
         inks=_inks_on_fills(presentation),
+        schemes=schemes,
     )
 
 
@@ -1368,28 +1391,39 @@ def _walk(shapes: Any) -> Iterable[Any]:
 _COLOUR_WORK = frozenset({Category.COLOR})
 
 
-def _keep_intentional_colors(
+def _meaningful_colors(
     wanted: list[Issue],
     intents: Optional[Sequence[Any]],
-) -> tuple[list, list[Issue]]:
-    """Split off the colour fixes the model read as meaning something.
+) -> tuple[list, list[set[str]]]:
+    """The colour systems the model read on a slide, as sets to keep apart.
 
-    Returns the pairs spared and the findings still to apply.
+    WHAT THIS USED TO DO AND WHY IT STOPPED. A "keep" verdict used to remove
+    the colour fix from the run: the model said the greens and tans on this
+    slide mean something, so the tool left them alone. That answered the wrong
+    question. What makes a legend a legend is not its particular greens, it is
+    that its three steps are three DIFFERENT colours -- and leaving them alone
+    left three off-palette colours in a deck whose whole purpose is to be on
+    the palette, which is the complaint this tool exists to answer.
 
-    Narrow on purpose, in three ways, because this is the one place a model's
-    opinion stops a proven finding being corrected:
+    `apply.colorplan` already maps colours one to one and keeps distinct ones
+    distinct, so the system survives being put on the palette without anything
+    having to recognise what it meant. What the model's reading adds on top of
+    that is which colours are a system TOGETHER, and the plan can hold those
+    further apart than the ordinary tolerance -- so a scheme that reads as
+    three steps still reads as three steps after the move, rather than as
+    three entries that merely happen not to be identical.
 
-    - Only colour categories. A slide whose greys are deliberate still has its
-      text reflowed and its shapes aligned.
-    - Only the shapes named. `shape_ids` is how a slide carries a real colour
-      system AND a heading somebody typed the wrong blue into; an empty list
-      falls back to the whole slide, which is blunter and is the model saying
-      the system is the slide.
-    - Only where a verdict exists. No verdict is not a keep. The default is
-      and stays "correct it".
+    Returns the intents, for the report -- a designer is told which colours
+    were read as an encoding and where they went -- and the sets of colours
+    that must stay clearly apart.
+
+    Narrow in the same two ways it always was. Only colour categories: a slide
+    whose greys are deliberate still has its text reflowed and its shapes
+    aligned. Only the shapes named, falling back to the slide where the model
+    named none.
     """
     if not intents:
-        return [], wanted
+        return [], []
 
     by_slide: dict[int, Any] = {}
     for intent in intents:
@@ -1397,30 +1431,40 @@ def _keep_intentional_colors(
             by_slide[int(intent.slide)] = intent
 
     if not by_slide:
-        return [], wanted
+        return [], []
+
+    from .fixers import _hex_of  # noqa: PLC0415 - one parser, not two
 
     kept: list = []
-    remaining: list[Issue] = []
+    grouped: dict[int, set[str]] = {}
     for issue in wanted:
         intent = by_slide.get(issue.slide) if issue.slide is not None else None
         if (
-            intent is not None
-            and issue.category in _COLOUR_WORK
-            and (not intent.shape_ids or issue.shape_id in set(intent.shape_ids))
+            intent is None
+            or issue.category not in _COLOUR_WORK
+            or (intent.shape_ids and issue.shape_id not in set(intent.shape_ids))
         ):
-            kept.append((issue, intent))
             continue
-        remaining.append(issue)
+        kept.append((issue, intent))
+        hexed = _hex_of(issue.found)
+        if hexed:
+            grouped.setdefault(int(issue.slide), set()).add(hexed)
 
+    # A set of one is not a system. One colour on a slide has nothing to stay
+    # distinct from, and treating it as a scheme would raise the bar on a
+    # colour that is simply the wrong blue.
+    schemes = [group for group in grouped.values() if len(group) > 1]
     if kept:
         log.info(
-            "left %d colour fix(es) alone on %d slide(s): the colours read as "
-            "deliberate (%s)",
-            len(kept),
+            "the model read the colours on %d slide(s) as an encoding (%s); "
+            "they are put on the palette together, and %d set(s) are held "
+            "clearly apart from each other",
             len({i.slide for i, _ in kept}),
-            "; ".join(sorted({t.scheme for _i, t in kept if t.scheme})) or "no scheme named",
+            "; ".join(sorted({t.scheme for _i, t in kept if t.scheme}))
+            or "no scheme named",
+            len(schemes),
         )
-    return kept, remaining
+    return kept, schemes
 
 
 def _wanted(
@@ -1447,11 +1491,65 @@ def _wanted(
     return [by_id[key] for key in wanted]
 
 
+def _finish_the_colors(
+    out: Path,
+    spec: Optional[Any],
+    plan: Optional[Any],
+    tolerances: Optional[Tolerances],
+    result: "ApplyResult",
+) -> None:
+    """Put every colour left in the deck on the palette, then make it readable.
+
+    TWO PASSES BECAUSE THE SECOND DEPENDS ON THE FIRST. The sweep is what
+    closes the gap between "no finding names an off-palette colour" and "there
+    is no off-palette colour": a gradient's stops, a shadow, a chart's series,
+    a cell's borders and a bullet's colour are all places a colour sits that no
+    rule has ever read. Sweeping them changes what a good deal of the copy
+    SITS ON, and the only pass that can judge the result is one that runs
+    afterwards -- which is what `apply.contrast` is.
+
+    Both are best effort and neither is allowed to fail the run. A deck that
+    reaches here has had every fix the designer ticked applied to it and, where
+    they asked for one, has been restyled onto the master; losing that to a
+    sweep that could not parse a chart part would be the wrong trade by a wide
+    margin.
+    """
+    palette = getattr(spec, "palette", None)
+    if not palette:
+        return
+    tol = (tolerances or Tolerances()).color_delta_e
+
+    try:
+        from .palette import sweep_to_palette  # noqa: PLC0415 - lazy
+
+        result.palette_sweep = sweep_to_palette(out, dict(palette), tol, plan)
+    except Exception:
+        log.warning(
+            "could not sweep the remaining colours onto the palette; the deck "
+            "is as the fixes left it", exc_info=True,
+        )
+
+    try:
+        from ..rules.colors import master_text_colors  # noqa: PLC0415 - lazy
+        from .contrast import enforce_contrast  # noqa: PLC0415 - lazy
+
+        inks = master_text_colors(spec)
+        if inks:
+            result.contrast_pass = enforce_contrast(out, inks, tol)
+    except Exception:
+        log.warning(
+            "could not check the deck's contrast after recolouring; the "
+            "colours stand and the report says what was measured before",
+            exc_info=True,
+        )
+
+
 def _rebuild_in_place(
     master: str | Path,
     target: Path,
     tuning: Optional[RuleTuning],
     layout_choices: Optional[Sequence[Any]] = None,
+    shape_roles: Optional[Any] = None,
 ) -> Any:
     """Rebuild the corrected deck onto the master, over the same output path.
 
@@ -1464,6 +1562,11 @@ def _rebuild_in_place(
     structural matcher to decide alone, which is what this did before: the
     model pass was wired into `validate --apply-master` and into nothing else,
     so the rebuild a designer actually runs from the page never saw it.
+
+    `shape_roles` is what the same layer read off the same renders about the
+    boxes rather than the pages: which is the subtitle, which is a source
+    line, which shapes are a chart. It decides what the restyle may claim into
+    a region and what has to survive untouched -- see `rebuild.builder`.
     """
     from ..rebuild import rebuild  # noqa: PLC0415 - avoids a circular import
 
@@ -1472,7 +1575,8 @@ def _rebuild_in_place(
     result = None
     try:
         result = rebuild(
-            master, staged, target, tuning=tuning, seen=layout_choices or None
+            master, staged, target, tuning=tuning, seen=layout_choices or None,
+            roles=shape_roles,
         )
         return result
     finally:

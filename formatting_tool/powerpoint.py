@@ -239,8 +239,8 @@ class _PowerPointHost:
         finally:
             # The only quit in the module, and only for an instance we started.
             if app is not None and ours:
-                quietly(app.Quit)
-            quietly(pythoncom.CoUninitialize)
+                quietly(lambda: app.Quit())
+            quietly(lambda: pythoncom.CoUninitialize())
 
     def _drain(self, exc: Exception) -> None:
         while True:
@@ -256,11 +256,81 @@ class _PowerPointHost:
 
 
 def quietly(call) -> None:
+    """Run a COM call for its side effect and swallow whatever it does.
+
+    Pass a lambda, never a bound method. `quietly(deck.Close)` looks up the
+    member before this function is entered, and against PowerPoint that lookup
+    is itself a COM call that can fail -- so the failure this was written to
+    swallow escapes past it. `quietly(lambda: deck.Close())` does not.
+    """
     try:
         call()
     except Exception:
         log.debug("ignoring an error while shutting PowerPoint down", exc_info=True)
 
+
+# PowerPoint rejects calls while it is busy (RPC_E_CALL_REJECTED /
+# RPC_E_SERVERCALL_RETRYLATER). Transient, not a real failure: a call fails
+# once and the identical call passes straight after. Left unhandled, a slide
+# is silently lost to a race.
+_TRANSIENT = (-2147418111, -2147417846)
+_ATTEMPTS = 4
+_BACKOFF_SEC = 0.4
+
+
+def _transient(exc: BaseException) -> bool:
+    """Whether this is PowerPoint being busy rather than a real fault.
+
+    Two shapes, and the second is the one that misleads. A rejected call
+    normally arrives as a com_error carrying one of the HRESULTs above. A
+    rejected *name lookup* does not: win32com's dynamic dispatch asks
+    GetIDsOfNames for the member, swallows whatever comes back and reports no
+    such attribute. What that reads like is `AttributeError: Open.Close` -- a
+    Presentation that answered `.Slides` a moment ago and now appears not to
+    have `.Close` -- which sends whoever sees it looking for a wrong object
+    rather than a busy server. Same cause as the wait in `_ready`, same cure.
+    """
+    if isinstance(exc, AttributeError):
+        return True
+    args = getattr(exc, "args", ())
+    return bool(args) and args[0] in _TRANSIENT
+
+
+def retry(call, attempts: int = _ATTEMPTS):
+    """Run a COM call, retrying only while PowerPoint is busy.
+
+    `call` is re-run whole, so pass a lambda rather than a bound method: the
+    member lookup is itself a COM call and is itself one of the things that
+    fails. Any other failure raises immediately, because retrying a real error
+    only delays it.
+    """
+    last: Optional[BaseException] = None
+    for attempt in range(attempts):
+        try:
+            return call()
+        except Exception as exc:
+            if not _transient(exc):
+                raise
+            last = exc
+            time.sleep(_BACKOFF_SEC * (attempt + 1))
+    raise last          # type: ignore[misc]
+
+
+def close(presentation) -> bool:
+    """Close a deck, waiting out a busy PowerPoint, and say whether it closed.
+
+    Not housekeeping. A deck left open turns the next Open of the same path
+    into "PowerPoint could not open the file", so a close that did not happen
+    is charged to whatever runs next rather than to whoever left it. Callers
+    unwinding from another error ignore the answer, because that error is the
+    interesting one; callers with nothing else wrong read it.
+    """
+    try:
+        retry(lambda: presentation.Close())
+        return True
+    except Exception:
+        log.debug("could not close a presentation", exc_info=True)
+        return False
 
 
 def run(work, timeout: Optional[float] = None):

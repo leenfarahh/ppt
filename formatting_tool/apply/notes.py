@@ -151,9 +151,9 @@ def _write_comments(
             except Exception:
                 log.debug("a comment would not go on slide %d", comment.slide,
                           exc_info=True)
-        _retry(presentation.Save)
+        _retry(lambda: presentation.Save())
     finally:
-        powerpoint.quietly(presentation.Close)
+        powerpoint.close(presentation)
     return written
 
 
@@ -229,7 +229,7 @@ def _write(app: Any, deck: Path, notes: Sequence[NoteCopy]) -> list[CopyResult]:
                 f"its text was copied into a PowerPoint comment on slide "
                 f"{note.slide}",
             ))
-        _retry(presentation.Save)
+        _retry(lambda: presentation.Save())
     finally:
-        powerpoint.quietly(presentation.Close)
+        powerpoint.close(presentation)
     return results

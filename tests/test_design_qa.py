@@ -1328,30 +1328,29 @@ def test_naming_the_row_and_naming_the_grid_do_the_same_thing():
 
 def test_the_same_split_happens_on_the_other_axis():
     """Aligning left edges is about a column, so the set splits into columns.
-    The left-hand one is already square and stays put; only the right-hand
-    one, which is out by 0.3in, is touched."""
+    The left-hand one is already square and stays put; in the right-hand one
+    the first box is the anchor, so it keeps its 7.0in and the 7.3in below it
+    is the only shape that moves."""
     report = _arranged(
         _row((1.0, 1.0, 2.0, 1.0), (1.0, 3.0, 2.0, 1.0),
              (7.0, 1.0, 2.0, 1.0), (7.3, 3.0, 2.0, 1.0)),
         "align_left", 0, 1, 2, 3,
     )
     assert {s.shape_id: s.left_in
-            for s in steps_for(report, ["slide:1:0"])} == {102: 7.15, 103: 7.15}
+            for s in steps_for(report, ["slide:1:0"])} == {103: 7.0}
 
 
-def test_two_shapes_out_of_line_each_move_half_way():
-    """A deliberate consequence of the median, not an accident of it, and the
-    case is worth pinning because it is the one where the median has no
-    majority to find. With four shapes and one out, three agreeing say where
-    the line is and only the fourth moves. With two, there is no way to tell
-    which of them is the one that is wrong -- so neither is called wrong, they
-    meet in the middle, and the complaint is answered without this having to
-    guess which heading a designer meant to keep."""
+def test_two_shapes_out_of_line_join_the_first_of_them():
+    """THE ANCHOR IS A BOX ON THE SLIDE, NOT A STATISTIC. The median this used
+    to take put both shapes on a line neither of them was drawn at, which is
+    the behaviour that walked a levelled row into the title above it: the line
+    a set is brought onto has to be one a designer can point at. So the first
+    box along the row keeps its place and the rest join it."""
     report = _arranged(
         _row((2.0, 1.6, 3.0, 0.5), (8.0, 1.9, 3.0, 0.5)), "align_top", 0, 1)
 
     assert {s.shape_id: s.top_in
-            for s in steps_for(report, ["slide:1:0"])} == {100: 1.75, 101: 1.75}
+            for s in steps_for(report, ["slide:1:0"])} == {101: 1.6}
 
 
 def test_distributing_a_grid_spaces_each_row_on_its_own():
@@ -1505,11 +1504,11 @@ def test_two_corrections_cannot_both_decide_where_one_shape_sits():
 
     shape, result, settled = FakeShape(), QaFixResult(), set()
     spaced = Step(op="align", slide=1, shape_id=5, shape="Oval 1", left_in=2.0)
-    _align(shape, spaced, result, settled)
+    _align(None, shape, spaced, result, settled)
     assert shape.Left == 144.0 and result.applied
 
     squared = Step(op="align", slide=1, shape_id=5, shape="Oval 1", left_in=3.0)
-    _align(shape, squared, result, settled)
+    _align(None, shape, squared, result, settled)
     assert shape.Left == 144.0                      # the first answer stands
     assert "already settled" in result.skipped[0].reason
     assert "across" in result.skipped[0].reason
@@ -1533,10 +1532,10 @@ def test_two_slides_do_not_share_one_shapes_identity():
     result, settled = QaFixResult(), set()
     first, second = FakeShape(), FakeShape()
 
-    _align(first, Step(op="align", slide=1, shape_id=2, shape="Oval 1",
-                       path=(1,), top_in=1.5), result, settled)
-    _align(second, Step(op="align", slide=7, shape_id=2, shape="Oval 1",
-                        path=(1,), top_in=1.5), result, settled)
+    _align(None, first, Step(op="align", slide=1, shape_id=2, shape="Oval 1",
+                             path=(1,), top_in=1.5), result, settled)
+    _align(None, second, Step(op="align", slide=7, shape_id=2, shape="Oval 1",
+                              path=(1,), top_in=1.5), result, settled)
 
     assert not result.skipped, [s.reason for s in result.skipped]
     assert first.Top == second.Top == 108.0
@@ -1552,10 +1551,10 @@ def test_settling_one_axis_leaves_the_other_free():
         Left, Top = 72.0, 144.0
 
     shape, result, settled = FakeShape(), QaFixResult(), set()
-    _align(shape, Step(op="align", slide=1, shape_id=5, shape="Oval 1",
-                       top_in=1.5), result, settled)
-    _align(shape, Step(op="align", slide=1, shape_id=5, shape="Oval 1",
-                       left_in=2.0), result, settled)
+    _align(None, shape, Step(op="align", slide=1, shape_id=5, shape="Oval 1",
+                             top_in=1.5), result, settled)
+    _align(None, shape, Step(op="align", slide=1, shape_id=5, shape="Oval 1",
+                             left_in=2.0), result, settled)
 
     assert not result.skipped
     assert (shape.Left, shape.Top) == (144.0, 108.0)
@@ -2112,3 +2111,231 @@ def test_the_master_is_what_makes_the_report_say_it_has_one():
     assert review_deck(
         Path("deck.pptx"), [], profile=profile, spec=spec
     ).has_master is True
+
+
+# --------------------------------------------------------------------------- #
+# A chart is not a diagram
+# --------------------------------------------------------------------------- #
+#
+# A bar chart is a run of like-sized boxes on a regular grid with one of them a
+# different height, which is the literal definition every arrangement here
+# matches on -- and every correction they would make to it changes what the
+# picture says the numbers are. No reading of the file can tell that run from a
+# row of cards. The model looking at the render can, and `charts` is where it
+# says so.
+
+
+def _listed(refs):
+    """The ref map `review_from_response` reads, from (id, box) pairs."""
+    from formatting_tool.ai.designqa import Listed
+    from formatting_tool.models import Geometry, ShapeProfile
+
+    out = {}
+    for index, (shape_id, box) in enumerate(refs.items(), start=1):
+        left, top, width, height = box
+        out[shape_id] = Listed(
+            shape=ShapeProfile(
+                shape_id=index,
+                name=shape_id,
+                shape_type="AUTO_SHAPE",
+                geometry=Geometry(
+                    left_in=left, top_in=top, width_in=width, height_in=height
+                ),
+            ),
+            path=(index,),
+        )
+    return out
+
+
+def _chart_slide():
+    """A chart across the left half, and a caption sitting beside it."""
+    return _listed({
+        "s1": (1.0, 2.0, 6.0, 4.0),     # the plot
+        "s2": (1.2, 5.4, 0.8, 0.3),     # a value label inside it
+        "s3": (2.4, 5.4, 0.8, 0.3),     # another
+        "s4": (8.0, 2.0, 4.0, 0.4),     # a caption, outside it
+    })
+
+
+def test_a_shape_inside_a_chart_gets_no_action() -> None:
+    """A bar is a certain height because a number is a certain size, so
+    stepping its type or centring it makes the picture state something other
+    than the data."""
+    from formatting_tool.ai.designqa import review_from_response
+
+    review = review_from_response(
+        {
+            "charts": ["s1"],
+            "shapes": [
+                {"shape": "s2", "status": "issue", "issue": "too_small",
+                 "action": "grow", "note": "the value labels are tiny",
+                 "task": "set the value labels larger", "fix": None},
+            ],
+            "slide_issues": [],
+        },
+        1, _chart_slide(), (13.333, 7.5),
+    )
+
+    [verdict] = review.verdicts
+    assert verdict.action == "none"
+    # The finding is kept: "this chart's labels are too small" is real, and
+    # a designer changes it in the chart rather than by dragging a shape.
+    assert verdict.status == "issue" and verdict.task
+
+
+def test_a_shape_outside_the_chart_is_corrected_as_usual() -> None:
+    from formatting_tool.ai.designqa import review_from_response
+
+    review = review_from_response(
+        {
+            "charts": ["s1"],
+            "shapes": [
+                {"shape": "s4", "status": "issue", "issue": "too_small",
+                 "action": "grow", "note": "the caption is tiny",
+                 "task": "set the caption larger", "fix": None},
+            ],
+            "slide_issues": [],
+        },
+        1, _chart_slide(), (13.333, 7.5),
+    )
+
+    assert review.verdicts[0].action == "grow"
+
+
+def test_an_arrangement_naming_a_charts_parts_is_dropped_whole() -> None:
+    """Not trimmed. A set with a chart's parts taken out of it is not a
+    smaller version of the finding, it is a different finding nobody made --
+    so the arrangement goes and the sentence stays."""
+    from formatting_tool.ai.designqa import review_from_response
+
+    review = review_from_response(
+        {
+            "charts": ["s1"],
+            "shapes": [],
+            "slide_issues": [{
+                "note": "the value labels do not line up",
+                "task": "level the value labels",
+                "arrangement": "align_top",
+                "shapes": ["s2", "s3"],
+            }],
+        },
+        1, _chart_slide(), (13.333, 7.5),
+    )
+
+    [issue] = review.slide_issues
+    assert issue.arrangement == "" and issue.members == ()
+    assert issue.task == "level the value labels"
+
+
+def test_a_slide_with_no_chart_on_it_is_unchanged() -> None:
+    """Most slides. An empty `charts` has to cost nothing."""
+    from formatting_tool.ai.designqa import review_from_response
+
+    review = review_from_response(
+        {
+            "charts": [],
+            "shapes": [],
+            "slide_issues": [{
+                "note": "the cards do not line up",
+                "task": "level the cards",
+                "arrangement": "align_top",
+                "shapes": ["s2", "s3"],
+            }],
+        },
+        1, _chart_slide(), (13.333, 7.5),
+    )
+
+    [issue] = review.slide_issues
+    assert issue.arrangement == "align_top" and len(issue.members) == 2
+
+
+def test_the_chart_regions_survive_a_truncated_answer() -> None:
+    """`charts` is what holds the corrections off a data graphic, so an answer
+    cut off after it would otherwise keep every verdict and lose the one thing
+    stopping them being applied to a bar chart."""
+    from formatting_tool.ai.gemini import salvage_list
+
+    text = '{"charts": ["s1", "s2"], "shapes": [{"shape": "s4"'
+    assert salvage_list(text, "charts") == ["s1", "s2"]
+
+
+# --------------------------------------------------------------------------- #
+# An alignment that would bury a neighbour
+# --------------------------------------------------------------------------- #
+
+class _Neighbour:
+    """A shape as COM reports one, in points."""
+
+    def __init__(self, shape_id, left, top, width, height, name="Shape"):
+        self.Id = shape_id
+        self.Left, self.Top = float(left), float(top)
+        self.Width, self.Height = float(width), float(height)
+        self.Name = name
+
+
+class _Slide:
+    def __init__(self, *shapes):
+        self.Shapes = _Collection(shapes)
+
+
+class _Collection:
+    def __init__(self, items):
+        self._items = list(items)
+        self.Count = len(self._items)
+
+    def __call__(self, index):
+        return self._items[index - 1]
+
+
+def test_an_alignment_that_lands_on_the_title_is_refused() -> None:
+    """The defect that drove the anchor change and the guard both. A set is
+    levelled against its own members and nothing in that arithmetic knows what
+    else is on the slide, so a row of column headings brought onto the line of
+    the first of them is free to arrive on top of the title above it."""
+    from formatting_tool.apply.qafix import QaFixResult, Step, _align
+
+    title = _Neighbour(1, 60, 60, 600, 60, "Title 1")
+    heading = _Neighbour(2, 60, 170, 200, 30, "Rectangle 7")
+    slide = _Slide(title, heading)
+    result, settled = QaFixResult(), set()
+
+    # 1.0in down is 72pt, squarely inside the title's band.
+    _align(slide, heading, Step(op="align", slide=1, shape_id=2,
+                                shape="Rectangle 7", path=(2,), top_in=1.0),
+           result, settled)
+
+    assert heading.Top == 170.0, "the heading moved into the title"
+    assert "Title 1" in result.skipped[0].reason
+
+
+def test_an_overlap_it_arrived_with_is_not_this_moves_doing() -> None:
+    """A label on a band is over the band by design, and refusing that would
+    refuse every alignment inside a component."""
+    from formatting_tool.apply.qafix import QaFixResult, Step, _align
+
+    band = _Neighbour(1, 60, 160, 600, 60, "Band")
+    label = _Neighbour(2, 70, 170, 200, 30, "Label")
+    slide = _Slide(band, label)
+    result, settled = QaFixResult(), set()
+
+    _align(slide, label, Step(op="align", slide=1, shape_id=2, shape="Label",
+                              path=(2,), top_in=2.5), result, settled)
+
+    assert label.Top == 180.0
+    assert result.applied and not result.skipped
+
+
+def test_an_alignment_clear_of_everything_still_happens() -> None:
+    from formatting_tool.apply.qafix import QaFixResult, Step, _align
+
+    other = _Neighbour(1, 600, 60, 100, 60, "Elsewhere")
+    moving = _Neighbour(2, 60, 170, 200, 30, "Rectangle 7")
+    slide = _Slide(other, moving)
+    result, settled = QaFixResult(), set()
+
+    _align(slide, moving, Step(op="align", slide=1, shape_id=2,
+                               shape="Rectangle 7", path=(2,), top_in=2.5),
+           result, settled)
+
+    assert moving.Top == 180.0
+    assert result.applied and not result.skipped

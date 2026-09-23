@@ -48,7 +48,6 @@ from __future__ import annotations
 import logging
 import shutil
 import tempfile
-import time
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -59,14 +58,6 @@ from ..models import normalize_layout_name
 from . import pictures, quarantine, rtl
 
 log = logging.getLogger(__name__)
-
-# PowerPoint rejects calls while it is busy (RPC_E_CALL_REJECTED /
-# SERVERCALL_RETRYLATER). Transient, not a real failure: a call fails once and
-# the identical call passes straight after. Left unhandled, a slide is silently
-# lost to a race.
-_TRANSIENT = (-2147418111, -2147417846)
-_ATTEMPTS = 4
-_BACKOFF_SEC = 0.4
 
 # COM failures restated as something a person can do. The raw tuple names the
 # HRESULT and nothing else, so whoever reads it has no next step.
@@ -185,6 +176,7 @@ def apply_master(
     plans: dict[int, str],
     mirror: bool = False,
     doubtful: Optional[Collection[int]] = None,
+    roles: Optional[Any] = None,
 ) -> MasterApplyResult:
     """Restyle `deck` onto `master`'s layouts and write the result to `out`.
 
@@ -192,6 +184,12 @@ def apply_master(
     Taken as DECIDED rather than re-derived here, so the layouts somebody
     approved are the ones applied; re-planning inside the apply would silently
     discard every pick. `rebuild.matcher` is what makes those picks.
+
+    `roles` is `ai.roles.RolesResult`: what the model said each shape on each
+    slide IS. It decides which placeholders are pinned where they were drawn
+    before the swap -- a source line, a chart's parts, drawn furniture -- so
+    PowerPoint's own placeholder matching cannot re-place them into a region
+    meant for something else. See `pictures.pin_by_role`.
 
     `doubtful` is the slides the matcher was guessing about. Those and only
     those are measured before and after the swap, and one the restyle wrecked
@@ -212,7 +210,9 @@ def apply_master(
         )
     try:
         return powerpoint.run(
-            lambda app: _drive(app, deck, master, out, plans, mirror, doubtful)
+            lambda app: _drive(
+                app, deck, master, out, plans, mirror, doubtful, roles
+            )
         )
     except Exception as exc:
         return MasterApplyResult(fatal=advice(exc))
@@ -256,22 +256,10 @@ def _code(args) -> Optional[int]:
     return args[0]
 
 
-def _retry(call):
-    """Run a COM call, retrying only the transient busy/rejected errors.
-
-    Any other failure raises immediately: retrying a real error delays it.
-    """
-    last: Optional[Exception] = None
-    for attempt in range(_ATTEMPTS):
-        try:
-            return call()
-        except Exception as exc:
-            args = getattr(exc, "args", ())
-            if not (args and args[0] in _TRANSIENT):
-                raise
-            last = exc
-            time.sleep(_BACKOFF_SEC * (attempt + 1))
-    raise last          # type: ignore[misc]
+# One definition of "PowerPoint was busy, ask again", shared with everything
+# else that drives it. Kept under the old name because this module and the
+# ones that borrow it call it on nearly every COM call.
+_retry = powerpoint.retry
 
 
 def _drive(
@@ -282,6 +270,7 @@ def _drive(
     plans: dict[int, str],
     mirror: bool = False,
     doubtful: Optional[Collection[int]] = None,
+    roles: Optional[Any] = None,
 ):
     """The whole conversation with PowerPoint, on the thread that owns it."""
     result = MasterApplyResult()
@@ -299,7 +288,7 @@ def _drive(
     # through automation is what makes it work for a `a:custGeom` mask, which
     # COM cannot describe at all -- see `rebuild.pictures`. A no-op on a deck
     # with no picture placeholders, which then reaches PowerPoint untouched.
-    pictures.freeze_file(working)
+    pictures.freeze_file(working, roles)
 
     presentation = None
     try:
@@ -353,12 +342,12 @@ def _drive(
         if out.exists():
             out.unlink()        # SaveAs will not overwrite silently
         _retry(lambda: presentation.SaveAs(str(out.resolve())))
-        presentation.Close()
+        _retry(lambda: presentation.Close())
         presentation = None
         return result
     finally:
         if presentation is not None:
-            powerpoint.quietly(presentation.Close)
+            powerpoint.close(presentation)
         shutil.rmtree(staging, ignore_errors=True)
 
 
@@ -426,7 +415,7 @@ def _design_names(app: Any, master: Path) -> list[str]:
         return []
     finally:
         if opened is not None:
-            powerpoint.quietly(opened.Close)
+            powerpoint.close(opened)
 
 
 def _only_design(app: Any, master: Path, index: int, staging: Path):
@@ -447,8 +436,8 @@ def _only_design(app: Any, master: Path, index: int, staging: Path):
         for i in range(int(opened.Designs.Count), 0, -1):
             if i != index:
                 powerpoint.quietly(lambda i=i: opened.Designs(i).Delete())
-        _retry(opened.Save)
-        opened.Close()
+        _retry(lambda: opened.Save())
+        _retry(lambda: opened.Close())
         opened = None
         return trimmed.resolve()
     except Exception:
@@ -456,7 +445,7 @@ def _only_design(app: Any, master: Path, index: int, staging: Path):
         return None
     finally:
         if opened is not None:
-            powerpoint.quietly(opened.Close)
+            powerpoint.close(opened)
 
 
 def _name_of(design: Any) -> str:

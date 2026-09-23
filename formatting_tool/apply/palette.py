@@ -88,10 +88,13 @@ class SweepResult:
     colors: dict[str, str] = field(default_factory=dict)   # from -> to
     icons: int = 0                       # statements rewritten inside SVGs
     reason: str = ""                     # why nothing happened, when nothing did
+    # Related icons given one scheme after the sweep. See `apply.icons`.
+    matched_icons: int = 0
+    matched: list[str] = field(default_factory=list)
 
     @property
     def applied(self) -> bool:
-        return self.changed > 0 or self.icons > 0
+        return self.changed > 0 or self.icons > 0 or self.matched_icons > 0
 
     def line(self) -> str:
         if not self.applied:
@@ -99,10 +102,16 @@ class SweepResult:
         moved = ", ".join(
             f"#{was} -> #{now}" for was, now in sorted(self.colors.items())
         )
-        return (
+        swept = (
             f"put {self.changed} colour statement(s) and {self.icons} icon "
             f"statement(s) onto the palette ({moved})"
         )
+        if self.matched_icons:
+            swept += (
+                f"; then matched {self.matched_icons} icon(s) to the related "
+                "icons beside them"
+            )
+        return swept
 
 
 def sweep_to_palette(
@@ -156,11 +165,26 @@ def sweep_to_palette(
             decided[value] = _target_for(value, entries, tolerance, plan)
         return decided[value]
 
+    # Which icons belong together, read before anything moves: the one that
+    # leads a set is the one whose own colours were already the brand's.
+    from .icons import apply_harmony, plan_harmony  # noqa: PLC0415
+
+    harmony = _safely(lambda: plan_harmony(presentation, entries)) or []
+
     for part in _swept_parts(presentation):
         result.changed += _sweep_element(
             part, target_for, result.colors, entries
         )
     result.icons += _sweep_icons(presentation, target_for, result.colors)
+
+    # Then the related icons take the leader's colours as the sweep left them,
+    # so every icon is on the palette AND a set reads as one set.
+    matched = _safely(lambda: apply_harmony(harmony))
+    if matched is not None:
+        result.matched_icons = matched.icons
+        result.matched = matched.lines
+        for line in matched.lines:
+            log.info("%s: %s", path.name, line)
 
     if not result.applied:
         return result

@@ -6,7 +6,7 @@ The flow, and the reason it is a separate command rather than part of validate:
         |                                 |
         v                                 v
     extractor.py                      extractor.py
-    one Gemini call, whole PDF        no model call; the theme and the
+    one Claude call, whole PDF        no model call; the theme and the
     as a file part                    slides are already structured
         |  raw reading, every             |  an empty shell, everything
         |  value carrying its quote       |  marked MISSING

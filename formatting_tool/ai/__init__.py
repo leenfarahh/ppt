@@ -1,7 +1,8 @@
 #ai validation layer
 from .client import AIConfig, AIResult, AIValidationError, AIValidator
 from .payload import build_batches, build_reference_block, payload_to_text
-from .schema import AI_RESPONSE_SCHEMA, to_gemini_schema
+from .claude import to_claude_schema
+from .schema import AI_RESPONSE_SCHEMA
 
 __all__ = [
     "AIConfig",
@@ -12,5 +13,5 @@ __all__ = [
     "build_reference_block",
     "payload_to_text",
     "AI_RESPONSE_SCHEMA",
-    "to_gemini_schema",
+    "to_claude_schema",
 ]

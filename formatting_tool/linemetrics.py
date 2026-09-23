@@ -89,6 +89,14 @@ class LineMetricsProvider(Protocol):
         """Where the text was actually drawn, or None if unknown."""
         ...
 
+    def line_bounds(self, key: ShapeKey) -> Optional[list[TextBounds]]:
+        """Where each line was drawn, for text that overhangs its box.
+
+        Optional: a provider without it is asked for `bounds` alone, and the
+        whole paragraph's rectangle stands in for its lines.
+        """
+        ...
+
 
 class NullLineMetrics:
     """The default: knows nothing, admits it."""
@@ -103,6 +111,9 @@ class NullLineMetrics:
         return None
 
     def bounds(self, key: ShapeKey) -> Optional[TextBounds]:
+        return None
+
+    def line_bounds(self, key: ShapeKey) -> Optional[list[TextBounds]]:
         return None
 
 
@@ -126,6 +137,7 @@ class PowerPointComMetrics:
         self.deck_path = Path(deck_path)
         self._lines: dict[ShapeKey, list[str]] = {}
         self._bounds: dict[ShapeKey, TextBounds] = {}
+        self._line_bounds: dict[ShapeKey, list[TextBounds]] = {}
         self._loaded = False
         self._ok = False
 
@@ -144,6 +156,11 @@ class PowerPointComMetrics:
         if not self._loaded:
             self._load()
         return self._bounds.get(key)
+
+    def line_bounds(self, key: ShapeKey) -> Optional[list[TextBounds]]:
+        if not self._loaded:
+            self._load()
+        return self._line_bounds.get(key)
 
     def _load(self) -> None:
         self._loaded = True
@@ -214,6 +231,15 @@ class PowerPointComMetrics:
             bounds = _bounds_of(text_range)
             if bounds is not None:
                 self._bounds[key] = bounds
+                # Line by line only where the text leaves its box, which is
+                # rare and is exactly where the paragraph's rectangle is too
+                # coarse: a last line that stops at 7.23in was reported over a
+                # number whose glyphs start at 7.36in, because the paragraph's
+                # widest line reaches 7.75in.
+                if _overhangs(bounds, shape):
+                    lines = [_bounds_of(text_range.Lines(i + 1)) for i in range(count)]
+                    if all(line is not None for line in lines):
+                        self._line_bounds[key] = lines
         except Exception:
             # A shape with a frame but no range, a placeholder PowerPoint will
             # not talk about, a picture pretending to have text. None of them
@@ -243,6 +269,22 @@ def _bounds_of(text_range: Any) -> Optional[TextBounds]:
 
 
 _MSO_GROUP = 6
+
+
+def _overhangs(bounds: TextBounds, shape: Any) -> bool:
+    """Whether the drawn text reaches past the shape's own box at all."""
+    try:
+        left = float(shape.Left) / _POINTS_PER_INCH
+        top = float(shape.Top) / _POINTS_PER_INCH
+        right = left + float(shape.Width) / _POINTS_PER_INCH
+        bottom = top + float(shape.Height) / _POINTS_PER_INCH
+    except Exception:
+        return False
+    slack = 0.02
+    return (
+        bounds.left_in < left - slack or bounds.top_in < top - slack
+        or bounds.right_in > right + slack or bounds.bottom_in > bottom + slack
+    )
 
 
 def _com_each(collection: Any):

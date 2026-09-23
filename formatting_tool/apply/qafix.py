@@ -157,6 +157,11 @@ class Step:
     # `grow` and `shrink`: the number is the one the rest of the named set is
     # already set at, counted in `designqa._type_steps`.
     size_pt: Optional[float] = None
+    # `match_format` on a PAIR: where the reference's size does not fit this
+    # shape, both may come down together to the largest size that fits. Only
+    # for two, because in a larger set the reference coming down would leave
+    # the members already matched to it behind.
+    shared_fit: bool = False
     note: str = ""                # what the model said, carried for the page
     # What `align` measured its target off, in the words the page will show.
     # The default is the cross-slide case the op was written for; a within-
@@ -486,6 +491,8 @@ def _apply_one(
         _resize(shape, step, result)
     elif step.op == "set_size":
         _set_size(shape, step, result)
+    elif step.op == "match_format":
+        _match_format(slide, shape, step, result)
     else:
         result.skipped.append(_refused(step, f"there is no {step.op!r} correction"))
 
@@ -763,10 +770,12 @@ def _widen(presentation, slide, shape, step: Step, result: QaFixResult) -> None:
         return
 
     if not breaks_mid_word(text, _lines_of(text_range)):
-        result.skipped.append(_refused(
-            step, "its words are not breaking in half, so widening it would "
-                  "only make the box bigger",
-        ))
+        # Not broken, but narrower than its column. Four labels down the right
+        # of a diagram, three drawn at one width and one at half of it, wraps
+        # the odd one to four lines where the rest take one -- which is what
+        # the model is pointing at when it asks for this on a box whose words
+        # are whole. The column says how wide it should be.
+        _widen_to_column(presentation, slide, shape, step, result, original)
         return
 
     room = _room_to_the_right(presentation, slide, shape)
@@ -805,6 +814,79 @@ def _widen(presentation, slide, shape, step: Step, result: QaFixResult) -> None:
         "its words still break in half at the widest this box can go without "
         "reaching what is beside it; the column needs to be laid out wider",
     ))
+
+
+def _widen_to_column(
+    presentation, slide, shape, step: Step, result: QaFixResult, original: float
+) -> None:
+    """Give a box the width the boxes it lines up with already share."""
+    target = _column_width(slide, shape)
+    if target is None or target <= original + 1:
+        result.skipped.append(_refused(
+            step, "its words are not breaking in half and it is already as "
+                  "wide as the boxes it lines up with, so widening it would "
+                  "only make the box bigger",
+        ))
+        return
+    room = _room_to_the_right(presentation, slide, shape)
+    if target > original + room + 1:
+        result.skipped.append(_refused(
+            step, f"the boxes it lines up with are {target / _POINTS_PER_INCH:.2f}in "
+                  "wide, and what is beside it leaves no room for that",
+        ))
+        return
+    try:
+        shape.Width = target
+    except Exception as exc:
+        _restore_width(shape, original)
+        result.skipped.append(_refused(step, f"PowerPoint refused the width: {exc}"))
+        return
+    result.applied.append(_made(
+        step,
+        f"widened the box from {original / _POINTS_PER_INCH:.2f}in to "
+        f"{target / _POINTS_PER_INCH:.2f}in, the width of the boxes it lines "
+        "up with",
+    ))
+
+
+def _column_width(slide: Any, shape: Any) -> Optional[float]:
+    """The width the text boxes sharing this one's left edge agree on.
+
+    At least two of them, agreeing to a few points: one neighbour is a width,
+    two are a column. Boxes stacked under each other only -- a box beside this
+    one on the same row is a different column that happens to start nearby.
+    """
+    try:
+        left, top = float(shape.Left), float(shape.Top)
+        bottom = top + float(shape.Height)
+        me = int(shape.Id)
+    except Exception:
+        return None
+    widths = []
+    for other in _com_each(slide.Shapes):
+        try:
+            if int(other.Id) == me or not int(other.HasTextFrame):
+                continue
+            if not str(other.TextFrame.TextRange.Text).strip():
+                continue
+            if abs(float(other.Left) - left) > _COLUMN_SLACK_PT:
+                continue
+            o_top = float(other.Top)
+            if o_top < bottom and o_top + float(other.Height) > top:
+                continue
+            widths.append(float(other.Width))
+        except Exception:
+            continue
+    best, agreeing = None, 0
+    for width in widths:
+        count = sum(1 for w in widths if abs(w - width) <= _COLUMN_SLACK_PT)
+        if count > agreeing:
+            best, agreeing = width, count
+    return best if agreeing >= 2 else None
+
+
+# Two edges or widths this close, in points, are the same one.
+_COLUMN_SLACK_PT = 4.0
 
 
 def _restore_width(shape: Any, width: float) -> None:
@@ -1255,6 +1337,234 @@ def _set_size(shape: Any, step: Step, result: QaFixResult) -> None:
         f"set the type from {current:g}pt to {step.size_pt:g}pt, "
         f"to match {step.measured_off}",
     ))
+
+
+def _match_format(slide: Any, shape: Any, step: Step, result: QaFixResult) -> None:
+    """Set this shape's text the way the reference shape's is set.
+
+    Size, typeface, colour and line spacing, copied off what PowerPoint says
+    the reference is DRAWING -- which is the only reading that covers a
+    placeholder whose size is inherited from the layout and stated nowhere in
+    the file. Only what the reference states uniformly is copied: a value it
+    mixes (a bold lead-in word) is not one value, and flattening the target to
+    one would destroy emphasis the writer put there.
+
+    Put back if the copy stops fitting, measured against how well it fitted
+    before: card copy that already spills a hair is not refused for spilling
+    the same hair at the new size, only for spilling more.
+    """
+    source = _find(slide, step.parent_path, step.parent_id or 0, step.parent)
+    if source is None:
+        result.skipped.append(_refused(
+            step, f"the shape it should match, {step.parent!r}, could not be "
+                  "found again on the slide",
+        ))
+        return
+    try:
+        src = source.TextFrame.TextRange
+        dst = shape.TextFrame.TextRange
+        if not str(dst.Text).strip() or not str(src.Text).strip():
+            result.skipped.append(_refused(step, "there is no text to match"))
+            return
+    except Exception:
+        result.skipped.append(
+            _refused(step, "PowerPoint would not say what these shapes hold")
+        )
+        return
+
+    wanted = _text_format(src)
+    if not wanted:
+        result.skipped.append(_refused(
+            step, f"{step.parent!r} mixes its own formatting, so there is no "
+                  "one format to copy",
+        ))
+        return
+    if _text_format(dst) == wanted:
+        result.skipped.append(_refused(step, f"it already matches {step.measured_off}"))
+        return
+
+    before = _fit_ratio(shape)
+    snapshot = _snapshot(dst)
+    try:
+        _write_format(dst, wanted)
+    except Exception as exc:
+        _restore(dst, snapshot)
+        result.skipped.append(_refused(step, f"PowerPoint refused the format: {exc}"))
+        return
+
+    after = _fit_ratio(shape)
+    ceiling = max(before or 0.0, 1.0) + _SPILL_SLACK
+    shared = None
+    if after is not None and after > ceiling and step.shared_fit and "size" in wanted:
+        shared = _largest_fit(shape, dst, wanted["size"], ceiling)
+        if shared is not None:
+            src_snapshot = _snapshot(src)
+            try:
+                src.Font.Size = shared
+            except Exception:
+                _restore(src, src_snapshot)
+                shared = None
+            else:
+                wanted["size"] = shared
+                after = _fit_ratio(shape)
+    if after is not None and after > ceiling:
+        _restore(dst, snapshot)
+        result.skipped.append(_refused(
+            step, f"set like {step.parent!r} its copy no longer fits its box, "
+                  "so the box or the copy has to give first",
+        ))
+        return
+
+    said = [f"{wanted['size']:g}pt"] if "size" in wanted else []
+    if "name" in wanted:
+        said.append(str(wanted["name"]))
+    if shared is not None:
+        result.applied.append(_made(
+            step,
+            f"set its text like {step.parent!r} ({', '.join(said)}), and both "
+            f"at {shared:g}pt: the largest size this box's copy fits at",
+        ))
+        return
+    result.applied.append(_made(
+        step,
+        f"set its text like {step.parent!r}"
+        + (f" ({', '.join(said)})" if said else "")
+        + ", so the set reads as one",
+    ))
+
+
+def _largest_fit(
+    shape: Any, text_range: Any, start: float, ceiling: float
+) -> Optional[float]:
+    """The largest size below `start`, in half points, at which the copy fits;
+    None if it does not fit even at the legibility floor."""
+    size = start - _STEP_PT
+    while size >= FLOOR_PT:
+        try:
+            text_range.Font.Size = size
+        except Exception:
+            return None
+        ratio = _fit_ratio(shape)
+        if ratio is None or ratio <= ceiling:
+            return size
+        size -= _STEP_PT
+    return None
+
+
+def _text_format(text_range: Any) -> dict[str, Any]:
+    """The formatting a whole range shares, leaving out what it mixes."""
+    out: dict[str, Any] = {}
+    font = text_range.Font
+    size = _read_com(lambda: float(font.Size))
+    if size is not None and size > 0:
+        out["size"] = round(size * 2) / 2
+    name = _read_com(lambda: str(font.Name or ""))
+    if name:
+        out["name"] = name
+    theme = _read_com(lambda: int(font.Color.ObjectThemeColor))
+    if theme is not None and theme > 0:
+        out["theme"] = theme
+    else:
+        kind = _read_com(lambda: int(font.Color.Type))
+        rgb = _read_com(lambda: int(font.Color.RGB))
+        if kind == _MSO_COLOR_RGB and rgb is not None and rgb >= 0:
+            out["rgb"] = rgb
+    para = text_range.ParagraphFormat
+    rule = _read_com(lambda: int(para.LineRuleWithin))
+    within = _read_com(lambda: float(para.SpaceWithin))
+    if rule in (0, -1) and within is not None and within >= 0:
+        out["line_rule"], out["within"] = rule, within
+    return out
+
+
+def _write_format(text_range: Any, wanted: dict[str, Any]) -> None:
+    font = text_range.Font
+    if "size" in wanted:
+        font.Size = wanted["size"]
+    if "name" in wanted:
+        font.Name = wanted["name"]
+    if "theme" in wanted:
+        font.Color.ObjectThemeColor = wanted["theme"]
+    elif "rgb" in wanted:
+        font.Color.RGB = wanted["rgb"]
+    if "within" in wanted:
+        text_range.ParagraphFormat.LineRuleWithin = wanted["line_rule"]
+        text_range.ParagraphFormat.SpaceWithin = wanted["within"]
+
+
+def _snapshot(text_range: Any) -> list[tuple]:
+    """Each run's own formatting, so a change can be put back exactly even
+    where the range mixed sizes or colours before it."""
+    runs = []
+    for run in _indexed(text_range.Runs):
+        runs.append((
+            run,
+            _read_com(lambda r=run: float(r.Font.Size)),
+            _read_com(lambda r=run: str(r.Font.Name)),
+            _read_com(lambda r=run: int(r.Font.Color.ObjectThemeColor)),
+            _read_com(lambda r=run: int(r.Font.Color.RGB)),
+        ))
+    paragraphs = []
+    for para in _indexed(text_range.Paragraphs):
+        paragraphs.append((
+            para,
+            _read_com(lambda p=para: int(p.ParagraphFormat.LineRuleWithin)),
+            _read_com(lambda p=para: float(p.ParagraphFormat.SpaceWithin)),
+        ))
+    return [("runs", runs), ("paragraphs", paragraphs)]
+
+
+def _indexed(method) -> list:
+    """`TextRange.Runs` and `.Paragraphs` are methods taking a 1-based index,
+    not collections: `Runs()` is one range spanning all of them."""
+    count = _read_com(lambda: int(method().Count)) or 0
+    items = []
+    for i in range(1, count + 1):
+        item = _read_com(lambda i=i: method(i))
+        if item is not None:
+            items.append(item)
+    return items
+
+
+def _restore(text_range: Any, snapshot: list[tuple]) -> None:
+    runs = dict(snapshot).get("runs", [])
+    for run, size, name, theme, rgb in runs:
+        if size:
+            powerpoint.quietly(lambda: setattr(run.Font, "Size", size))
+        if name:
+            powerpoint.quietly(lambda: setattr(run.Font, "Name", name))
+        if theme and theme > 0:
+            powerpoint.quietly(lambda: setattr(run.Font.Color, "ObjectThemeColor", theme))
+        elif rgb is not None:
+            powerpoint.quietly(lambda: setattr(run.Font.Color, "RGB", rgb))
+    for para, rule, within in dict(snapshot).get("paragraphs", []):
+        if rule in (0, -1) and within is not None:
+            powerpoint.quietly(lambda: setattr(para.ParagraphFormat, "LineRuleWithin", rule))
+            powerpoint.quietly(lambda: setattr(para.ParagraphFormat, "SpaceWithin", within))
+
+
+def _fit_ratio(shape: Any) -> Optional[float]:
+    """How tall the drawn text is against its box; None where it cannot say
+    or the box grows to fit."""
+    try:
+        if int(shape.TextFrame.AutoSize) != 0:
+            return None
+        height = float(shape.Height)
+        drawn = float(shape.TextFrame.TextRange.BoundHeight)
+    except Exception:
+        return None
+    return drawn / height if height > 0 else None
+
+
+_MSO_COLOR_RGB = 1
+
+
+def _read_com(call) -> Any:
+    """A COM property's value, or None when PowerPoint will not give one."""
+    try:
+        return call()
+    except Exception:
+        return None
 
 
 def _resize(shape: Any, step: Step, result: QaFixResult) -> None:

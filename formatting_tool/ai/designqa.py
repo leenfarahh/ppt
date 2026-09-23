@@ -63,7 +63,7 @@ from ..models import (
     ShapeProfile,
     SlideProfile,
 )
-from .gemini import (
+from .claude import (
     Exhausted,
     Truncated,
     build_client,
@@ -167,7 +167,7 @@ ISSUES = (
 ARRANGEMENTS = (
     "align_top", "align_bottom", "align_left", "align_right",
     "distribute_h", "distribute_v", "center_h",
-    "same_width", "same_height", "same_type_size",
+    "same_width", "same_height", "same_type_size", "same_text_format",
 )
 
 # How many shapes each arrangement needs before it means anything. Aligning
@@ -185,6 +185,11 @@ _ARRANGE_MIN = {
     # Three headings at three sizes is a set with a majority in it; two
     # headings at two sizes is a pair somebody may have meant.
     "same_type_size": 3,
+    # Two, because the model names which one is right. Two cards whose body
+    # copy is set at 12pt and 7pt have no majority between them and never
+    # will; what settles it is somebody looking at the slide and saying which
+    # of the two is the one the other should look like. See `SlideIssue.reference`.
+    "same_text_format": 2,
     # Three to match a size, not two. Two shapes at two widths have no majority
     # between them -- a median of two is their midpoint, which resizes BOTH and
     # lands on a width neither was drawn at. Three is the first number at which
@@ -220,8 +225,8 @@ PROPOSABLE_OPS = (
     "delete_empty_paragraphs",
 )
 
-# Room for the answer, on top of whatever thinking was asked for. Gemini counts
-# thinking against `max_output_tokens`, so the two share one allowance and the
+# Room for the answer, on top of whatever thinking was asked for. Thinking
+# counts against `max_tokens`, so the two share one allowance and the
 # reasoning can squeeze the answer out -- which arrives as a truncated string
 # and NO VERDICTS AT ALL for the slide that had the most to say. See
 # `ai.layout` for the same trap with a smaller answer.
@@ -485,6 +490,17 @@ handed over, so it is worth naming precisely.
                               shapes whose type should agree, not the shapes
                               that are wrong: the set says which size was
                               meant.
+               same_text_format
+                              these should have their text set the same way:
+                              the same size, typeface, colour and line spacing.
+                              For the body copy of sibling cards or columns --
+                              two cards whose paragraphs are 12pt in one and
+                              7pt in the other. Name every sibling in `shapes`
+                              and put in `reference` the one whose text is set
+                              the way the others should be: the one that reads
+                              as intended and whose copy would still fit the
+                              other boxes. Works for two shapes, because you
+                              say which is right.
                center_h       these should sit centred across the width of the
                               slide, as a set. For a row that leaves an empty
                               column beside it -- three cards on a grid drawn
@@ -826,6 +842,10 @@ class SlideIssue:
     task: str = ""
     arrangement: str = ""          # one of ARRANGEMENTS, or "" for a plain note
     members: tuple[Member, ...] = ()
+    # The member the others should match, for an arrangement the set cannot
+    # settle by counting. Named by the model, which is looking at the slide:
+    # of two cards at two sizes, the one that reads as intended and fits.
+    reference: Optional[Member] = None
 
     @property
     def addressable(self) -> bool:
@@ -840,6 +860,10 @@ class SlideIssue:
         needed = _ARRANGE_MIN.get(self.arrangement)
         if needed is None:
             return False
+        if self.arrangement == "same_text_format" and (
+            self.reference is None or self.reference.shape_id is None
+        ):
+            return False
         return sum(1 for m in self.members if m.shape_id is not None) >= needed
 
     def to_dict(self) -> dict[str, Any]:
@@ -847,6 +871,7 @@ class SlideIssue:
             "note": self.note, "task": self.task,
             "arrangement": self.arrangement,
             "members": [m.to_dict() for m in self.members],
+            "reference": self.reference.to_dict() if self.reference else None,
         }
 
 
@@ -1187,8 +1212,19 @@ def _schema(refs: Sequence[str]) -> dict[str, Any]:
                                 "when arrangement is 'none'."
                             ),
                         },
+                        "reference": {
+                            "type": "string",
+                            "enum": [*refs, "none"],
+                            "description": (
+                                "For same_text_format: the ref, from `shapes`, "
+                                "whose text is set the way the others should "
+                                "be. 'none' for every other arrangement."
+                            ),
+                        },
                     },
-                    "required": ["note", "task", "arrangement", "shapes"],
+                    "required": [
+                        "note", "task", "arrangement", "shapes", "reference",
+                    ],
                     "additionalProperties": False,
                 },
             },
@@ -1214,7 +1250,7 @@ def review_slides(
     images: Sequence[tuple[int, Path]],
     model: str,
     thinking_budget: int,
-    api_key_env: str = "GEMINI_API_KEY",
+    api_key_env: str = "ANTHROPIC_API_KEY",
     concurrency: int = 6,
 ) -> list[SlideReview]:
     """One review per rendered slide. Never raises.
@@ -1423,7 +1459,7 @@ def review_consistency(
     images: Sequence[tuple[int, Path]],
     model: str,
     thinking_budget: int,
-    api_key_env: str = "GEMINI_API_KEY",
+    api_key_env: str = "ANTHROPIC_API_KEY",
 ) -> tuple[list[DeckIssue], str]:
     """How the slides disagree with each other. Returns (issues, reason).
 
@@ -1740,10 +1776,18 @@ def review_from_response(
             note = str(entry.get("note") or "").strip()
             task = str(entry.get("task") or "").strip()
             arrangement, members = _arrangement(entry, refs, review, size)
+        reference = (
+            _reference(entry, members) if not isinstance(entry, str) else None
+        )
+        if arrangement == "same_text_format" and reference is None:
+            # A pair with nobody saying which is right is a coin toss; it
+            # stays a note for a designer.
+            arrangement, members = "", ()
         if note or task:
             review.slide_issues.append(SlideIssue(
                 note=note or task, task=task,
                 arrangement=arrangement, members=members,
+                reference=reference if arrangement else None,
             ))
     return review
 
@@ -1799,6 +1843,19 @@ def _arrangement(
     if len(members) < _ARRANGE_MIN[kind]:
         return "", ()
     return kind, tuple(members)
+
+
+def _reference(
+    raw: dict[str, Any], members: Sequence[Member]
+) -> Optional[Member]:
+    """The member the model says the rest should match, if it named one of them.
+
+    Only one of the set. A reference outside the shapes named is a shape the
+    finding is not about, and matching a card's copy to the title's would be
+    obeying a slip.
+    """
+    ref = str(raw.get("reference") or "").strip()
+    return next((m for m in members if m.ref == ref), None)
 
 
 def _proposal(raw: Any, shape: ShapeProfile) -> Optional[FixAction]:

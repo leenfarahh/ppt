@@ -42,6 +42,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import logging
+import re
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path, PurePosixPath
@@ -66,6 +67,7 @@ log = logging.getLogger(__name__)
 
 _R_NS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
 _P_NS = "{http://schemas.openxmlformats.org/presentationml/2006/main}"
+_A_NS = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
 
 
 class RebuildError(RuntimeError):
@@ -512,8 +514,10 @@ def _rebuild_slide(
     shapes = list(src_slide.shapes)
     charts_here = chartparts.chart_boxes(shapes)
 
-    claims: dict[int, Any] = {}
+    claims: dict[int, Any] = claim_dates(shapes, pool)
     for shape in shapes:
+        if id(shape) in claims:
+            continue
         if not _is_placeholder(shape) or chartparts.is_chart(shape):
             # A chart in a content placeholder is still a chart. Claimed, it
             # would take the region and then fail to copy into it.
@@ -528,6 +532,7 @@ def _rebuild_slide(
         shape for shape in shapes
         if not _is_placeholder(shape) and _has_copy(shape)
         and not _leave_alone(shape, here, canvas_in, charts_here)
+        and id(shape) not in claims
     ]
     run_claims, furniture, moves = claim_runs(loose, pool, shapes)
     claims.update(run_claims)
@@ -840,6 +845,105 @@ def _subtitle_text(here: Optional[Any]) -> Optional[str]:
         return None
     found = here.subtitle
     return found.text if found is not None else ""
+
+
+def claim_dates(shapes: Sequence[Any], pool: list[Any]) -> dict[int, Any]:
+    """Put the slide's date into the layout's date slot.
+
+    THE SLOT IS OFTEN NOT A DATE PLACEHOLDER. A master that wants the date on
+    its cover in the brand's type draws a plain text placeholder and types
+    the format into its prompt -- "DD/MM/YY" -- because a real date
+    placeholder takes the master's footer styling. Everything else here
+    claims by family, dates are chrome and belong to no family, so the source
+    date was carried over at its old inches beside an empty "DD/MM/YY" slot.
+
+    A date is a DATE placeholder, a live date field, or a loose box whose
+    copy is a date and nothing else. A slot is an empty DATE placeholder or
+    an empty text placeholder whose prompt reads as a date. Runs first,
+    before anything else claims: the slot is a text placeholder, and the
+    drawn-over pass would otherwise fill it with whatever sits nearest.
+    """
+    sources = [s for s in shapes if _reads_as_date(s)]
+    if not sources:
+        return {}
+    claims: dict[int, Any] = {}
+    for shape in sources:
+        slots = [p for p in pool if _is_date_slot(p)]
+        if not slots:
+            break
+        slot = max(slots, key=lambda p: _affinity(shape, p, (0, 0)))
+        pool.remove(slot)
+        claims[id(shape)] = slot
+        log.info("put the date from %r into %r", _name_of(shape), _name_of(slot))
+    return claims
+
+
+def _placeholder_token(shape: Any) -> str:
+    try:
+        return str(shape.placeholder_format.type or "").split("(")[0].strip().upper()
+    except Exception:
+        return ""
+
+
+def _reads_as_date(shape: Any) -> bool:
+    if not _has_copy(shape):
+        return False
+    if _is_placeholder(shape):
+        return _placeholder_token(shape) == "DATE"
+    try:
+        body = shape.text_frame._txBody
+    except Exception:
+        return False
+    if any(
+        str(f.get("type", "")).startswith("datetime")
+        for f in body.iter(_A_NS + "fld")
+    ):
+        return True
+    return bool(_DATE_COPY.match(_text_of(shape).strip()))
+
+
+def _is_date_slot(placeholder: Any) -> bool:
+    if _has_copy(placeholder):
+        return False
+    token = _placeholder_token(placeholder)
+    if token == "DATE":
+        return True
+    if token not in ("BODY", "SUBTITLE", "OBJECT"):
+        return False
+    return bool(_DATE_PROMPT.search(_prompt_of(placeholder)))
+
+
+def _prompt_of(placeholder: Any) -> str:
+    """The prompt the layout shows in this placeholder, or ""."""
+    try:
+        base = placeholder._base_placeholder
+    except Exception:
+        base = None
+    if base is None:
+        return ""
+    return _text_of(base).strip()
+
+
+# A prompt that is a date format: "DD/MM/YY", "dd.mm.yyyy", "Month YYYY",
+# "Date". Whole-prompt, so "Click to add the update" is not a date slot.
+_DATE_PROMPT = re.compile(
+    r"^\s*(?:date|(?:dd?|mm?m?m?|month|yy(?:yy)?)(?:[\s/.\-,]+"
+    r"(?:dd?|mm?m?m?|month|yy(?:yy)?))*)\s*$",
+    re.IGNORECASE,
+)
+
+_MONTH = (r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?")
+
+# Copy that is a date and nothing else: 23-Sep-26, 23/09/2026, 2026-09-23,
+# September 2026, 23 September 2026, Sep 23, 2026.
+_DATE_COPY = re.compile(
+    r"^(?:\d{1,2}[/.\-]\d{1,2}[/.\-]\d{2,4}"
+    r"|\d{4}-\d{1,2}-\d{1,2}"
+    rf"|\d{{1,2}}[\s\-]{_MONTH}[\s\-,]*\d{{2,4}}"
+    rf"|{_MONTH}\s+\d{{1,2}},?\s+\d{{4}}"
+    rf"|{_MONTH}\s+\d{{4}})$",
+    re.IGNORECASE,
+)
 
 
 def claim_drawn_over(
@@ -1413,12 +1517,15 @@ def fill_runs(
                 p for p in slide.placeholders if not chartparts.is_chart(p)
             ]
             here = roles.for_slide(number) if roles is not None else None
+            dates = claim_dates(shapes, pool)
             loose = [
                 shape for shape in shapes
                 if not _is_placeholder(shape) and _has_copy(shape)
                 and not _leave_alone(shape, here, canvas, charts_here)
+                and id(shape) not in dates
             ]
             claims, furniture, moves = claim_runs(loose, pool, shapes, rtl=rtl)
+            claims.update(dates)
             subtitle = _subtitle_text(here)
             claims.update(claim_drawn_over(
                 [s for s in loose if id(s) not in claims], pool,
@@ -1643,18 +1750,55 @@ def _copy_text(source: Any, target: Any) -> bool:
     frame = target.text_frame
     frame.clear()
 
+    from pptx.text.text import _Run  # noqa: PLC0415 - lazy heavy dependency
+
     for index, src_para in enumerate(source.text_frame.paragraphs):
         para = frame.paragraphs[0] if index == 0 else frame.add_paragraph()
         para.level = src_para.level
-        for src_run in src_para.runs:
-            run = para.add_run()
-            run.text = src_run.text
-            for attr in ("bold", "italic", "underline"):
-                value = getattr(src_run.font, attr, None)
-                if value is not None:
-                    setattr(run.font, attr, value)
-            _copy_hyperlink(src_run, run)
+        # Walked in document order rather than through `.runs`, which sees
+        # a:r only. A line break and a field are part of the copy too: a date
+        # is usually a live `datetime` field, and read as runs it came across
+        # as nothing at all.
+        for child in src_para._p:
+            tag = child.tag.rsplit("}", 1)[-1]
+            if tag == "br":
+                para.add_line_break()
+            elif tag == "fld":
+                _copy_field(child, para)
+            elif tag == "r":
+                src_run = _Run(child, src_para)
+                run = para.add_run()
+                run.text = src_run.text
+                for attr in ("bold", "italic", "underline"):
+                    value = getattr(src_run.font, attr, None)
+                    if value is not None:
+                        setattr(run.font, attr, value)
+                _copy_hyperlink(src_run, run)
     return True
+
+
+def _copy_field(field: Any, para: Any) -> None:
+    """Carry a field (a live date, a slide number) across, minus its styling.
+
+    The same terms as a run: emphasis survives, typeface, size and colour are
+    the layout's. The field itself stays live, so a date keeps updating.
+    """
+    clone = copy.deepcopy(field)
+    rpr = clone.find(_A_NS + "rPr")
+    if rpr is not None:
+        keep = {k: v for k, v in rpr.attrib.items() if k in ("lang", "b", "i", "u")}
+        for child in list(rpr):
+            rpr.remove(child)
+        rpr.attrib.clear()
+        rpr.attrib.update(keep)
+    ppr = clone.find(_A_NS + "pPr")
+    if ppr is not None:
+        clone.remove(ppr)
+    end = para._p.find(_A_NS + "endParaRPr")
+    if end is not None:
+        end.addprevious(clone)
+    else:
+        para._p.append(clone)
 
 
 def _copy_hyperlink(src_run: Any, run: Any) -> None:

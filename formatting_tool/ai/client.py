@@ -2,18 +2,19 @@
 from __future__ import annotations
 
 import logging
-import threading
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from ..models import ColorIntent, Issue, LayoutChoice, MasterSpec
-from .gemini import (
+from .claude import (
     AIValidationError,
     finish_reason as _finish_reason,
     build_client,
-    count as _count,
+    DEFAULT_MODEL as _CLAUDE_MODEL,
     file_part,
     generate_json,
+    to_claude_schema,
+    usage_counts,
 )
 from .payload import build_reference_block, payload_to_text
 from .schema import (
@@ -21,7 +22,6 @@ from .schema import (
     issues_from_response,
     color_intents_from_response,
     layout_choices_from_response,
-    to_gemini_schema,
 )
 
 __all__ = [
@@ -37,9 +37,8 @@ __all__ = [
 
 log = logging.getLogger(__name__)
 
-# gemini-2.5-pro was retired for new keys and answers 404, which made every AI
-# run on a fresh key fail outright.
-DEFAULT_MODEL = "gemini-3.1-pro-preview"
+# Claude only. `ai/gemini.py` is kept on disk and imported by nothing.
+DEFAULT_MODEL = _CLAUDE_MODEL
 DEFAULT_EFFORT = "high"
 DEFAULT_MAX_TOKENS = 16000
 
@@ -52,10 +51,6 @@ THINKING_BUDGETS = {
 }
 MAX_OUTPUT_CEILING = 65536
 
-# How long the system prefix stays cached. Long enough for a long deck, short
-# enough that a run which dies without tidying up does not leave it lying
-# around being charged for.
-_CACHE_TTL = "3600s"
 
 REVIEWER_INSTRUCTIONS = """\
 You are reviewing a PowerPoint deck for formatting consistency against a brand
@@ -234,7 +229,7 @@ class AIConfig:
     model: str = DEFAULT_MODEL
     effort: str = DEFAULT_EFFORT
     max_tokens: int = DEFAULT_MAX_TOKENS
-    api_key_env: str = "GEMINI_API_KEY"
+    api_key_env: str = "ANTHROPIC_API_KEY"
 
     @property
     def thinking_budget(self) -> int:
@@ -242,7 +237,7 @@ class AIConfig:
 
     @property
     def max_output_tokens(self) -> int:
-        """Answer allowance plus thinking, since Gemini counts both."""
+        """Answer allowance plus thinking, since `max_tokens` covers both."""
         return min(self.max_tokens + self.thinking_budget, MAX_OUTPUT_CEILING)
 
 
@@ -292,13 +287,8 @@ class AIValidator:
         # Built once and reused verbatim. Rebuilding it per call would change
         # the bytes and cost every cache hit.
         self._reference_block = build_reference_block(spec)
-        self._response_schema = to_gemini_schema(AI_RESPONSE_SCHEMA)
+        self._response_schema = to_claude_schema(AI_RESPONSE_SCHEMA)
         self._client: Any = None
-        # Name of the explicit cache holding the system prefix, once one has
-        # been made. See `_cached_prefix`.
-        self._cache: Optional[str] = None
-        self._cache_tried = False
-        self._cache_lock = threading.Lock()
 
     # -- system prompt ------------------------------------------------------ #
 
@@ -307,57 +297,17 @@ class AIValidator:
         return REVIEWER_INSTRUCTIONS + "\n\nBRAND REFERENCE\n" + self._reference_block
 
     def _cached_prefix(self, client: Any) -> Optional[str]:
-        """An explicit cache holding the system prefix, or None to send it.
+        """Always None: there is no cache object to make.
 
-        The prefix is byte-identical on every call -- the reference block is
-        built once in `__init__` for exactly that reason -- and yet every
-        batch of a 105-slide run reported `cache_read=0`. Implicit caching has
-        a minimum length the prefix does not reach, so it never engaged, and
-        about 2,100 tokens went over the wire 105 times.
-
-        Made once per run, under a lock, because the batches run several at a
-        time and two threads racing to create it would make two caches and use
-        neither twice. Tried once: a model that will not cache says so on the
-        first attempt and there is nothing to learn from asking again.
-
-        Failure is not an error. Explicit caching has its own minimum, and not
-        every model offers it at all; when it is unavailable the prefix is
-        sent inline exactly as before, which is the behaviour this replaced.
+        The system prefix is byte-identical on every call -- the reference
+        block is built once in `__init__` for exactly that reason -- and Claude
+        caches it by the marker `claude.generate_json` puts on the system
+        prompt, so every batch after the first reads it from the cache.
         """
-        with self._cache_lock:
-            if self._cache_tried:
-                return self._cache
-            self._cache_tried = True
-            try:
-                from google.genai import types  # noqa: PLC0415
-
-                cache = client.caches.create(
-                    model=self.config.model,
-                    config=types.CreateCachedContentConfig(
-                        system_instruction=self.system_instruction(),
-                        ttl=_CACHE_TTL,
-                    ),
-                )
-                self._cache = str(cache.name)
-                log.info(
-                    "cached the brand reference and instructions as %s; the "
-                    "system prefix is sent once instead of once per batch",
-                    self._cache,
-                )
-            except Exception as exc:
-                log.debug("no explicit cache for the system prefix: %s", exc)
-                self._cache = None
-            return self._cache
+        return None
 
     def release(self) -> None:
-        """Delete the run's cache. Safe to call when there never was one."""
-        name, self._cache = self._cache, None
-        if not name or self._client is None:
-            return
-        try:
-            self._client.caches.delete(name=name)
-        except Exception:
-            log.debug("could not delete the cached prefix %s", name, exc_info=True)
+        """Nothing to tidy up; kept so callers need not know that."""
 
     # -- the call ----------------------------------------------------------- #
 
@@ -488,39 +438,31 @@ class AIValidator:
         # about a slide the model never saw is not a judgement, and acting
         # on it would protect a defect nobody reviewed.
         intents = color_intents_from_response(data, rendered)
-        usage = getattr(response, "usage_metadata", None)
-        cached = _count(usage, "cached_content_token_count")
+        usage = usage_counts(response)
         return AIResult(
             issues=issues,
             summaries=[summary] if summary else [],
             layout_choices=picks,
             color_intents=intents,
             calls=1,
-            # prompt_token_count already includes the cached prefix, so it
-            # comes back out here to keep the two fields disjoint.
-            input_tokens=max(_count(usage, "prompt_token_count") - cached, 0),
-            output_tokens=(
-                _count(usage, "candidates_token_count")
-                + _count(usage, "thoughts_token_count")
-            ),
-            cache_read_tokens=cached,
-            # Implicit caching is written by the service and never billed as a
-            # write, so there is nothing to report here.
-            cache_write_tokens=0,
+            input_tokens=usage["input"],
+            output_tokens=usage["output"],
+            cache_read_tokens=usage["cache_read"],
+            cache_write_tokens=usage["cache_write"],
         )
 
     def _log_usage(self, response: Any, payload: dict[str, Any]) -> None:
-        usage = getattr(response, "usage_metadata", None)
-        cache_read = _count(usage, "cached_content_token_count")
+        usage = usage_counts(response)
+        cache_read = usage["cache_read"]
         batch = payload.get("batch", {})
         log.info(
-            "batch %s/%s: in=%s out=%s thinking=%s cache_read=%s",
+            "batch %s/%s: in=%s out=%s cache_read=%s cache_write=%s",
             batch.get("index"),
             batch.get("of"),
-            max(_count(usage, "prompt_token_count") - cache_read, 0),
-            _count(usage, "candidates_token_count"),
-            _count(usage, "thoughts_token_count"),
+            usage["input"],
+            usage["output"],
             cache_read,
+            usage["cache_write"],
         )
         if batch.get("index", 1) > 1 and cache_read == 0:
             log.warning(

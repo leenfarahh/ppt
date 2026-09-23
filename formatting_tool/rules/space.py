@@ -515,22 +515,37 @@ class TextCollisionRule(Rule):
             bounds = self.metrics.bounds(ShapeKey(slide.number, shape.shape_id))
             if bounds is None:
                 continue
-            if _overhang(bounds, box)[0] <= _MEASURED_SLACK_IN:
-                continue
-            hit = _first_shape_under(slide, shape, bounds)
+            hit = None
+            if _overhang(bounds, box)[0] > _MEASURED_SLACK_IN:
+                hit = _first_shape_under(slide, shape, bounds, self.metrics)
+            # A rule drawn through the lines of text, inside the box or not.
+            # The overhang test exists to spare a caption deliberately set on a
+            # photo; nobody sets copy across a footer rule on purpose, and a
+            # paragraph in a tall bottom-anchored box does exactly that without
+            # ever leaving its box.
+            ruled = None if hit is not None else _rule_through(ctx, slide, shape, bounds)
+            hit = hit or ruled
             if hit is None:
                 continue
 
-            plan = _separation(ctx.deck, slide, shape, bounds, hit)
+            plan = _separation(ctx, slide, shape, bounds, hit)
             if plan is None:
                 continue
             mover, still, dx, dy = plan
             rect = still.geometry
             yield self.issue(
-                f"{mover.name!r} and text spilling out of "
-                f"{(still if mover is shape else shape).name!r} are drawn over "
-                f"each other; {mover.name!r} is in front, so it is the one "
-                f"that moves.",
+                (
+                    f"{shape.name!r} is drawn across {still.name!r}, which "
+                    f"runs through its lines of text; {shape.name!r} is the "
+                    "one that moves."
+                )
+                if ruled is not None
+                else (
+                    f"{mover.name!r} and text spilling out of "
+                    f"{(still if mover is shape else shape).name!r} are drawn "
+                    f"over each other; {mover.name!r} is in front, so it is the "
+                    "one that moves."
+                ),
                 slide=slide,
                 shape=mover,
                 expected=(
@@ -552,7 +567,7 @@ class TextCollisionRule(Rule):
             )
 
 
-def _separation(deck, slide, shape, bounds, hit):
+def _separation(ctx, slide, shape, bounds, hit):
     """Who moves and by how much, or None if neither can be nudged clear.
 
     The rectangle that matters for the text is the INK, not the box: the box
@@ -570,41 +585,284 @@ def _separation(deck, slide, shape, bounds, hit):
         width_in=bounds.width_in, height_in=bounds.height_in,
     )
     order = list(slide.shapes)
-    try:
-        text_at = next(i for i, s in enumerate(order) if s.shape_id == shape.shape_id)
-        hit_at = next(i for i, s in enumerate(order) if s.shape_id == hit.shape_id)
-    except StopIteration:
+    text_at = next(
+        (i for i, s in enumerate(order) if s.shape_id == shape.shape_id), None
+    )
+    hit_at = next(
+        (i for i, s in enumerate(order) if s is hit), None
+    )
+    if text_at is None:
         return None
 
     # (the one that moves, the one it clears, the rectangle to clear it of,
     #  the rectangle that moves)
-    front_first = (
-        [(hit, shape, ink, hit.geometry), (shape, hit, hit.geometry, ink)]
-        if hit_at > text_at
-        else [(shape, hit, hit.geometry, ink), (hit, shape, ink, hit.geometry)]
-    )
-    for mover, still, obstacle, moving in front_first:
-        delta = _shortest_way_out(moving, obstacle)
-        if delta is None:
-            continue
-        dx, dy = delta
-        # A nudge, or nothing. Text with wrapping off can overhang its box by
-        # inches, and then the shortest way out is to relocate something
-        # across the slide -- a source line shunted 2in to clear a panel is
-        # not the fix anyone wanted, and the real answer there is to turn
-        # wrapping on or shorten the line. Past this the finding stands and
-        # says so, with no target on it.
-        if abs(dx) > _MAX_NUDGE_IN or abs(dy) > _MAX_NUDGE_IN:
-            continue
-        box = mover.geometry
-        if (
-            box.left_in + dx >= 0
-            and box.top_in + dy >= 0
-            and box.left_in + dx + box.width_in <= deck.width_in
-            and box.top_in + dy + box.height_in <= deck.height_in
-        ):
-            return mover, still, dx, dy
+    if hit_at is None:
+        # The layout's own artwork. It is behind everything on the slide and
+        # cannot be moved from the slide, so the text is the one that goes.
+        plans = [(shape, hit, hit.geometry, ink)]
+    elif hit_at > text_at:
+        plans = [(hit, shape, ink, hit.geometry), (shape, hit, hit.geometry, ink)]
+    else:
+        plans = [(shape, hit, hit.geometry, ink), (hit, shape, ink, hit.geometry)]
+    for mover, still, obstacle, moving in plans:
+        delta = _way_out(ctx, slide, mover, still, obstacle, moving)
+        if delta is not None:
+            return mover, still, delta[0], delta[1]
     return None
+
+
+def _way_out(ctx, slide, mover, still, obstacle, moving):
+    """Where the mover goes: onto its neighbours' edges if it can, else a nudge.
+
+    THE SHORTEST WAY OUT IS THE LAST RESORT, NOT THE ANSWER. On a slide of
+    three columns -- a paragraph beside two cards -- the paragraph sat in a
+    box the cards' height but half an inch lower and against the slide edge,
+    its last line drawn across the footer rule. The shortest way clear was up
+    0.11in, which clears the rule and leaves the paragraph aligned with
+    nothing. What a designer does is put it where its row already is: top and
+    bottom on the cards' edges, left edge on the layout's margin. So the
+    positions that land the mover on its neighbours' edges are tried first,
+    and taken when they clear the collision without landing on anything new.
+
+    The shortest way out is still offered where no aligned position works,
+    and it is NOT checked against the neighbours here: the applier checks
+    every geometric move against the whole slide, reverts one that lands on
+    something, and names what stopped it, which is a better report than a
+    finding with no target.
+    """
+    box = mover.geometry
+    width, height = ctx.deck.width_in, ctx.deck.height_in
+    others = [
+        s for s in slide.shapes
+        if s is not mover and s.shape_id != mover.shape_id
+        and not _renders_nothing(s)
+        and getattr(s, "geometry", None) is not None
+        and s.geometry.width_in > 0 and s.geometry.height_in > 0
+    ]
+
+    def on_canvas(dx, dy):
+        return (
+            box.left_in + dx >= 0 and box.top_in + dy >= 0
+            and box.left_in + dx + box.width_in <= width
+            and box.top_in + dy + box.height_in <= height
+        )
+
+    def clears(dx, dy):
+        moved = _shifted(moving, dx, dy)
+        if _intersection(moved, obstacle) is not None:
+            return False
+        if _crosses(moved, obstacle):
+            return False
+        return True
+
+    aligned = []
+    for dx in _snaps_into_frame(ctx, slide, box):
+        for dy in _row_edges(box, others):
+            if abs(dx) > _MAX_ALIGN_IN or abs(dy) > _MAX_ALIGN_IN:
+                continue
+            if not (on_canvas(dx, dy) and clears(dx, dy)):
+                continue
+            if _lands_on_something(box, dx, dy, others, still):
+                continue
+            if _ruled_through(ctx, slide, _shifted(moving, dx, dy), mover):
+                continue
+            gained = _edges_shared(_shifted(box, dx, dy), others) - _edges_shared(
+                box, others
+            )
+            if gained <= 0:
+                continue
+            aligned.append((-gained, abs(dx) + abs(dy), dx, dy))
+    if aligned:
+        _, _, dx, dy = min(aligned)
+        return dx, dy
+
+    delta = _shortest_way_out(moving, obstacle)
+    if delta is None:
+        return None
+    dx, dy = delta
+    # A nudge, or nothing. Text with wrapping off can overhang its box by
+    # inches, and then the shortest way out is to relocate something
+    # across the slide -- a source line shunted 2in to clear a panel is
+    # not the fix anyone wanted, and the real answer there is to turn
+    # wrapping on or shorten the line. Past this the finding stands and
+    # says so, with no target on it.
+    if abs(dx) > _MAX_NUDGE_IN or abs(dy) > _MAX_NUDGE_IN:
+        return None
+    return (dx, dy) if on_canvas(dx, dy) else None
+
+
+def _shifted(rect, dx: float, dy: float) -> Geometry:
+    return Geometry(
+        left_in=rect.left_in + dx, top_in=rect.top_in + dy,
+        width_in=rect.width_in, height_in=rect.height_in,
+    )
+
+
+def _snaps_into_frame(ctx, slide, box) -> list[float]:
+    """Horizontal moves worth trying: none, and into the layout's frame.
+
+    Only a box already OUTSIDE the frame is offered a sideways move. One that
+    sits inside it is where the designer put it, and sliding it across to
+    line up with something is a composition decision this does not make.
+    """
+    moves = [0.0]
+    layout = _layout_for(ctx, slide)
+    if layout is None:
+        return moves
+    # The edges the layout declares, not `content_frame`, which needs PS
+    # rectangles and is None on a layout that only has placeholders. The
+    # right edge is at least the left margin mirrored: a layout's title often
+    # stops short of the width its content uses.
+    lefts, rights = layout.declared_left_edges, layout.declared_right_edges
+    if not lefts or not rights:
+        return moves
+    left = min(lefts)
+    right = max(max(rights), ctx.deck.width_in - left)
+    tolerance = ctx.spec.tolerances.position_in
+    if box.left_in < left - tolerance:
+        moves.append(left - box.left_in)
+    elif box.right_in > right + tolerance:
+        moves.append(right - box.right_in)
+    return moves
+
+
+def _row_edges(box, others) -> list[float]:
+    """Vertical moves that put the box's top or bottom on a neighbour's."""
+    moves = set()
+    for other in others:
+        rect = other.geometry
+        moves.add(round(rect.top_in - box.top_in, 4))
+        moves.add(round(rect.top_in + rect.height_in - box.bottom_in, 4))
+    moves.discard(0.0)
+    return sorted(moves) + [0.0]
+
+
+def _edges_shared(box, others) -> int:
+    """How many of this box's left, top and bottom edges a neighbour shares."""
+    count = 0
+    for other in others:
+        rect = other.geometry
+        count += abs(rect.left_in - box.left_in) <= _EDGE_IN
+        count += abs(rect.top_in - box.top_in) <= _EDGE_IN
+        count += abs(rect.top_in + rect.height_in - box.bottom_in) <= _EDGE_IN
+    return count
+
+
+def _lands_on_something(box, dx, dy, others, still) -> bool:
+    """Whether the moved box overlaps a neighbour it did not overlap before."""
+    moved = _shifted(box, dx, dy)
+    # The shape being cleared included: an edge of the text's own box is an
+    # edge to align to, and a bar "aligned" onto the top of the copy it was
+    # meant to clear is sitting on it.
+    for other in others:
+        if _intersection(moved, other.geometry) is not None and (
+            _intersection(box, other.geometry) is None
+        ):
+            return True
+    return False
+
+
+def _layout_for(ctx, slide):
+    """The layout this slide is drawn on, as the deck carries it, else the spec's."""
+    name = getattr(slide, "layout_name", None)
+    if not name:
+        return None
+    for layout in getattr(ctx.deck, "layouts", None) or []:
+        if layout.name == name:
+            return layout
+    finder = getattr(ctx.spec, "layout_named", None)
+    return finder(name) if finder is not None else None
+
+
+def _is_rule(shape) -> bool:
+    """A drawn line: a connector, or a shape too thin to be anything else."""
+    rect = getattr(shape, "geometry", None)
+    if rect is None or (getattr(shape, "text", "") or "").strip():
+        return False
+    if getattr(shape, "placeholder_type", None) or getattr(shape, "is_picture", False):
+        return False
+    thin = min(rect.width_in, rect.height_in)
+    long = max(rect.width_in, rect.height_in)
+    return thin <= _RULE_THICKNESS_IN and long > 0.1
+
+
+def _crosses(ink, line) -> bool:
+    """Whether a line runs through the lines of text, not just past them.
+
+    Kept clear of the ink's own edges: a rule just under a heading touches the
+    bottom of its line box by design, and that is spacing, not a collision.
+    """
+    rect = getattr(line, "geometry", line)
+    if rect.height_in <= rect.width_in:
+        y = rect.top_in + rect.height_in / 2
+        through = ink.top_in + _THROUGH_IN < y < ink.top_in + ink.height_in - _THROUGH_IN
+        span = min(ink.left_in + ink.width_in, rect.left_in + rect.width_in) - max(
+            ink.left_in, rect.left_in
+        )
+    else:
+        x = rect.left_in + rect.width_in / 2
+        through = ink.left_in + _THROUGH_IN < x < ink.left_in + ink.width_in - _THROUGH_IN
+        span = min(ink.top_in + ink.height_in, rect.top_in + rect.height_in) - max(
+            ink.top_in, rect.top_in
+        )
+    return through and span > _THROUGH_IN
+
+
+def _ruled_through(ctx, slide, ink, shape):
+    """The first rule, on the slide or its layout, drawn through this ink.
+
+    A LINE JOINED TO THE SHAPE IS NOT RUNNING THROUGH IT. On a process diagram
+    every numbered badge has a connector starting at its edge and running out
+    to its label, straight through the middle of the number: that is the
+    drawing, and moving the badge "clear" of it broke a diagram that was
+    right. So a slide line with an end inside the shape's own box is skipped.
+    Layout lines are not: nothing on a slide is joined to the layout's footer
+    rule, and a paragraph drawn across it is the defect this exists for.
+    """
+    layout = _layout_for(ctx, slide)
+    box = getattr(shape, "geometry", None)
+    for other, own in (
+        [(s, True) for s in slide.shapes]
+        + [(s, False) for s in (layout.shapes if layout else [])]
+    ):
+        if other is shape or not _is_rule(other):
+            continue
+        if own and box is not None and _ends_inside(other.geometry, box):
+            continue
+        if _crosses(ink, other):
+            return other
+    return None
+
+
+def _ends_inside(line, box) -> bool:
+    """Whether either end of a straight line lies within a box."""
+    if line.height_in <= line.width_in:
+        y = line.top_in + line.height_in / 2
+        ends = ((line.left_in, y), (line.left_in + line.width_in, y))
+    else:
+        x = line.left_in + line.width_in / 2
+        ends = ((x, line.top_in), (x, line.top_in + line.height_in))
+    return any(
+        box.left_in - _TOUCH_IN <= px <= box.left_in + box.width_in + _TOUCH_IN
+        and box.top_in - _TOUCH_IN <= py <= box.top_in + box.height_in + _TOUCH_IN
+        for px, py in ends
+    )
+
+
+def _rule_through(ctx, slide, shape, bounds):
+    """`_ruled_through` for a shape's measured text. Footers are exempt: they
+    sit on the footer rule by design."""
+    if getattr(shape, "role", None) is TextRole.FOOTER:
+        return None
+    # Text in a shape with a fill of its own -- a badge, a pill, a button --
+    # is drawn on that shape, and a line meeting the shape is the diagram.
+    if getattr(shape, "fill_kind", None) in _OWN_FILLS:
+        return None
+    ink = Geometry(
+        left_in=bounds.left_in, top_in=bounds.top_in,
+        width_in=bounds.width_in, height_in=bounds.height_in,
+    )
+    return _ruled_through(ctx, slide, ink, shape)
 
 
 def _shortest_way_out(moving: Geometry, obstacle: Geometry):
@@ -652,6 +910,20 @@ _CLEAR_IN = 0.02
 # already a visible relocation, and an overhang that needs more than that is
 # a copy or wrapping problem wearing a geometry problem's clothes.
 _MAX_NUDGE_IN = 0.75
+
+# The most a shape may travel, per axis, to land on its neighbours' edges.
+# Further than a nudge because the destination is not arbitrary: it is where
+# the row the shape belongs to already is.
+_MAX_ALIGN_IN = 1.0
+
+# Two edges this close are the same edge.
+_EDGE_IN = 0.02
+
+# A shape this thin is a drawn line, and how far inside the text's own edges a
+# line has to be to be running through it rather than beside it.
+_RULE_THICKNESS_IN = 0.03
+_OWN_FILLS = frozenset({"solid", "gradient", "picture", "pattern", "textured"})
+_THROUGH_IN = 0.04
 
 
 class OverlapRule(Rule):
@@ -1522,8 +1794,12 @@ class TextOverflowRule(Rule):
         # What it runs OVER is `space.text_collision`'s finding. That one is
         # reported on the shape that has to move and carries a target, so it
         # can be applied; this one is about a box too small for its copy.
-        hit = _first_shape_under(slide, shape, bounds)
+        hit = _first_shape_under(slide, shape, bounds, self.metrics)
         needed = _box_for(bounds, box, edge)
+        # Growing is still offered where the box ALREADY overlaps what the text
+        # runs over: the grown box lands on nothing it was not on before, and
+        # the collision is `space.text_collision`'s either way.
+        growable = hit is None or _intersection(box, hit.geometry) is not None
         return self.issue(
             f"Text is drawn {bounds.width_in:.2f} x {bounds.height_in:.2f}in "
             f"in a {box.width_in:.2f} x {box.height_in:.2f}in box, "
@@ -1550,7 +1826,7 @@ class TextOverflowRule(Rule):
                     f"{needed.top_in:.2f}, {needed.width_in:.2f} x "
                     f"{needed.height_in:.2f}in"
                 )
-                if hit is None
+                if growable
                 else f"text within {box.width_in:.2f} x {box.height_in:.2f}in"
             ),
             found=(
@@ -1641,18 +1917,23 @@ _INSET_IN = 0.05
 def _box_for(bounds, box, edge: str):
     """The box this copy would fit in, grown on the edge it overflows.
 
-    Grown, never shrunk, and on one edge only. The left and top stay where
-    the designer put them: a box that overflows its bottom is not evidence
-    that its top is wrong, and moving two edges to fix one is how a fix starts
-    making composition decisions.
+    Grown, never shrunk, and only on the side the text actually spills over.
+    That side is the anchor showing through: top-anchored copy spills off the
+    bottom, bottom-anchored copy off the top, middle-anchored off both by the
+    same amount. Growing exactly there keeps the text where it is drawn, which
+    is the whole condition for a grow being safe. Growing the bottom of a
+    bottom-anchored heading instead would drag the copy down onto whatever is
+    under it.
     """
     if edge in ("bottom", "top"):
-        height = max(
-            box.height_in, bounds.bottom_in + _INSET_IN - box.top_in
-        )
+        top, bottom = box.top_in, box.top_in + box.height_in
+        if bounds.top_in < top - _MEASURED_SLACK_IN:
+            top = bounds.top_in - _INSET_IN
+        if bounds.bottom_in > bottom + _MEASURED_SLACK_IN:
+            bottom = bounds.bottom_in + _INSET_IN
         return Geometry(
-            left_in=box.left_in, top_in=box.top_in,
-            width_in=box.width_in, height_in=height,
+            left_in=box.left_in, top_in=top,
+            width_in=box.width_in, height_in=bottom - top,
         )
     width = max(box.width_in, bounds.right_in + _INSET_IN - box.left_in)
     return Geometry(
@@ -1661,7 +1942,7 @@ def _box_for(bounds, box, edge: str):
     )
 
 
-def _first_shape_under(slide, shape, bounds):
+def _first_shape_under(slide, shape, bounds, metrics=None):
     """The shape the overhanging text is drawn across, if there is one.
 
     The test is on the part of the text that is OUTSIDE its own box, and that
@@ -1681,21 +1962,81 @@ def _first_shape_under(slide, shape, bounds):
     readable, and a designer who looks will see the rest.
     """
     box = shape.geometry
+    parts = _ink_parts(metrics, slide, shape, bounds, box)
     for other in slide.shapes:
         if getattr(other, "shape_id", None) == shape.shape_id:
             continue
         rect = getattr(other, "geometry", None)
         if rect is None or rect.width_in <= 0 or rect.height_in <= 0:
             continue
-        hit = _intersection(bounds, rect)
-        if hit is None:
+        if _within(box, rect) or _renders_nothing(other):
+            # The card the text box sits on, or a placeholder nobody filled.
+            # Copy spilling a hair past its box onto its own card is still on
+            # the card, and an empty placeholder draws nothing in a show or in
+            # print. Counting either as "what it runs over" withheld the grow
+            # target from every card on a three-card slide, and moved an empty
+            # subtitle placeholder out from under a title.
             continue
-        # Inside the text's own box, this is the layout doing what it meant
-        # to. Outside it, the text has gone somewhere nobody put it.
-        if _within(hit, box):
-            continue
-        return other
+        # Another text box is in the way only where its GLYPHS are. A number
+        # set in the corner of a card sits in an auto-fitted box twice its
+        # width, and copy passing through the empty half of that box touches
+        # nothing anybody can see.
+        if (getattr(other, "text", "") or "").strip():
+            rect = _ink_of(metrics, slide, other) or rect
+        for part in parts:
+            hit = _intersection(part, rect)
+            if hit is None:
+                continue
+            # Inside the text's own box, this is the layout doing what it
+            # meant to. Outside it, the text has gone somewhere nobody put it.
+            if _within(hit, box):
+                continue
+            return other
     return None
+
+
+def _ink_parts(metrics, slide, shape, bounds, box) -> list:
+    """The drawn rectangles to test: each line outside the box, if the
+    renderer measured them, else the paragraph's rectangle.
+
+    Per line because the paragraph's rectangle is as wide as its widest line.
+    A last line that stops at 7.23in was reported over a number starting at
+    7.36in, because a line two above it runs to 7.75in -- and that line is
+    inside its box.
+    """
+    reader = getattr(metrics, "line_bounds", None) if metrics is not None else None
+    lines = reader(ShapeKey(slide.number, shape.shape_id)) if reader else None
+    if not lines:
+        return [bounds]
+    return [line for line in lines if not _within(line, box)] or [bounds]
+
+
+def _ink_of(metrics, slide, shape):
+    if metrics is None:
+        return None
+    ink = metrics.bounds(ShapeKey(slide.number, shape.shape_id))
+    if ink is None:
+        return None
+    return Geometry(
+        left_in=ink.left_in, top_in=ink.top_in,
+        width_in=ink.width_in, height_in=ink.height_in,
+    )
+
+
+def _renders_nothing(shape) -> bool:
+    """An empty text placeholder: a prompt in the editor, nothing on the page.
+
+    Text kinds only. A filled picture, chart or table placeholder carries no
+    text either, and the profile cannot tell it from an empty one.
+    """
+    token = str(getattr(shape, "placeholder_type", None) or "").split("(")[0].strip()
+    return token in _TEXT_PLACEHOLDERS and not (getattr(shape, "text", "") or "").strip()
+
+
+_TEXT_PLACEHOLDERS = frozenset({
+    "TITLE", "CENTER_TITLE", "VERTICAL_TITLE", "SUBTITLE", "BODY",
+    "VERTICAL_BODY", "FOOTER", "DATE", "SLIDE_NUMBER", "HEADER",
+})
 
 
 def _intersection(a, b):

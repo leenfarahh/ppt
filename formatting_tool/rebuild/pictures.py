@@ -550,6 +550,14 @@ def inherit_artwork(presentation: Any) -> list[str]:
     furniture = _repeated_shapes(presentation)
     carried: list[str] = []
     for index, slide in enumerate(presentation.slides, start=1):
+        if _is_cover_layout(slide.slide_layout):
+            # A cover's layout artwork IS the old brand's cover design. It is
+            # on the one layout the one cover uses, so the repetition test
+            # below reads it as that slide's own content -- and on a real deck
+            # the old cover's freeforms, accent rule and logo were stamped onto
+            # the slide, on top of the new master's cover. The master being
+            # applied always brings a cover of its own.
+            continue
         artwork = _artwork_of(slide.slide_layout, furniture)
         # Kept in the layout's own order, and inserted at the front of the
         # z-order where a layout draws: under the slide's own shapes, which is
@@ -559,6 +567,19 @@ def inherit_artwork(presentation: Any) -> list[str]:
             if _copy_onto(slide, shape, _Z_FRONT + offset):
                 carried.append(f"slide {index}: {_name_of(shape)}")
     return carried
+
+
+def _is_cover_layout(layout: Any) -> bool:
+    """Whether a layout is a title slide: PowerPoint's own `title` layout type,
+    or a layout with a centre title, which is what a cover is built on."""
+    element = getattr(layout, "_element", None)
+    if element is not None and str(element.get("type") or "") == "title":
+        return True
+    for placeholder in _safe(lambda: list(layout.placeholders)) or []:
+        kind = str(_safe(lambda p=placeholder: p.placeholder_format.type) or "")
+        if kind.startswith("CENTER_TITLE"):
+            return True
+    return False
 
 
 # `p:spTree` opens with `p:nvGrpSpPr` and `p:grpSpPr`; shapes follow.

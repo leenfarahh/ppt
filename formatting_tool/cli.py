@@ -28,7 +28,7 @@ from typing import Optional, Sequence, TextIO
 
 from . import __version__
 from .ai.client import AIConfig, DEFAULT_EFFORT, DEFAULT_MODEL
-from .ai.gemini import AIValidationError
+from .ai.claude import AIValidationError
 from .ai.payload import DEFAULT_BATCH_SIZE, DEFAULT_BATCH_TOKENS
 from .apply import ApplyError, apply_fixes, fixable, fixer_for, why_not_fixable
 from .classify import fit_slide, layout_coverage, missing_kinds
@@ -743,7 +743,7 @@ def _build_parser() -> argparse.ArgumentParser:
     validate.add_argument(
         "--payload-dir", type=Path, help="with --ai-dry-run, write payloads here"
     )
-    validate.add_argument("--model", default=DEFAULT_MODEL, help="Gemini model id")
+    validate.add_argument("--model", default=DEFAULT_MODEL, help="Claude model id")
     validate.add_argument(
         "--effort",
         choices=["low", "medium", "high", "xhigh", "max"],
@@ -940,7 +940,7 @@ def _build_parser() -> argparse.ArgumentParser:
     extract.add_argument(
         "--out", type=Path, help="write the guidelines file here instead of stdout"
     )
-    extract.add_argument("--model", default=DEFAULT_MODEL, help="Gemini model id")
+    extract.add_argument("--model", default=DEFAULT_MODEL, help="Claude model id")
     extract.add_argument(
         "--effort",
         choices=["low", "medium", "high", "xhigh", "max"],
@@ -1019,12 +1019,11 @@ def _configure_logging(verbose: int, quiet: bool) -> None:
     logging.basicConfig(
         level=level, format="%(levelname)s %(name)s: %(message)s", stream=sys.stderr
     )
-    # The Gemini SDK narrates its own internals -- automatic function calling
-    # is on, and a recommendation not to use it that does not apply to a
-    # single-shot generate_content. None of it is actionable, and it drowns
-    # our own lines. Full debug logging (-vv) still shows it.
+    # The SDK narrates its own retries and requests. None of it is
+    # actionable, and it drowns our own lines. Full debug logging (-vv) still
+    # shows it.
     if level > logging.DEBUG:
-        logging.getLogger("google_genai").setLevel(logging.ERROR)
+        logging.getLogger("anthropic").setLevel(logging.ERROR)
 
 
 class _StdoutProxy:

@@ -18,6 +18,8 @@ the slide a reader notices first.
 
 from __future__ import annotations
 
+import pytest
+
 from formatting_tool.apply import fixer_for
 from formatting_tool.apply.fixers import LeaveAlone, _HEX
 from formatting_tool.extract import derive_master_spec
@@ -693,12 +695,32 @@ def test_a_legible_recolour_still_goes_through() -> None:
     from formatting_tool.apply.fixers import _ai_recolor_text
     from formatting_tool.models import FixAction
 
+    from pptx.dml.color import RGBColor
+
     slide, label = _slide_with_a_button()
+    # Off the brand to begin with, so the recolour is a correction.
+    label.text_frame.paragraphs[0].runs[0].font.color.rgb = RGBColor.from_string("B0B0B0")
     ctx = _FixCtx()
     ctx.neighbours = list(slide.shapes)
 
     detail = _ai_recolor_text(label, FixAction(op="recolor_text", hex="F2F2F2"), ctx)
     assert "recoloured 1 run(s)" in detail
+
+
+def test_a_recolour_that_corrects_nothing_is_declined() -> None:
+    """Text already in a brand colour that reads well on a flat fill has no
+    defect for a recolour to fix. Off a real slide: three of four number badges
+    went from the brand's navy to black on a hunch, and the set stopped
+    agreeing."""
+    from formatting_tool.apply.fixers import LeaveAlone, _ai_recolor_text
+    from formatting_tool.models import FixAction
+
+    slide, label = _slide_with_a_button()        # white on navy, 14:1
+    ctx = _FixCtx()
+    ctx.neighbours = list(slide.shapes)
+
+    with pytest.raises(LeaveAlone, match="nothing for the recolour to correct"):
+        _ai_recolor_text(label, FixAction(op="recolor_text", hex="F2F2F2"), ctx)
 
 
 def test_a_recolour_over_something_that_is_not_a_colour_is_not_second_guessed(

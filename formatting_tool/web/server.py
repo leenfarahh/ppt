@@ -57,11 +57,8 @@ log = logging.getLogger(__name__)
 
 STATIC = Path(__file__).parent / "static"
 
-# The page prefills this rather than DEFAULT_MODEL. `gemini-2.5-pro` is retired
-# for new API keys and answers 404, which the pipeline swallows into a
-# rule-only report; prefilling a model that works keeps the first AI run in the
-# UI from looking like a silent success. The CLI default is left alone.
-SUGGESTED_MODEL = "gemini-3.1-pro-preview"
+# What the page prefills. The same as the CLI's default: Claude only.
+SUGGESTED_MODEL = DEFAULT_MODEL
 
 # One run at a time. Log capture attaches a handler to a shared logger, so
 # concurrent runs would hand each other's lines to the wrong page.
@@ -1995,7 +1992,7 @@ def _context(root: Path) -> dict[str, Any]:
             "effort": DEFAULT_EFFORT,
             "batch_size": DEFAULT_BATCH_SIZE,
         },
-        "api_key": bool(os.environ.get("GEMINI_API_KEY")),
+        "api_key": bool(os.environ.get("ANTHROPIC_API_KEY")),
         # Whether this host can render at all. The deck check degrades without
         # a renderer; the design check cannot run at all, and saying so before
         # a designer uploads 25MB is the difference between a warning and a

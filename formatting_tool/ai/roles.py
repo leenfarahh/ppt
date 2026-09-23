@@ -45,7 +45,7 @@ from typing import Any, Optional, Sequence
 
 from ..models import DeckProfile
 from .designqa import Listed, build_shape_map
-from .gemini import Exhausted, build_client, file_part, generate_json
+from .claude import Exhausted, build_client, file_part, generate_json
 
 log = logging.getLogger(__name__)
 
@@ -335,7 +335,7 @@ def read_roles(
     images: Sequence[tuple[int, Path]],
     model: str,
     thinking_budget: int,
-    api_key_env: str = "GEMINI_API_KEY",
+    api_key_env: str = "ANTHROPIC_API_KEY",
     concurrency: int = 6,
 ) -> RolesResult:
     """One answer per rendered slide. Never raises.

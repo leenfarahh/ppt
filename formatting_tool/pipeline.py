@@ -72,7 +72,7 @@ from pathlib import Path
 from typing import Optional
 
 from .ai.client import AIConfig, AIResult, AIValidationError, AIValidator
-from .ai.gemini import Exhausted
+from .ai.claude import Exhausted
 from .ai.payload import (
     DEFAULT_BATCH_SIZE,
     DEFAULT_BATCH_TOKENS,
@@ -159,7 +159,7 @@ class RunConfig:
     # the wall clock almost exactly. A 105-slide deck at three was 35
     # sequential rounds and the best part of half an hour; at eight it is
     # fourteen. Rate limits are waited out rather than raised (see
-    # `ai.gemini.generate_json`), so the cost of setting it too high is a
+    # `ai.claude.generate_json`), so the cost of setting it too high is a
     # pause, not a lost slide.
     ai_concurrency: int = 8
     # How much payload one AI call may carry, in tokens. Slides are packed up

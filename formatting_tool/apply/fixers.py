@@ -580,36 +580,58 @@ def fix_text_overflow(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[s
             "is shorter copy"
         )
 
-    # Only a top-anchored box. This is the trap the whole fix fell into:
-    # growing a box does not move top-anchored text, and DOES move middle- or
-    # bottom-anchored text, by half the growth and all of it respectively.
-    # Measured on a real box, growing 0.22in to 0.50in moved bottom-anchored
-    # copy down 0.28in -- onto the very bar it was meant to clear, which it
-    # had not even been touching before. So a box that would relocate its own
-    # copy is not grown, and the report says why.
-    anchor = _anchor_of(shape)
-    if anchor not in ("top", None):
-        raise LeaveAlone(
-            f"the text in this box is {anchor}-anchored, so growing the box "
-            "would move the copy down rather than give it room; shorten the "
-            "copy or anchor the text to the top first"
-        )
-
-    _, _, want_w, want_h = target
-    width, height = _emu(want_w), _emu(want_h)
+    want_l, want_t, want_w, want_h = target
+    # A hair of rounding either way is not growth: the target is written to
+    # a hundredth of an inch, and read back it can differ from the box by an
+    # EMU, which reported as "+0.00in wider".
+    hair = _emu(0.01)
+    left, width = shape.left, shape.width
+    if _emu(want_w) > shape.width + hair:
+        width = _emu(want_w)
+    top, bottom = shape.top, shape.top + shape.height
+    if _emu(want_t) < top - hair:
+        top = _emu(want_t)
+    if _emu(want_t) + _emu(want_h) > bottom + hair:
+        bottom = _emu(want_t) + _emu(want_h)
+    height = bottom - top
     if width <= shape.width and height <= shape.height:
         return None            # nothing to grow; the box already fits
 
-    width, height = max(width, shape.width), max(height, shape.height)
-    blocker = _grown_onto(shape, width, height, ctx)
+    # Only on the side the anchor leaves the text free to move. This is the
+    # trap the fix once fell into: growing the bottom of a bottom-anchored box
+    # moved its copy down 0.28in, onto the very bar it was meant to clear. The
+    # rule grows on the side the copy spilled over, which is the anchor
+    # showing through, so a mismatch here means the target and the box
+    # disagree and the safe answer is to leave it.
+    anchor = _anchor_of(shape) or "top"
+    grew_up = top < shape.top
+    grew_down = bottom > shape.top + shape.height
+    slack = _emu(0.02)
+    moves_copy = (
+        (anchor == "top" and grew_up)
+        or (anchor == "bottom" and grew_down)
+        or (
+            anchor == "middle"
+            and abs((shape.top - top) - (bottom - shape.top - shape.height)) > slack
+        )
+    )
+    if moves_copy:
+        raise LeaveAlone(
+            f"the text in this box is {anchor}-anchored, so growing it on "
+            "that side would move the copy rather than give it room; shorten "
+            "the copy or change the anchor first"
+        )
+
+    blocker = _grown_onto(shape, left, top, width, height, ctx)
     if blocker is not None:
         raise LeaveAlone(
             f"the room the copy needs is taken by {blocker!r}, so the box "
             "cannot grow into it; shorten the copy or move one of the two"
         )
     if (
-        shape.left + width > ctx.width_emu
-        or shape.top + height > ctx.height_emu
+        top < 0
+        or left + width > ctx.width_emu
+        or top + height > ctx.height_emu
     ):
         raise LeaveAlone(
             "the room the copy needs runs off the slide, so the copy has to "
@@ -620,8 +642,16 @@ def fix_text_overflow(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[s
     if width > shape.width:
         grew.append(f"{(width - shape.width) / EMU_PER_INCH:+.2f}in wider")
     if height > shape.height:
-        grew.append(f"{(height - shape.height) / EMU_PER_INCH:+.2f}in taller")
-    shape.width, shape.height = width, height
+        side = "upward" if grew_up and not grew_down else ""
+        grew.append(
+            f"{(height - shape.height) / EMU_PER_INCH:+.2f}in taller"
+            + (f" {side}" if side else "")
+        )
+    # All four, left included and first. A placeholder that inherits its
+    # position from the layout has no geometry of its own, and writing only
+    # the size creates one whose missing offset PowerPoint reads as zero: the
+    # title slid to the slide edge, across the layout's accent bar.
+    shape.left, shape.top, shape.width, shape.height = left, top, width, height
     return f"grew the box {' and '.join(grew)}, to the size its copy needs"
 
 
@@ -647,27 +677,34 @@ def _anchor_of(shape: Any) -> Optional[str]:
 
 
 def _grown_onto(
-    shape: Any, width: int, height: int, ctx: "FixContext"
+    shape: Any, new_left: int, new_top: int, width: int, height: int,
+    ctx: "FixContext",
 ) -> Optional[str]:
     """The neighbour a grown box would land on, if any.
 
     Only what the growth ADDS is tested. A box already overlapping a panel it
     sits on -- a caption on a photo -- must not be refused for an overlap it
     had before this ran; the question is whether growing makes a new one.
+
+    An empty placeholder is not a neighbour. It shows a prompt in the editor
+    and nothing in a show or in print, and a title refused room because the
+    empty subtitle region sits under it is refused for something nobody sees.
     """
     if shape.left is None or shape.top is None:
         return None
     was_right, was_bottom = shape.left + shape.width, shape.top + shape.height
-    now_right, now_bottom = shape.left + width, shape.top + height
+    now_right, now_bottom = new_left + width, new_top + height
 
     for other in getattr(ctx, "neighbours", None) or []:
         left, top = getattr(other, "left", None), getattr(other, "top", None)
         o_w, o_h = getattr(other, "width", None), getattr(other, "height", None)
         if None in (left, top, o_w, o_h):
             continue
-        if left >= now_right or left + o_w <= shape.left:
+        if _is_empty_placeholder(other):
             continue
-        if top >= now_bottom or top + o_h <= shape.top:
+        if left >= now_right or left + o_w <= new_left:
+            continue
+        if top >= now_bottom or top + o_h <= new_top:
             continue
         # It overlaps the grown box. Did it overlap the old one too?
         overlapped_before = (
@@ -677,6 +714,22 @@ def _grown_onto(
         if not overlapped_before:
             return str(getattr(other, "name", "a neighbour"))
     return None
+
+
+def _is_empty_placeholder(shape: Any) -> bool:
+    try:
+        if not shape.is_placeholder:
+            return False
+    except Exception:
+        return False
+    try:
+        # A filled picture, table or chart placeholder is a p:pic or a
+        # p:graphicFrame; only a p:sp can be an empty prompt.
+        if not str(shape._element.tag).endswith("}sp"):
+            return False
+        return not (shape.has_text_frame and shape.text_frame.text.strip())
+    except Exception:
+        return False
 
 
 def fix_text_collision(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[str]:
@@ -705,6 +758,10 @@ def fix_text_collision(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[
     if abs(dx) < 0.001 and abs(dy) < 0.001:
         shape.left, shape.top = was
         return None
+    if "runs through its lines" in (issue.message or ""):
+        return (
+            f"moved {dx:+.2f}, {dy:+.2f}in off the rule drawn through its text"
+        )
     return (
         f"moved {dx:+.2f}, {dy:+.2f}in clear of the text drawn over it, "
         "being the shape in front"
@@ -1932,6 +1989,18 @@ def fix_orphan_widow(shape: Any, issue: Issue, ctx: "FixContext") -> Optional[st
         )
     pair = _pair_to_bind(paragraph)
     if pair is None:
+        # The word is a paragraph of its own, which is almost never a wrap:
+        # it is copy pasted with a hard return at every line of the box it
+        # came from. "... United Nations Sustainable Development" / "Goals".
+        # The stranded word is the symptom; the breaks are the defect, and
+        # taking them out lets the copy wrap to the box it is in now.
+        joined = _rejoin_hard_wrap(shape, paragraph)
+        if joined:
+            return (
+                f"rejoined {joined + 1} lines broken by hand mid-sentence, so "
+                f"the copy wraps to its box and {stranded!r} is no longer a "
+                "line of its own"
+            )
         raise LeaveAlone(
             "there is only one word to bind, so nothing can be brought down "
             "with it"
@@ -1970,6 +2039,72 @@ def _paragraph_ending_with(shape: Any, stranded: str) -> Optional[Any]:
         if (paragraph.text or "").rstrip().endswith(stranded):
             return paragraph
     return None
+
+
+def _rejoin_hard_wrap(shape: Any, paragraph: Any) -> int:
+    """Merge the lines a hard-wrapped sentence was broken into. Returns how
+    many breaks were taken out, 0 when this does not read as one.
+
+    A break counts as a hard wrap only when the line before it stops
+    mid-sentence -- no closing punctuation -- is a line's worth of copy long,
+    and is not a bullet. A list of short unpunctuated items passes none of
+    that, which is the case this must never merge.
+    """
+    paragraphs = list(shape.text_frame.paragraphs)
+    try:
+        at = next(i for i, p in enumerate(paragraphs) if p._p is paragraph._p)
+    except StopIteration:
+        return 0
+    start = at
+    while start > 0 and _breaks_mid_sentence(paragraphs[start - 1], paragraph):
+        start -= 1
+    if start == at:
+        return 0
+
+    head = paragraphs[start]._p
+    for tail in paragraphs[start + 1: at + 1]:
+        _append_space(head)
+        end = head.find(_A + "endParaRPr")
+        for child in list(tail._p):
+            if child.tag in (_A + "r", _A + "br", _A + "fld"):
+                if end is not None:
+                    end.addprevious(child)
+                else:
+                    head.append(child)
+        tail._p.getparent().remove(tail._p)
+    return at - start
+
+
+_A = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+
+
+def _breaks_mid_sentence(before: Any, stranded: Any) -> bool:
+    text = (before.text or "").rstrip()
+    if len(text) < _HARD_WRAP_MIN_CHARS or text[-1] in ".!?:;":
+        return False
+    if (before.level or 0) != (stranded.level or 0):
+        return False
+    pPr = before._p.find(_A + "pPr")
+    if pPr is not None and any(
+        pPr.find(_A + tag) is not None for tag in ("buChar", "buAutoNum", "buBlip")
+    ):
+        return False
+    return True
+
+
+# A line's worth of copy. A hard-wrapped paragraph breaks where the old box
+# ran out of room, so every line before the last is long.
+_HARD_WRAP_MIN_CHARS = 30
+
+
+def _append_space(p: Any) -> None:
+    """Put one space at the end of a paragraph's last run, if it has none."""
+    runs = p.findall(_A + "r")
+    if not runs:
+        return
+    t = runs[-1].find(_A + "t")
+    if t is not None and t.text and not t.text.endswith((" ", _NBSP)):
+        t.text += " "
 
 
 def _pair_to_bind(paragraph: Any) -> Optional[str]:
@@ -2347,6 +2482,7 @@ def _ai_recolor_text(shape: Any, action: Any, ctx: "FixContext") -> Optional[str
     if not _has_text(shape):
         return None
     _refuse_unreadable_ink(shape, action.hex, ctx)
+    _refuse_needless_recolor(shape, action.hex, ctx)
     from pptx.dml.color import RGBColor  # noqa: PLC0415 - lazy heavy dependency
 
     colour = RGBColor.from_string(action.hex)
@@ -2360,6 +2496,55 @@ def _ai_recolor_text(shape: Any, action: Any, ctx: "FixContext") -> Optional[str
     if not changed:
         return None
     return f"recoloured {changed} run(s) to {label} #{action.hex}"
+
+
+def _refuse_needless_recolor(shape: Any, target: str, ctx: "FixContext") -> None:
+    """Stand down on a text recolour that corrects nothing measurable.
+
+    The model is asked to propose `recolor_text` for type it cannot read on a
+    photograph or a gradient -- the one pairing the file cannot measure. On a
+    flat fill the file CAN measure it, and where the text is already a brand
+    colour that reads well there is no defect for the recolour to fix: only a
+    colour changed on a hunch. Off a real slide, three of four number badges
+    went from the brand's navy to black, the fourth -- its text inside a group
+    -- stayed navy, and a set that had agreed stopped agreeing.
+    """
+    current = _uniform_ink(shape)
+    if not current or current == target.upper():
+        return
+    if not any(
+        str(entry).strip().lstrip("#").upper() == current
+        for entry in ctx.brand.palette.values()
+    ):
+        return                          # off the brand: a recolour is a fix
+    background = _under(shape, ctx)
+    if not background:
+        return                          # a photograph or a gradient: the model's call
+    ratio = contrast_ratio(current, background)
+    if ratio is None or ratio < TEXT_CONTRAST_FLOOR:
+        return
+    raise LeaveAlone(
+        f"its text is already #{current}, a brand colour, and reads at "
+        f"{ratio:.1f}:1 on the #{background} behind it, so there is nothing "
+        "for the recolour to correct"
+    )
+
+
+def _uniform_ink(shape: Any) -> Optional[str]:
+    """The one literal colour every run of a shape's text is set in, or None."""
+    seen = set()
+    try:
+        for paragraph in shape.text_frame.paragraphs:
+            for run in paragraph.runs:
+                if not run.text.strip():
+                    continue
+                try:
+                    seen.add(str(run.font.color.rgb).upper())
+                except Exception:
+                    return None
+    except Exception:
+        return None
+    return seen.pop() if len(seen) == 1 else None
 
 
 def _refuse_unreadable_ink(shape: Any, target: str, ctx: "FixContext") -> None:
@@ -2408,7 +2593,7 @@ def _under(shape: Any, ctx: "FixContext") -> Optional[str]:
     it. `ctx.neighbours` is in document order, which is z-order, so the last
     container before this shape is the one the words land on.
     """
-    own = _fill_hex_of(shape)
+    own = _fill_hex_of(shape, ctx)
     if own:
         return own
     try:
@@ -2430,13 +2615,13 @@ def _under(shape: Any, ctx: "FixContext") -> Optional[str]:
                 continue
         except Exception:
             continue
-        fill = _fill_hex_of(other)
+        fill = _fill_hex_of(other, ctx)
         if fill:
             found = fill
     return found
 
 
-def _fill_hex_of(shape: Any) -> Optional[str]:
+def _fill_hex_of(shape: Any, ctx: Optional["FixContext"] = None) -> Optional[str]:
     """A shape's solid fill as six hex digits, or None for anything else.
 
     None for a gradient, a picture fill and no fill alike: none of those is one
@@ -2448,9 +2633,29 @@ def _fill_hex_of(shape: Any) -> Optional[str]:
         # BACKGROUND, GRADIENT, PICTURE, PATTERNED -- is not one colour.
         if not str(shape.fill.type).startswith("SOLID"):
             return None
-        return str(shape.fill.fore_color.rgb).upper()
+        colour = shape.fill.fore_color
     except Exception:
         return None
+    try:
+        return str(colour.rgb).upper()
+    except Exception:
+        pass
+    # A theme-bound fill -- a white badge drawn in `lt1` -- resolves through
+    # the palette, which carries the master's theme slots.
+    slot = _THEME_SLOTS.get(str(getattr(colour, "theme_color", "")).split(" ")[0])
+    palette = getattr(getattr(ctx, "brand", None), "palette", None) or {}
+    value = palette.get(f"theme:{slot}") if slot else None
+    return str(value).strip().lstrip("#").upper() if value else None
+
+
+# python-pptx's theme colour names, as the palette's `theme:` slots.
+_THEME_SLOTS = {
+    "BACKGROUND_1": "lt1", "LIGHT_1": "lt1", "BACKGROUND_2": "lt2",
+    "LIGHT_2": "lt2", "TEXT_1": "dk1", "DARK_1": "dk1", "TEXT_2": "dk2",
+    "DARK_2": "dk2", "ACCENT_1": "accent1", "ACCENT_2": "accent2",
+    "ACCENT_3": "accent3", "ACCENT_4": "accent4", "ACCENT_5": "accent5",
+    "ACCENT_6": "accent6",
+}
 
 
 def _ai_set_font(shape: Any, action: Any, ctx: "FixContext") -> Optional[str]:

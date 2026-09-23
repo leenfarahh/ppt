@@ -174,6 +174,30 @@ def recolor(markup: str, old: str, new: str) -> tuple[str, int]:
     return _COLOUR.sub(swap, markup), changed
 
 
+def recolor_many(markup: str, mapping: dict[str, str]) -> tuple[str, int]:
+    """Several colours rewritten in ONE pass, so a swap cannot undo itself.
+
+    Two passes of `recolor` turning navy into green and then green into navy
+    leave everything navy. One pass reads each statement once, against the
+    colours as they were.
+    """
+    table = {
+        old.strip().lstrip("#").upper(): new.strip().lstrip("#").upper()
+        for old, new in mapping.items()
+    }
+    changed = 0
+
+    def swap(match: re.Match) -> str:
+        nonlocal changed
+        new = table.get(_expand(match.group(2)))
+        if new is None or new == _expand(match.group(2)):
+            return match.group(0)
+        changed += 1
+        return match.group(0).replace(match.group(2), new)
+
+    return _COLOUR.sub(swap, markup), changed
+
+
 def _theme_by_colour(markup: str) -> dict[str, str]:
     """Colour -> theme slot, taken from the `MsftOfcThm_*` style rules.
 

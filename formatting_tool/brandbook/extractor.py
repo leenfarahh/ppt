@@ -19,8 +19,10 @@ from pathlib import Path
 from typing import Any, Optional
 
 from ..ai.client import DEFAULT_MODEL, THINKING_BUDGETS
-from ..ai.gemini import AIValidationError, build_client, count, file_part, generate_json
-from ..ai.schema import to_gemini_schema
+from ..ai.claude import (
+    AIValidationError, build_client, file_part, generate_json, to_claude_schema,
+    usage_counts,
+)
 from ..extract import DeckReadError, read_deck
 from ..models import BrandGuidelines, Provenance, guideline_paths
 from .mapping import Rejection, guidelines_from_extraction
@@ -84,7 +86,7 @@ class ExtractConfig:
     model: str = DEFAULT_MODEL
     effort: str = DEFAULT_EFFORT
     max_tokens: int = DEFAULT_MAX_TOKENS
-    api_key_env: str = "GEMINI_API_KEY"
+    api_key_env: str = "ANTHROPIC_API_KEY"
 
     @property
     def thinking_budget(self) -> int:
@@ -92,7 +94,7 @@ class ExtractConfig:
 
     @property
     def max_output_tokens(self) -> int:
-        """Answer allowance plus thinking, since Gemini counts both."""
+        """Answer allowance plus thinking, since `max_tokens` covers both."""
         return min(self.max_tokens + self.thinking_budget, MAX_OUTPUT_CEILING)
 
 
@@ -235,7 +237,7 @@ def extract_from_pdf(
         model=config.model,
         contents=[document, "Extract the stated formatting rules."],
         system_instruction=EXTRACTION_INSTRUCTIONS,
-        schema=to_gemini_schema(BRANDBOOK_SCHEMA),
+        schema=to_claude_schema(BRANDBOOK_SCHEMA),
         translate_schema=False,
         thinking_budget=config.thinking_budget,
         max_output_tokens=config.max_output_tokens,
@@ -243,7 +245,7 @@ def extract_from_pdf(
     )
 
     mapped = guidelines_from_extraction(data, source=path.name)
-    usage = getattr(response, "usage_metadata", None)
+    usage = usage_counts(response)
     result = ExtractionResult(
         guidelines=mapped.guidelines,
         source=str(path),
@@ -252,10 +254,8 @@ def extract_from_pdf(
         rejections=mapped.rejections,
         unspecified=mapped.unspecified,
         raw=data,
-        input_tokens=count(usage, "prompt_token_count"),
-        output_tokens=(
-            count(usage, "candidates_token_count") + count(usage, "thoughts_token_count")
-        ),
+        input_tokens=usage["input"] + usage["cache_read"] + usage["cache_write"],
+        output_tokens=usage["output"],
     )
 
     log.info(

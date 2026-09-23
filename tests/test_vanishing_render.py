@@ -197,7 +197,7 @@ def test_a_spent_account_still_stops_the_layer() -> None:
     message, and with a retry attached it was half an hour of sleeping to
     reach the same report."""
     from formatting_tool.ai.client import AIResult
-    from formatting_tool.ai.gemini import Exhausted
+    from formatting_tool.ai.claude import Exhausted
     from formatting_tool.pipeline import RunConfig, _review_batches
 
     asked: list[int] = []

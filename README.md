@@ -2,7 +2,7 @@
 
 Checks a messy deck against an approved master deck and a brand guidelines
 file, then reports the inconsistencies. Two layers: a deterministic pass that
-proves what it finds from the file, and a Gemini pass that judges what the
+proves what it finds from the file, and a Claude pass that judges what the
 first pass cannot.
 
 It also rebuilds a deck onto the master's layouts, which is the fix for the
@@ -17,7 +17,7 @@ CLI only. No UI yet.
 brand-book.pdf  OR  approved.pptx          [extract-guidelines, run once]
         |
         v
-  brandbook/        PDF: one Gemini call, whole document as pages; every value
+  brandbook/        PDF: one Claude call, whole document as pages; every value
         |           must carry a verbatim quote or it is discarded
         |           PPTX: no model call. The theme gives the palette and the
         |           typefaces, the slides give sizes, logo and margins
@@ -64,7 +64,7 @@ master.pptx + messy.pptx + config/brand.yaml   [validate, every run]
   ai/payload.py     brand guidelines + rule findings + slide digests
         |
         v
-  ai/client.py      Gemini, structured JSON out
+  ai/client.py      Claude, structured JSON out
         |
         |  Issue(source=ai), plus context folded onto rule findings
         v
@@ -138,8 +138,8 @@ pip install -r requirements.txt
 pip install -e .          # optional, gives you the `formatting-tool` command
 ```
 
-The AI layer needs credentials. Copy the template and fill in your key
-(get one at [aistudio.google.com/apikey](https://aistudio.google.com/apikey)):
+The AI layer runs on Claude and needs an Anthropic API key. Copy the template
+and fill it in (get one at [console.anthropic.com](https://console.anthropic.com)):
 
 ```powershell
 Copy-Item .env.example .env
@@ -147,19 +147,22 @@ Copy-Item .env.example .env
 
 ```ini
 # .env
-GEMINI_API_KEY=...
+ANTHROPIC_API_KEY=...
 ```
 
 `.env` is gitignored and is read at startup from the working directory (or any
 parent). Anything already exported in the shell wins over the file:
 
 ```powershell
-$env:GEMINI_API_KEY = "..."
+$env:ANTHROPIC_API_KEY = "..."
 ```
 
-The SDK also answers to `GOOGLE_API_KEY`, and to the Vertex AI variables if you
-would rather route through a Google Cloud project, so an unset `GEMINI_API_KEY`
-does not mean there are no credentials. `--no-ai` needs none of this.
+The SDK also answers to `ANTHROPIC_AUTH_TOKEN` and to an `ant auth login`
+profile, so an unset `ANTHROPIC_API_KEY` does not mean there are no
+credentials. `--no-ai` needs none of this.
+
+The default model is `claude-opus-5`. `formatting_tool/ai/gemini.py` is kept on
+disk but imported by nothing; every AI call goes through `ai/claude.py`.
 
 ## Use
 
@@ -1945,7 +1948,7 @@ Skipped where no browser is installed.
 | `formatting_tool/report/reader.py` | Reads a report back from JSON, so a selection round-trips. |
 | `formatting_tool/ai/payload.py` | Builds the cached prefix and the per-batch payload. |
 | `formatting_tool/ai/schema.py` | The JSON contract, enforced server-side. |
-| `formatting_tool/ai/client.py` | The Gemini call. |
+| `formatting_tool/ai/client.py` | The Claude call (through `ai/claude.py`). |
 | `formatting_tool/report/` | Merge, dedupe, order, write. |
 | `formatting_tool/web/` | The browser UI: a stdlib server and two HTML pages. |
 | `formatting_tool/designqa.py` | The design check: render a deck, ask what it looks like. |

@@ -9,10 +9,14 @@ description = "Two-layer deck formatting validator: deterministic rules, then an
 requires-python = ">=3.10"
 dependencies = [
     "python-pptx>=1.0.2",
-    "google-genai>=1.0.0",
+    "anthropic>=1.8.0",
     "PyYAML>=6.0",
     "python-dotenv>=1.0.0",
 ]
+
+[project.optional-dependencies]
+# Only for `formatting_tool/ai/gemini.py`, which is kept but imported by nothing.
+gemini = ["google-genai>=1.0.0"]
 
 [project.scripts]
 formatting-tool = "formatting_tool.cli:main"

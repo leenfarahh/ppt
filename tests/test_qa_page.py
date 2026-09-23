@@ -103,7 +103,7 @@ def _check() -> dict:
         "elapsed_s": 12.3,
         "report": {
             "deck": "narrow.pptx", "generated_at": "now",
-            "model": "gemini-3.1-pro-preview",
+            "model": "claude-opus-5",
             "width_in": 13.333, "height_in": 7.5,
             "slides": [{
                 "slide": 1, "shapes": shapes,

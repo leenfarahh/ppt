@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from formatting_tool.ai.schema import to_gemini_schema
+from formatting_tool.ai.claude import to_claude_schema
 from formatting_tool.brandbook import (
     BRANDBOOK_SCHEMA,
     ExtractConfig,
@@ -374,14 +374,27 @@ def test_schema_has_no_optional_keys() -> None:
     check(BRANDBOOK_SCHEMA)
 
 
-def test_schema_survives_translation_to_geminis_subset() -> None:
-    translated = to_gemini_schema(BRANDBOOK_SCHEMA)
-    assert translated["type"] == "OBJECT"
-    assert "additionalProperties" not in json.dumps(translated)
+def test_schema_is_closed_for_claudes_structured_output() -> None:
+    """Every object closed, nothing Claude's structured output rejects."""
+    translated = to_claude_schema(BRANDBOOK_SCHEMA)
 
+    def check(node, where="$"):
+        if isinstance(node, dict):
+            if node.get("type") == "object" or (
+                isinstance(node.get("type"), list) and "object" in node["type"]
+            ):
+                assert node.get("additionalProperties") is False, where
+            for bad in ("nullable", "propertyOrdering", "minimum", "maximum"):
+                assert bad not in node, f"{where}.{bad}"
+            for key, value in node.items():
+                check(value, f"{where}.{key}")
+        elif isinstance(node, list):
+            for i, value in enumerate(node):
+                check(value, f"{where}[{i}]")
+
+    check(translated)
     palette_item = translated["properties"]["palette"]["items"]
-    assert palette_item["properties"]["hex"]["nullable"] is True
-    assert palette_item["properties"]["label"]["type"] == "STRING"
+    assert "label" in palette_item["properties"]
 
 
 def test_extract_from_pdf_end_to_end(tmp_path: Path) -> None:
@@ -390,31 +403,42 @@ def test_extract_from_pdf_end_to_end(tmp_path: Path) -> None:
     pdf.write_bytes(b"%PDF-1.4\n%%EOF\n")
 
     class _Usage:
-        prompt_token_count = 4321
-        candidates_token_count = 210
-        thoughts_token_count = 90
-        cached_content_token_count = 0
+        input_tokens = 4000
+        output_tokens = 300
+        cache_read_input_tokens = 0
+        cache_creation_input_tokens = 321
 
-    class _Part:
+    class _Text:
+        type = "text"
         text = json.dumps(_extraction())
-        thought = False
 
-    class _Response:
-        candidates = [type("C", (), {"content": type("N", (), {"parts": [_Part()]})()})()]
-        prompt_feedback = None
-        usage_metadata = _Usage()
+    class _Message:
+        content = [_Text()]
+        stop_reason = "end_turn"
+        usage = _Usage()
 
-    class _Models:
+    class _Stream:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def get_final_message(self):
+            return _Message()
+
+    class _Messages:
         def __init__(self) -> None:
             self.calls: list[dict] = []
 
-        def generate_content(self, **kwargs):
+        def stream(self, **kwargs):
             self.calls.append(kwargs)
-            return _Response()
+            return _Stream()
 
     class _Client:
         def __init__(self) -> None:
-            self.models = _Models()
+            self.beta = type("B", (), {})()
+            self.beta.messages = _Messages()
 
     client = _Client()
     result = extract_from_pdf(pdf, ExtractConfig(effort="low"), client=client)
@@ -424,12 +448,17 @@ def test_extract_from_pdf_end_to_end(tmp_path: Path) -> None:
     assert result.output_tokens == 300
     assert result.unspecified == ["safe_margins"]
 
-    # The PDF went as a file part alongside the instruction, and the schema was
-    # translated for Gemini before the call.
-    sent = client.models.calls[0]
-    assert len(sent["contents"]) == 2
-    assert sent["config"].response_mime_type == "application/json"
-    assert sent["config"].response_schema["type"] == "OBJECT"
+    # The PDF went as a document block ahead of the instruction. The schema
+    # has more nullable fields than structured output compiles (every rule
+    # may be unstated in a given book), so it is stated in the instructions.
+    sent = client.beta.messages.calls[0]
+    blocks = sent["messages"][0]["content"]
+    assert [b["type"] for b in blocks] == ["document", "text"]
+    assert blocks[0]["source"]["media_type"] == "application/pdf"
+    assert "format" not in sent["output_config"]
+    assert '"palette"' in sent["system"][0]["text"]
+    assert sent["output_config"]["effort"] == "low"
+    assert sent["thinking"] == {"type": "adaptive"}
 
 
 def test_non_pdf_reference_file_is_refused(tmp_path: Path) -> None:

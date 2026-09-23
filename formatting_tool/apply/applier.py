@@ -910,9 +910,15 @@ def _apply_one_uninstrumented(
         #
         # It is also the hazard `space.satellite_offset` reports, so without
         # this an accepted fix could manufacture a finding for the next run.
-        broken = aligned_before - _aligned(
-            shape, partners, context.align_tolerance_in
-        )
+        aligned_after = _aligned(shape, partners, context.align_tolerance_in)
+        broken = aligned_before - aligned_after
+        # A move that lands on MORE edges than it leaves is a shape being put
+        # into its row, not taken out of one. A paragraph moved onto the top,
+        # bottom and margin of the cards beside it gave up one centre line it
+        # shared with a card by coincidence, 0.04in out, and was reverted for
+        # it.
+        if broken and len(aligned_after - aligned_before) > len(broken):
+            broken = set()
         if broken:
             # The set is what is out of place, so the set is what moves. A
             # column of shapes all sitting 0.44in outside the margin is not

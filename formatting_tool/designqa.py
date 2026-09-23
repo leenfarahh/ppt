@@ -1454,6 +1454,8 @@ def _arrange_steps(
     # disagreeing with each other.
     if issue.arrangement == "same_type_size":
         return _type_steps(report, number, index, issue)
+    if issue.arrangement == "same_text_format":
+        return _format_steps(report, number, index, issue)
     if issue.arrangement in _SIZE_ARRANGEMENTS:
         return _resize_steps(report, number, index, issue, placed)
 
@@ -1760,6 +1762,75 @@ def _type_steps(
             note=issue.note,
         ))
     return steps
+
+
+def _format_steps(
+    report: DesignQaReport, number: int, index: int, issue: SlideIssue
+) -> list:
+    """Set the text of each named sibling the way the reference is set.
+
+    THE MODEL PICKS THE REFERENCE, NOT A COUNT, and that is what this adds to
+    `_type_steps`. Two cards whose body copy is 12pt in one and 7pt in the
+    other have no majority, so the counting arrangements are silent on the
+    commonest version of this defect there is. The model is looking at the
+    slide and can say which of the two reads as intended; the file then says
+    what that one is set at, and PowerPoint copies it and checks the copy
+    still fits (`qafix._match_format`).
+
+    A member whose runs already state exactly what the reference states is
+    left out, so a set that agrees produces no step rather than a refusal.
+    """
+    from .apply.qafix import Step  # noqa: PLC0415 - COM-side module
+
+    reference = issue.reference
+    if reference is None or reference.shape_id is None or report.profile is None:
+        return []
+    source = _shape_at(report.profile, number, reference.path)
+    if source is None:
+        return []
+    wanted = _format_of(source)
+
+    steps = []
+    for member in issue.members:
+        if member.shape_id is None or member.ref == reference.ref:
+            continue
+        shape = _shape_at(report.profile, number, member.path)
+        if shape is None:
+            continue
+        if wanted is not None and _format_of(shape) == wanted:
+            continue
+        steps.append(Step(
+            op="match_format",
+            slide=number,
+            shape_id=member.shape_id,
+            shape=member.shape,
+            path=member.path,
+            parent_id=reference.shape_id,
+            parent=reference.shape,
+            parent_path=reference.path,
+            measured_off=f"{reference.shape!r}, the one its set should look like",
+            shared_fit=len(issue.members) == 2,
+            task_id=f"slide:{number}:{index}",
+            note=issue.note,
+        ))
+    return steps
+
+
+def _format_of(shape: ShapeProfile) -> Optional[frozenset]:
+    """What a shape's text is set at, when every run says; None otherwise.
+
+    None where a run inherits anything, because an unstated value cannot be
+    compared from the file -- only PowerPoint knows what it draws.
+    """
+    seen = set()
+    for paragraph in shape.paragraphs:
+        for run in paragraph.runs:
+            if not run.text.strip():
+                continue
+            if not run.size_pt or not run.font_name or not run.color_hex:
+                return None
+            seen.add((run.size_pt, run.font_name, run.color_hex.upper()))
+    return frozenset(seen) if seen else None
 
 
 def _resize_steps(

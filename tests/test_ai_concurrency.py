@@ -16,7 +16,7 @@ import threading
 import time
 
 from formatting_tool.ai.client import AIResult
-from formatting_tool.ai.gemini import AIValidationError, Exhausted
+from formatting_tool.ai.claude import AIValidationError, Exhausted
 from formatting_tool.models import Category, DeckProfile, Issue, Severity, Source
 from formatting_tool.pipeline import RunConfig, _review_batches
 from formatting_tool.render import SlideImages

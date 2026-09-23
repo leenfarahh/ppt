@@ -397,7 +397,7 @@ async function boot() {
                "the design check needs PowerPoint and <code>pywin32</code> on Windows.");
   }
   if (!state.ctx.api_key) {
-    notes.push("No <code>GEMINI_API_KEY</code> in the environment, so the model cannot be asked.");
+    notes.push("No <code>ANTHROPIC_API_KEY</code> in the environment, so the model cannot be asked.");
   }
   $("#setup-note").innerHTML = notes.join(" ");
   await openHandedOver();

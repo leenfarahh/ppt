@@ -562,7 +562,7 @@ async function boot() {
   if (ctx.defaults.cli_model !== ctx.defaults.model) {
     notes.push(`The CLI default is <code>${esc(ctx.defaults.cli_model)}</code>, which is retired and answers 404.`);
   }
-  if (!ctx.api_key) notes.push("No <code>GEMINI_API_KEY</code> in the environment, so the AI layer will fail.");
+  if (!ctx.api_key) notes.push("No <code>ANTHROPIC_API_KEY</code> in the environment, so the AI layer will fail.");
   $("#ai-note").innerHTML = notes.join(" ");
 
 }

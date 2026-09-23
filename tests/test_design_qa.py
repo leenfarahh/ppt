@@ -1219,7 +1219,8 @@ def test_the_model_is_never_asked_where_a_shape_belongs():
     from formatting_tool.ai.designqa import _schema
 
     fields = _schema(["s1"])["properties"]["slide_issues"]["items"]["properties"]
-    assert set(fields) == {"note", "task", "arrangement", "shapes"}
+    # `reference` is a ref, like `shapes`: which shape is right, never where.
+    assert set(fields) == {"note", "task", "arrangement", "shapes", "reference"}
 
 
 def test_a_slide_finding_that_is_not_a_relation_is_still_for_a_designer():
@@ -1611,7 +1612,7 @@ def test_a_cut_off_answer_keeps_the_verdicts_that_arrived():
     will not decode. Nothing is repaired -- a half-written verdict is dropped
     rather than guessed at -- so what comes back is a prefix of what the model
     actually said and never an invention."""
-    from formatting_tool.ai.gemini import salvage_list
+    from formatting_tool.ai.claude import salvage_list
 
     cut = (
         '{"shapes": ['
@@ -1628,7 +1629,7 @@ def test_a_cut_off_answer_keeps_the_verdicts_that_arrived():
 def test_salvage_reads_a_whole_answer_the_same_way():
     """It has to be right on undamaged text too, since what makes an answer
     the last complete one is not visible from inside the scan."""
-    from formatting_tool.ai.gemini import salvage_list
+    from formatting_tool.ai.claude import salvage_list
 
     whole = '{"shapes": [{"shape": "s1"}, {"shape": "s2"}], "slide_issues": []}'
     assert [e["shape"] for e in salvage_list(whole, "shapes")] == ["s1", "s2"]
@@ -1636,7 +1637,7 @@ def test_salvage_reads_a_whole_answer_the_same_way():
 
 
 def test_salvage_gives_nothing_back_rather_than_guessing():
-    from formatting_tool.ai.gemini import salvage_list
+    from formatting_tool.ai.claude import salvage_list
 
     assert salvage_list("", "shapes") == []
     assert salvage_list("not json at all", "shapes") == []
@@ -1655,7 +1656,7 @@ def test_a_truncated_answer_carries_its_text_for_the_caller_to_use():
     nothing to read, and this leaves a complete answer with its tail cut off.
     Still an AIValidationError, so callers that cannot use half an answer are
     unaffected."""
-    from formatting_tool.ai.gemini import AIValidationError, Truncated
+    from formatting_tool.ai.claude import AIValidationError, Truncated
 
     exc = Truncated("cut off", text='{"shapes": [{"shape": "s1"}')
     assert isinstance(exc, AIValidationError)
@@ -2253,7 +2254,7 @@ def test_the_chart_regions_survive_a_truncated_answer() -> None:
     """`charts` is what holds the corrections off a data graphic, so an answer
     cut off after it would otherwise keep every verdict and lose the one thing
     stopping them being applied to a bar chart."""
-    from formatting_tool.ai.gemini import salvage_list
+    from formatting_tool.ai.claude import salvage_list
 
     text = '{"charts": ["s1", "s2"], "shapes": [{"shape": "s4"'
     assert salvage_list(text, "charts") == ["s1", "s2"]
@@ -2339,3 +2340,80 @@ def test_an_alignment_clear_of_everything_still_happens() -> None:
 
     assert moving.Top == 180.0
     assert result.applied and not result.skipped
+
+
+# --------------------------------------------------------------------------- #
+# Sibling text set the same way, the model saying which one is right
+#
+# Two cards whose body copy is 15pt in one and 12pt in the other. No count can
+# settle a pair, so the counting arrangements were silent on the commonest
+# version of this there is; the model is looking at the slide and names the
+# one the other should look like.
+# --------------------------------------------------------------------------- #
+
+def test_a_pair_is_matched_to_the_one_the_model_names():
+    review = review_from_response(
+        {"shapes": [], "slide_issues": [{
+            "note": "the two cards set their body copy at different sizes",
+            "task": "set the second card's copy like the first",
+            "arrangement": "same_text_format",
+            "shapes": ["s1", "s2"], "reference": "s2",
+        }]},
+        1, _refs(), (WIDE, TALL),
+    )
+    [issue] = review.slide_issues
+    assert issue.arrangement == "same_text_format" and issue.addressable
+    assert issue.reference.shape_id == 12
+
+
+def test_a_pair_with_no_reference_stays_a_note():
+    """Two answers and nobody saying which is right is a coin toss."""
+    for reference in ("none", "s404"):
+        review = review_from_response(
+            {"shapes": [], "slide_issues": [{
+                "note": "n", "task": "t", "arrangement": "same_text_format",
+                "shapes": ["s1", "s2"], "reference": reference,
+            }]},
+            1, _refs(), (WIDE, TALL),
+        )
+        [issue] = review.slide_issues
+        assert issue.arrangement == "" and not issue.addressable
+        assert issue.note == "n"
+
+
+def _format_pair(sizes, reference: int) -> DesignQaReport:
+    shapes = [
+        ShapeProfile(
+            shape_id=100 + index, name=f"Card body {index}",
+            shape_type="TEXT_BOX (17)",
+            geometry=Geometry(left_in=1.0 + index * 4.5, top_in=3.5,
+                              width_in=4.2, height_in=2.5),
+            text="Copy", paragraphs=[ParagraphProfile(text="Copy", runs=[
+                RunProfile(text="Copy", size_pt=size, font_name="Calibri",
+                           color_hex="000000")])],
+        )
+        for index, size in enumerate(sizes)
+    ]
+    profile = DeckProfile(path="deck.pptx", width_in=WIDE, height_in=TALL,
+                          slides=[SlideProfile(number=1, shapes=shapes)])
+    report = _arranged(profile, "same_text_format", *range(len(sizes)))
+    issue = report.reviews[0].slide_issues[0]
+    members = issue.members
+    report.reviews[0].slide_issues[0] = SlideIssue(
+        note=issue.note, task=issue.task, arrangement=issue.arrangement,
+        members=members, reference=members[reference],
+    )
+    return report
+
+
+def test_the_other_card_is_set_like_the_reference():
+    [step] = steps_for(_format_pair([15.0, 12.0], reference=0), ["slide:1:0"])
+
+    assert step.op == "match_format"
+    assert step.shape == "Card body 1"
+    assert (step.parent_id, step.parent) == (100, "Card body 0")
+    assert step.shared_fit          # a pair may come down together to fit
+
+
+def test_a_pair_that_already_agrees_needs_no_step():
+    assert steps_for(_format_pair([12.0, 12.0], reference=0), ["slide:1:0"]) == []

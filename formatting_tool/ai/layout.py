@@ -45,14 +45,14 @@ from pathlib import Path
 from typing import Any, Optional, Sequence
 
 from ..models import MARGIN_CHROME, LayoutChoice, MasterSpec
-from .gemini import Exhausted, build_client, file_part, generate_json
+from .claude import Exhausted, build_client, file_part, generate_json
 from .layoutsheet import LayoutSheet, build_sheet
 from .schema import LAYOUT_CHOICE_SCHEMA
 
 log = logging.getLogger(__name__)
 
-# Room for the answer, on top of whatever thinking was asked for. Gemini
-# counts thinking against `max_output_tokens`, so the flat 1024 this used to
+# Room for the answer, on top of whatever thinking was asked for. Thinking
+# counts against `max_tokens`, so the flat 1024 this used to
 # send was the two budgets sharing one allowance -- which held only while the
 # question was easy enough not to think about. Adding the layout sheet made it
 # think properly, and five of seventeen slides came back truncated mid-string
@@ -115,7 +115,7 @@ def choose_layouts(
     images: Sequence[tuple[int, Path]],
     model: str,
     thinking_budget: int,
-    api_key_env: str = "GEMINI_API_KEY",
+    api_key_env: str = "ANTHROPIC_API_KEY",
     concurrency: int = 6,
     master: Optional[Path] = None,
 ) -> list[LayoutChoice]:

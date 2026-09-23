@@ -7,7 +7,7 @@ Stage 4  ai/       ->  Issue(source=AI)
 Stage 5  report/   ->  ValidationReport
 
 Everything here is a plain dataclass on purpose: the model is filled in by
-python-pptx readers, serialized into the Gemini request payload, and written
+python-pptx readers, serialized into the Claude request payload, and written
 out as JSON, so it stays dependency-free.
 """
 
@@ -58,7 +58,7 @@ class Category(str, Enum):
 
 class Source(str, Enum):
     RULE = "rule"   # deterministic validation layer
-    AI = "ai"       # Gemini validation layer
+    AI = "ai"       # Claude validation layer
 
 
 class TextRole(str, Enum):
